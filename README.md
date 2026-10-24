@@ -7,7 +7,7 @@ analyze california roi and risk
 
 Each run replaces `zip_inventory_month`. The script deletes every existing row, then inserts the current California extract. A ZIP or month that is no longer in the file does not remain. Rows are not appended to the previous pull.
 
-The same extract is written to `california_zip_inventory.csv` in the repository root. Every run overwrites that file. The filename stays `california_zip_inventory.csv`. It is listed in `.gitignore` and is not committed.
+The same extract is written to `california_zip_inventory.csv` in the repository root. Every run overwrites that file. The filename stays `california_zip_inventory.csv`. The extract from the 2026-10-23 pull is committed at that path.
 
 This is regional ZIP inventory, not individual homes. Single-family and condo/townhome listings are pooled. There is no building type, bedroom count, bathroom count, lot acreage, or single-home price. Price per square foot is the ZIP's median, not one building's area. Source: Realtor.com Economic Research.
 
@@ -60,4 +60,4 @@ The command replaces the table and overwrites `california_zip_inventory.csv`.
 
 ### Scheduled refresh
 
-`.github/workflows/load-california.yml` runs at 16:00 UTC on January 1 and July 1 only (`0 16 1 1,7 *`), and when you start it by hand (`workflow_dispatch`). No other months are scheduled. Add a repository secret named `DATABASE_URL` with the same session-pooler URL. The workflow writes `california_zip_inventory.csv` in the job workspace and does not commit it.
+`.github/workflows/load-california.yml` runs at 16:00 UTC on January 1 and July 1 only (`0 16 1 1,7 *`), and when you start it by hand (`workflow_dispatch`). No other months are scheduled. Add a repository secret named `DATABASE_URL` with the same session-pooler URL. The workflow writes `california_zip_inventory.csv` in the job workspace. It does not commit a newer extract on its own.
