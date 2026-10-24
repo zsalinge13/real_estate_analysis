@@ -1,4 +1,4 @@
-"""Pull California census tracts from the FEMA National Risk Index.
+"""Pull Los Angeles County census tracts from the FEMA National Risk Index.
 
 Attributes only. The query sets returnGeometry to false. Each run overwrites
 nri_census_tracts_ca.csv.
@@ -13,57 +13,17 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-SERVICE = (
+LAYER = (
     "https://services.arcgis.com/XG15cJAlne2vxtgt/arcgis/rest/services/"
-    "National_Risk_Index_Census_Tracts/FeatureServer/0/query"
+    "National_Risk_Index_Census_Tracts/FeatureServer/0"
 )
+SERVICE = LAYER + "/query"
 OUTPUT = Path(__file__).resolve().parent / "nri_census_tracts_ca.csv"
 PAGE_SIZE = 2000
-WHERE = "STATEABBRV = 'CA'"
+# Los Angeles County is STCOFIPS 06037. STATEABBRV keeps the extract in California.
+WHERE = "STATEABBRV = 'CA' AND STCOFIPS = '06037'"
 ORDER = "TRACTFIPS"
-
-# Tract ids, then each hazard's loss, score, rating, and annualized
-# frequency. Names are the service fields: EALT is expected annual loss,
-# EALS is the score, EALR is the rating, and AFREQ is annualized frequency.
-# Inland flood is IFLD and coastal flood is CFLD.
-FIELDS = (
-    "TRACTFIPS",
-    "COUNTY",
-    "STATEABBRV",
-    "STCOFIPS",
-    "IFLD_EALT",
-    "IFLD_EALS",
-    "IFLD_EALR",
-    "IFLD_AFREQ",
-    "CFLD_EALT",
-    "CFLD_EALS",
-    "CFLD_EALR",
-    "CFLD_AFREQ",
-    "HWAV_EALT",
-    "HWAV_EALS",
-    "HWAV_EALR",
-    "HWAV_AFREQ",
-    "SWND_EALT",
-    "SWND_EALS",
-    "SWND_EALR",
-    "SWND_AFREQ",
-    "LNDS_EALT",
-    "LNDS_EALS",
-    "LNDS_EALR",
-    "LNDS_AFREQ",
-    "WFIR_EALT",
-    "WFIR_EALS",
-    "WFIR_EALR",
-    "WFIR_AFREQ",
-    "ERQK_EALT",
-    "ERQK_EALS",
-    "ERQK_EALR",
-    "ERQK_AFREQ",
-    "TSUN_EALT",
-    "TSUN_EALS",
-    "TSUN_EALR",
-    "TSUN_AFREQ",
-)
+ID_FIELDS = ("TRACTFIPS", "COUNTY", "STATEABBRV", "STCOFIPS")
 USER_AGENT = "real-estate-analysis"
 
 
@@ -75,17 +35,7 @@ def cell(value: object) -> object:
     return value
 
 
-def fetch_page(offset: int) -> dict:
-    params = {
-        "where": WHERE,
-        "outFields": ",".join(FIELDS),
-        "returnGeometry": "false",
-        "f": "json",
-        "orderByFields": ORDER,
-        "resultOffset": str(offset),
-        "resultRecordCount": str(PAGE_SIZE),
-    }
-    url = SERVICE + "?" + urllib.parse.urlencode(params)
+def fetch_json(url: str) -> dict:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(request, timeout=120) as response:
         payload = json.load(response)
@@ -94,11 +44,41 @@ def fetch_page(offset: int) -> dict:
     return payload
 
 
-def iter_attributes():
+def output_fields() -> tuple[str, ...]:
+    """Identifiers, then every annualized-frequency field in service order."""
+    payload = fetch_json(LAYER + "?f=json")
+    names = [field.get("name") for field in payload.get("fields") or []]
+    missing = [name for name in ID_FIELDS if name not in names]
+    if missing:
+        raise SystemExit(
+            "National Risk Index is missing fields: " + ", ".join(missing)
+        )
+    afreq = tuple(
+        name for name in names if isinstance(name, str) and "_AFREQ" in name
+    )
+    if not afreq:
+        raise SystemExit("National Risk Index returned no annualized frequency fields.")
+    return ID_FIELDS + afreq
+
+
+def fetch_page(fields: tuple[str, ...], offset: int) -> dict:
+    params = {
+        "where": WHERE,
+        "outFields": ",".join(fields),
+        "returnGeometry": "false",
+        "f": "json",
+        "orderByFields": ORDER,
+        "resultOffset": str(offset),
+        "resultRecordCount": str(PAGE_SIZE),
+    }
+    return fetch_json(SERVICE + "?" + urllib.parse.urlencode(params))
+
+
+def iter_attributes(fields: tuple[str, ...]):
     offset = 0
     seen_first: set[str] = set()
     while True:
-        payload = fetch_page(offset)
+        payload = fetch_page(fields, offset)
         features = payload.get("features") or []
         if not features:
             break
@@ -113,6 +93,15 @@ def iter_attributes():
             attributes = feature.get("attributes") or {}
             if "geometry" in feature:
                 raise SystemExit("National Risk Index returned geometry.")
+            if (
+                attributes.get("STATEABBRV") != "CA"
+                or attributes.get("STCOFIPS") != "06037"
+                or attributes.get("COUNTY") != "Los Angeles"
+            ):
+                raise SystemExit(
+                    "National Risk Index row is not Los Angeles County: "
+                    f"{attributes.get('TRACTFIPS')}"
+                )
             yield attributes
         offset += len(features)
         if len(features) < PAGE_SIZE:
@@ -122,21 +111,22 @@ def iter_attributes():
 
 
 def main() -> int:
+    fields = output_fields()
     tmp = OUTPUT.with_name(OUTPUT.name + ".tmp")
     count = 0
     try:
         with tmp.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle, lineterminator="\n")
-            writer.writerow(FIELDS)
-            for attributes in iter_attributes():
-                writer.writerow([cell(attributes.get(name)) for name in FIELDS])
+            writer.writerow(fields)
+            for attributes in iter_attributes(fields):
+                writer.writerow([cell(attributes.get(name)) for name in fields])
                 count += 1
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
     if count == 0:
         tmp.unlink(missing_ok=True)
-        print("No California National Risk Index tracts were returned.", file=sys.stderr)
+        print("No Los Angeles County National Risk Index tracts were returned.", file=sys.stderr)
         return 1
     tmp.replace(OUTPUT)
     print(f"Wrote {count} rows to {OUTPUT.name}.")
