@@ -2,12 +2,15 @@
 
 Layer 28 has no county-name field. The county id is DFIRM_ID. Los Angeles
 County FIPS is 06037, so the query keeps DFIRM_ID LIKE '06037%'. Geometry is
-WGS84 GeoJSON. Each run overwrites nfhl_flood_zones_los_angeles.geojson.
+WGS84 GeoJSON. Each run overwrites nfhl_flood_zones_los_angeles.geojson and
+replaces every row in public.nfhl_flood_zones. The connection string is
+DATABASE_URL in the environment.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -22,6 +25,9 @@ OUTPUT = Path(__file__).resolve().parent / "nfhl_flood_zones_los_angeles.geojson
 PAGE_SIZE = 200
 WHERE = "DFIRM_ID LIKE '06037%'"
 ORDER = "OBJECTID"
+DATABASE_URL_ENV = "DATABASE_URL"
+TABLE = "public.nfhl_flood_zones"
+BATCH_ROWS = 500
 
 # Flood-zone attributes present on layer 28. COUNTY is added in feature_json
 # because the service has no county-name field.
@@ -34,6 +40,17 @@ FIELDS = (
     "DEPTH",
 )
 COUNTY = "Los Angeles"
+# Table columns. geometry is GeoJSON text for the polygon, not a PostGIS type.
+COLUMNS = (
+    "dfirm_id",
+    "fld_zone",
+    "zone_subty",
+    "sfha_tf",
+    "static_bfe",
+    "depth",
+    "county",
+    "geometry",
+)
 USER_AGENT = "real-estate-analysis"
 MAX_FEATURES = 100_000
 
@@ -109,27 +126,102 @@ def iter_features():
             raise SystemExit("NFHL pagination did not finish.")
 
 
+def db_row(feature: dict) -> tuple:
+    properties = feature["properties"]
+    return (
+        properties.get("DFIRM_ID"),
+        properties.get("FLD_ZONE"),
+        properties.get("ZONE_SUBTY"),
+        properties.get("SFHA_TF"),
+        properties.get("STATIC_BFE"),
+        properties.get("DEPTH"),
+        properties.get("COUNTY"),
+        json.dumps(feature["geometry"], separators=(",", ":")),
+    )
+
+
+def connect():
+    import psycopg
+
+    database_url = os.environ.get(DATABASE_URL_ENV, "").strip()
+    if not database_url:
+        raise SystemExit(
+            f"{DATABASE_URL_ENV} is not set. Use the Supabase session pooler "
+            "connection string (port 5432). SSL is required."
+        )
+    return psycopg.connect(
+        database_url,
+        sslmode="require",
+        connect_timeout=30,
+        application_name="real_estate_analysis",
+    )
+
+
+def ensure_table(conn) -> None:
+    """Create public.nfhl_flood_zones if it is missing. No other table is changed."""
+    column_sql = ", ".join(
+        f"{name} {'double precision' if name in {'static_bfe', 'depth'} else 'text'}"
+        for name in COLUMNS
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            f"CREATE TABLE IF NOT EXISTS {TABLE} (\n    {column_sql}\n)"
+        )
+
+
+def replace_rows(conn, features: list[dict]) -> int:
+    """Delete rows in public.nfhl_flood_zones and insert this extract."""
+    names = ", ".join(COLUMNS)
+    placeholders = ", ".join(["%s"] * len(COLUMNS))
+    insert_sql = f"INSERT INTO {TABLE} ({names}) VALUES ({placeholders})"
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(f"DELETE FROM {TABLE}")
+            batch: list[tuple] = []
+            for feature in features:
+                batch.append(db_row(feature))
+                if len(batch) >= BATCH_ROWS:
+                    cur.executemany(insert_sql, batch)
+                    batch = []
+            if batch:
+                cur.executemany(insert_sql, batch)
+            cur.execute(f"SELECT COUNT(*) FROM {TABLE}")
+            count = cur.fetchone()[0]
+    return count
+
+
+def write_geojson(path: Path, features: list[dict]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write('{"type":"FeatureCollection","features":[\n')
+        for index, feature in enumerate(features):
+            if index:
+                handle.write(",\n")
+            handle.write(json.dumps(feature, separators=(",", ":")))
+        handle.write("\n]}\n")
+
+
 def main() -> int:
-    tmp = OUTPUT.with_name(OUTPUT.name + ".tmp")
-    count = 0
-    try:
-        with tmp.open("w", encoding="utf-8") as handle:
-            handle.write('{"type":"FeatureCollection","features":[\n')
-            for feature in iter_features():
-                if count:
-                    handle.write(",\n")
-                handle.write(json.dumps(feature, separators=(",", ":")))
-                count += 1
-            handle.write("\n]}\n")
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
-    if count == 0:
-        tmp.unlink(missing_ok=True)
-        print("No Los Angeles County NFHL flood zones were returned.", file=sys.stderr)
-        return 1
-    tmp.replace(OUTPUT)
-    print(f"Wrote {count} features to {OUTPUT.name}.")
+    with connect() as conn:
+        with conn.transaction():
+            ensure_table(conn)
+        features = list(iter_features())
+        if not features:
+            print(
+                "No Los Angeles County NFHL flood zones were returned.",
+                file=sys.stderr,
+            )
+            return 1
+        tmp = OUTPUT.with_name(OUTPUT.name + ".tmp")
+        try:
+            write_geojson(tmp, features)
+            count = replace_rows(conn, features)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
+        tmp.replace(OUTPUT)
+    print(
+        f"Replaced {TABLE} with {count} features and overwrote {OUTPUT.name}."
+    )
     return 0
 
 
