@@ -2,3 +2,5 @@
 .venv/
 __pycache__/
 *.pyc
+california_zip_inventory.csv
+california_zip_inventory.csv.tmp
