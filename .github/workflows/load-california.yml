@@ -1,4 +1,4 @@
-name: Load California housing metrics
+name: Load California ZIP inventory
 
 on:
   schedule:
@@ -25,7 +25,7 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Load California series
+      - name: Load California ZIP inventory
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python load_california.py

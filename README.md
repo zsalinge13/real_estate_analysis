@@ -3,9 +3,30 @@ analyze california roi and risk
 
 ## California load
 
-`load_california.py` reads the CSV download links on [Zillow Research](https://www.zillow.com/research/data/) and loads California rows into Supabase. If that page blocks the request, the script uses `research_hrefs.txt` (those same hrefs, saved from the page) and still skips a URL that returns 404. Building type is the file's home-type cut (all homes, single-family, or condo). A bedroom file keeps that bedroom slice; every other file is `all`. Values are numbers, blanks are dropped, and a rerun upserts so a revised month replaces the old value. Month is the month-end date Zillow uses as the column header.
+`load_california.py` reads the Zip row of Monthly Housing Inventory on [Realtor.com Research](https://www.realtor.com/research/data/) and downloads the Historical Data CSV (not the current-month file). It keeps rows whose `zip_name` ends in `, ca` and upserts them into `zip_inventory_month`, one row per California ZIP per month. A rerun replaces a month when Realtor.com revises history. The script drops the old Zillow tables `metric_observation` and `region` if they exist.
 
-This dataset has no building square footage, bathrooms, lot acreage, or single-home price. It is a regional series. Source: Zillow Research public CSVs.
+This is regional ZIP inventory, not individual homes. Single-family and condo/townhome listings are pooled. There is no building type, bedroom count, bathroom count, lot acreage, or single-home price. `median_square_feet` is the ZIP's median listing size, not one building's area. Flood and fire risk are not in this file. Source: Realtor.com Economic Research.
+
+Columns loaded from the file, plus `pulled_at` (when this run wrote the row):
+
+- `month_date_yyyymm`, `postal_code`, `zip_name`
+- `median_listing_price`, `median_listing_price_mm`, `median_listing_price_yy`
+- `active_listing_count`, `active_listing_count_mm`, `active_listing_count_yy`
+- `median_days_on_market`, `median_days_on_market_mm`, `median_days_on_market_yy`
+- `new_listing_count`, `new_listing_count_mm`, `new_listing_count_yy`
+- `price_increased_count`, `price_increased_count_mm`, `price_increased_count_yy`
+- `price_increased_share`, `price_increased_share_mm`, `price_increased_share_yy`
+- `price_reduced_count`, `price_reduced_count_mm`, `price_reduced_count_yy`
+- `price_reduced_share`, `price_reduced_share_mm`, `price_reduced_share_yy`
+- `pending_listing_count`, `pending_listing_count_mm`, `pending_listing_count_yy`
+- `median_listing_price_per_square_foot`, `median_listing_price_per_square_foot_mm`, `median_listing_price_per_square_foot_yy`
+- `median_square_feet`, `median_square_feet_mm`, `median_square_feet_yy`
+- `average_listing_price`, `average_listing_price_mm`, `average_listing_price_yy`
+- `total_listing_count`, `total_listing_count_mm`, `total_listing_count_yy`
+- `pending_ratio`, `pending_ratio_mm`, `pending_ratio_yy`
+- `quality_flag`
+
+Blank measure cells are stored as null. The primary key is (`postal_code`, `month_date_yyyymm`).
 
 Tableau connects later with the PostgreSQL connector. That is out of scope here.
 
@@ -15,8 +36,6 @@ Tableau connects later with the PostgreSQL connector. That is out of scope here.
 2. Export it as `DATABASE_URL`. Do not commit that string.
 3. `pip install -r requirements.txt`
 4. `python load_california.py`
-
-The script creates `region` (`region_id`, `region_name`, `region_type`, `state_code`) and `metric_observation` (`region_id`, `metric`, `building_type`, `bedrooms`, `month`, `value`, `pulled_at`) if they are missing. The observation primary key is (`region_id`, `metric`, `building_type`, `bedrooms`, `month`). Metro rows use Zillow's region type `msa`.
 
 ### Scheduled refresh
 
