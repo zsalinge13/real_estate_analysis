@@ -3,30 +3,24 @@ analyze california roi and risk
 
 ## California load
 
-`load_california.py` reads the Zip row of Monthly Housing Inventory on [Realtor.com Research](https://www.realtor.com/research/data/) and downloads the Historical Data CSV (not the current-month file). It keeps rows whose `zip_name` ends in `, ca` and upserts them into `zip_inventory_month`, one row per California ZIP per month. A rerun replaces a month when Realtor.com revises history. The script drops the old Zillow tables `metric_observation` and `region` if they exist.
+`load_california.py` reads the Zip row of Monthly Housing Inventory on [Realtor.com Research](https://www.realtor.com/research/data/) and downloads the Historical Data CSV (not the current-month file). It keeps a row when `zip_name` contains `, ca` (case-insensitive, so `, CA` matches) and upserts it into `zip_inventory_month`, one row per California ZIP per month. A rerun replaces a month when Realtor.com revises history. If an older wide table is already there, extra source columns are dropped. The script also drops the old Zillow tables `metric_observation` and `region` if they exist.
 
-This is regional ZIP inventory, not individual homes. Single-family and condo/townhome listings are pooled. There is no building type, bedroom count, bathroom count, lot acreage, or single-home price. `median_square_feet` is the ZIP's median listing size, not one building's area. Flood and fire risk are not in this file. Source: Realtor.com Economic Research.
+This is regional ZIP inventory, not individual homes. Single-family and condo/townhome listings are pooled. There is no building type, bedroom count, bathroom count, lot acreage, or single-home price. Price per square foot is the ZIP's median, not one building's area. Source: Realtor.com Economic Research.
 
-Columns loaded from the file, plus `pulled_at` (when this run wrote the row):
+Columns loaded from the file, in this order:
 
-- `month_date_yyyymm`, `postal_code`, `zip_name`
-- `median_listing_price`, `median_listing_price_mm`, `median_listing_price_yy`
-- `active_listing_count`, `active_listing_count_mm`, `active_listing_count_yy`
-- `median_days_on_market`, `median_days_on_market_mm`, `median_days_on_market_yy`
-- `new_listing_count`, `new_listing_count_mm`, `new_listing_count_yy`
-- `price_increased_count`, `price_increased_count_mm`, `price_increased_count_yy`
-- `price_increased_share`, `price_increased_share_mm`, `price_increased_share_yy`
-- `price_reduced_count`, `price_reduced_count_mm`, `price_reduced_count_yy`
-- `price_reduced_share`, `price_reduced_share_mm`, `price_reduced_share_yy`
-- `pending_listing_count`, `pending_listing_count_mm`, `pending_listing_count_yy`
-- `median_listing_price_per_square_foot`, `median_listing_price_per_square_foot_mm`, `median_listing_price_per_square_foot_yy`
-- `median_square_feet`, `median_square_feet_mm`, `median_square_feet_yy`
-- `average_listing_price`, `average_listing_price_mm`, `average_listing_price_yy`
-- `total_listing_count`, `total_listing_count_mm`, `total_listing_count_yy`
-- `pending_ratio`, `pending_ratio_mm`, `pending_ratio_yy`
-- `quality_flag`
+1. `month_date_yyyymm`
+2. `postal_code`
+3. `zip_name`
+4. `median_listing_price`
+5. `median_listing_price_mm`
+6. `median_listing_price_yy`
+7. `active_listing_count`
+8. `median_listing_price_per_square_foot`
+9. `median_listing_price_per_square_foot_mm`
+10. `median_listing_price_per_square_foot_yy`
 
-Blank measure cells are stored as null. The primary key is (`postal_code`, `month_date_yyyymm`).
+`pulled_at` is not in the CSV. It is the timestamp of the load that wrote the row. Blank measure cells are stored as null. The primary key is (`postal_code`, `month_date_yyyymm`).
 
 Tableau connects later with the PostgreSQL connector. That is out of scope here.
 
@@ -39,4 +33,4 @@ Tableau connects later with the PostgreSQL connector. That is out of scope here.
 
 ### Scheduled refresh
 
-`.github/workflows/load-california.yml` runs at 16:00 UTC on January 1 and July 1, and when you start it by hand (`workflow_dispatch`). Add a repository secret named `DATABASE_URL` with the same session-pooler URL.
+`.github/workflows/load-california.yml` runs at 16:00 UTC on January 1 and July 1 only (`0 16 1 1,7 *`), and when you start it by hand (`workflow_dispatch`). No other months are scheduled. Add a repository secret named `DATABASE_URL` with the same session-pooler URL.

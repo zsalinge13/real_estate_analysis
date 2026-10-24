@@ -2,7 +2,7 @@ name: Load California ZIP inventory
 
 on:
   schedule:
-    # 16:00 UTC on January 1 and July 1.
+    # 16:00 UTC on January 1 and July 1 only (every six months).
     - cron: "0 16 1 1,7 *"
   workflow_dispatch:
 

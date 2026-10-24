@@ -5,9 +5,10 @@ Monthly Housing Inventory downloads. This script reads the Zip row's
 Historical Data href and loads that CSV. It does not read values out of the
 page HTML, and it does not use the current-month snapshot.
 
-The file is already one row per ZIP per month. California rows are the ones
-whose zip_name ends in ", ca". A rerun upserts, because Realtor.com reissues
-the full history and can revise past months.
+The file is already one row per ZIP per month. A row is kept when zip_name
+contains ", ca" (case-insensitive, so ", CA" matches). Only the listing-price
+and active-count columns below are loaded. A rerun upserts, because
+Realtor.com reissues the full history and can revise past months.
 """
 
 from __future__ import annotations
@@ -33,55 +34,23 @@ USER_AGENT = (
     "Chrome/131.0.0.0 Safari/537.36"
 )
 
-# Column order of RDC_Inventory_Core_Metrics_Zip_History.csv.
-ID_COLUMNS = ("month_date_yyyymm", "postal_code", "zip_name")
-MEASURE_COLUMNS = (
+# Source columns kept from the ZIP history file, in load order.
+# pulled_at is added by this script; it is not a column in the CSV.
+KEPT_COLUMNS = (
+    "month_date_yyyymm",
+    "postal_code",
+    "zip_name",
     "median_listing_price",
     "median_listing_price_mm",
     "median_listing_price_yy",
     "active_listing_count",
-    "active_listing_count_mm",
-    "active_listing_count_yy",
-    "median_days_on_market",
-    "median_days_on_market_mm",
-    "median_days_on_market_yy",
-    "new_listing_count",
-    "new_listing_count_mm",
-    "new_listing_count_yy",
-    "price_increased_count",
-    "price_increased_count_mm",
-    "price_increased_count_yy",
-    "price_increased_share",
-    "price_increased_share_mm",
-    "price_increased_share_yy",
-    "price_reduced_count",
-    "price_reduced_count_mm",
-    "price_reduced_count_yy",
-    "price_reduced_share",
-    "price_reduced_share_mm",
-    "price_reduced_share_yy",
-    "pending_listing_count",
-    "pending_listing_count_mm",
-    "pending_listing_count_yy",
     "median_listing_price_per_square_foot",
     "median_listing_price_per_square_foot_mm",
     "median_listing_price_per_square_foot_yy",
-    "median_square_feet",
-    "median_square_feet_mm",
-    "median_square_feet_yy",
-    "average_listing_price",
-    "average_listing_price_mm",
-    "average_listing_price_yy",
-    "total_listing_count",
-    "total_listing_count_mm",
-    "total_listing_count_yy",
-    "pending_ratio",
-    "pending_ratio_mm",
-    "pending_ratio_yy",
-    "quality_flag",
 )
-SOURCE_COLUMNS = ID_COLUMNS + MEASURE_COLUMNS
-LOAD_COLUMNS = SOURCE_COLUMNS + ("pulled_at",)
+MEASURE_COLUMNS = KEPT_COLUMNS[3:]
+LOAD_COLUMNS = KEPT_COLUMNS + ("pulled_at",)
+IDENT_RE = re.compile(r"[a-z_][a-z0-9_]*")
 
 ZIP_ROW_RE = re.compile(r"<th>\s*Zip:\s*</th>(.*?)</tr>", re.IGNORECASE | re.DOTALL)
 HREF_RE = re.compile(r"""href=["']([^"']+\.csv)["']""", re.IGNORECASE)
@@ -159,17 +128,14 @@ def parse_number(raw: str | None) -> Decimal | None:
 
 
 def is_california_zip(zip_name: str | None) -> bool:
-    return (zip_name or "").strip().lower().endswith(", ca")
+    return ", ca" in (zip_name or "").lower()
 
 
 def require_header(fieldnames: list[str] | None) -> list[str]:
     names = [name.strip() for name in (fieldnames or [])]
-    if names != list(SOURCE_COLUMNS):
-        raise SystemExit(
-            "ZIP history CSV columns do not match the expected inventory file.\n"
-            f"Missing: {[c for c in SOURCE_COLUMNS if c not in names]}\n"
-            f"Unexpected: {[c for c in names if c not in SOURCE_COLUMNS]}"
-        )
+    missing = [column for column in KEPT_COLUMNS if column not in names]
+    if missing:
+        raise SystemExit(f"ZIP history CSV is missing columns: {missing}")
     return names
 
 
@@ -184,7 +150,7 @@ def iter_california_rows(reader: csv.DictReader, pulled_at: datetime):
         if len(month_text) != 6 or not month_text.isdigit() or not postal_code:
             continue
         measures = tuple(parse_number(row.get(column)) for column in MEASURE_COLUMNS)
-        yield (postal_code, int(month_text), zip_name, *measures, pulled_at)
+        yield (int(month_text), postal_code, zip_name, *measures, pulled_at)
 
 
 def open_csv(url: str):
@@ -244,6 +210,21 @@ DO UPDATE SET
 def ensure_schema(conn) -> None:
     with conn.cursor() as cur:
         cur.execute(schema_sql())
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = %s
+            """,
+            (TABLE,),
+        )
+        for (name,) in cur.fetchall():
+            if name in LOAD_COLUMNS:
+                continue
+            if IDENT_RE.fullmatch(name) is None:
+                raise SystemExit(f"Refusing to drop unexpected column {name!r}.")
+            cur.execute(f"ALTER TABLE {TABLE} DROP COLUMN {name}")
 
 
 def write_batch(conn, rows: list[tuple]) -> None:
