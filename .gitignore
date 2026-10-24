@@ -2,7 +2,3 @@ __pycache__/
 *.pyc
 nri_census_tracts_ca.csv
 nri_census_tracts_ca.csv.tmp
-heat_census_tracts_ca.csv
-heat_census_tracts_ca.csv.tmp
-earthquake_tracts_ca.csv
-earthquake_tracts_ca.csv.tmp
