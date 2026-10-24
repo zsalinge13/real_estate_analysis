@@ -3,15 +3,15 @@ analyze california roi and risk
 
 ## California load
 
-`load_california.py` reads the Zip row of Monthly Housing Inventory on [Realtor.com Research](https://www.realtor.com/research/data/) and downloads the Historical Data CSV (not the current-month file). It keeps a row when `zip_name` contains `, ca` (case-insensitive, so `, CA` matches).
+`load_california.py` reads the Zip row of Monthly Housing Inventory on [Realtor.com Research](https://www.realtor.com/research/data/) and downloads the Historical Data CSV (not the current-month file). A ZIP is kept when the Census [2020 ZCTA-to-county relationship file](https://www2.census.gov/geo/docs/maps-data/data/rel2020/zcta520/tab20_zcta520_county20_natl.txt) says Los Angeles County, FIPS `06037`, has strictly more land area in that ZCTA than any other county. Water area breaks a land-area tie. A tie on both is left out. The place name is not used.
 
-Each run replaces `zip_inventory_month`. The script deletes every existing row, then inserts the current California extract. A ZIP or month that is no longer in the file does not remain. Rows are not appended to the previous pull.
+Each run replaces `public.redfin_real_estate_value`. The script deletes every existing row in that table, then inserts the current extract. A ZIP or month that is no longer in the file does not remain. Rows are not appended. No other table is dropped or altered.
 
 The same extract is written to `california_zip_inventory.csv` in the repository root. Every run overwrites that file. The filename stays `california_zip_inventory.csv`. The extract from the 2026-10-23 pull is committed at that path.
 
 This is regional ZIP inventory, not individual homes. Single-family and condo/townhome listings are pooled. There is no building type, bedroom count, bathroom count, lot acreage, or single-home price. Price per square foot is the ZIP's median, not one building's area. Source: Realtor.com Economic Research.
 
-If an older table is already there, the script drops extra columns, including `pulled_at`. It also drops the old Zillow tables `metric_observation` and `region` if they exist. An older `month_date_yyyymm` stored as an integer such as `202609`, or as a date, is rewritten to text `2026_09` before the replace.
+If `public.redfin_real_estate_value` already has an older column type, the script rewrites that table only. An older `month_date_yyyymm` stored as an integer such as `202609`, or as a date, is rewritten to text `2026_09` before the replace.
 
 Columns, in this order:
 
@@ -35,7 +35,7 @@ The four change columns stay on the file's ratio scale. They are not divided or 
 
 ### Tableau
 
-`tableau/california-zip-inventory.tds` is a live PostgreSQL data source for `zip_inventory_month`.
+`tableau/california-zip-inventory.tds` is a live PostgreSQL data source for `public.redfin_real_estate_value`.
 
 1. Open the `.tds` file in Tableau Desktop.
 2. Set the server to the Supabase session pooler host (`*.pooler.supabase.com`), database `postgres`, and user `postgres.` plus the project ref.

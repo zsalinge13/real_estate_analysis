@@ -1,19 +1,20 @@
-"""Load California ZIP months from Realtor.com inventory history.
+"""Load Los Angeles County ZIP months from Realtor.com inventory history.
 
 The research page at https://www.realtor.com/research/data/ publishes the
 Monthly Housing Inventory downloads. This script reads the Zip row's
 Historical Data href and loads that CSV. It does not read values out of the
 page HTML, and it does not use the current-month snapshot.
 
-The file is already one row per ZIP per month. A row is kept when zip_name
-contains ", ca" (case-insensitive, so ", CA" matches). Only the listing-price
-and active-count columns below are loaded.
+The file is already one row per ZIP per month. A ZIP is kept when the Census
+ZCTA-to-county relationship file says Los Angeles County (FIPS 06037) is its
+majority county by land area. The place name is not used. Only the
+listing-price and active-count columns below are loaded.
 
-Each run replaces zip_inventory_month. Existing rows are deleted, then the
-current California extract is inserted, so a ZIP or month that left the file
-does not stay in the table. The same extract is written to
-california_zip_inventory.csv, overwriting that file. The filename does not
-change from run to run.
+Each run replaces public.redfin_real_estate_value. Existing rows in that table are
+deleted, then the current extract is inserted, so a ZIP or month that left
+the file does not stay in the table. No other table is dropped or altered.
+The same extract is written to california_zip_inventory.csv, overwriting that
+file. The filename does not change from run to run.
 """
 
 from __future__ import annotations
@@ -34,7 +35,15 @@ from zoneinfo import ZoneInfo
 RESEARCH_PAGE = "https://www.realtor.com/research/data/"
 DATABASE_URL_ENV = "DATABASE_URL"
 BATCH_ROWS = 20_000
-TABLE = "zip_inventory_month"
+TABLE_NAME = "redfin_real_estate_value"
+TABLE = "public.redfin_real_estate_value"
+# Census Bureau 2020 ZIP Code Tabulation Area to county relationship file.
+# https://www2.census.gov/geo/docs/maps-data/data/rel2020/zcta520/tab20_zcta520_county20_natl.txt
+CROSSWALK_URL = (
+    "https://www2.census.gov/geo/docs/maps-data/data/rel2020/zcta520/"
+    "tab20_zcta520_county20_natl.txt"
+)
+LA_COUNTY_FIPS = "06037"
 OUTPUT_CSV_NAME = "california_zip_inventory.csv"
 OUTPUT_CSV = Path(__file__).resolve().parent / OUTPUT_CSV_NAME
 PACIFIC = ZoneInfo("America/Los_Angeles")
@@ -189,8 +198,84 @@ def pull_date_text(moment: datetime | None = None) -> str:
     return current.strftime("%Y_%m_%d")
 
 
-def is_california_zip(zip_name: str | None) -> bool:
-    return ", ca" in (zip_name or "").lower()
+def postal_code_key(raw: str | None) -> str | None:
+    """Return the five-digit ZIP or ZCTA key, without using the place name."""
+    text = (raw or "").strip()
+    digits: list[str] = []
+    for char in text:
+        if char.isdigit():
+            digits.append(char)
+        elif char == "-" and len(digits) == 5:
+            break
+        else:
+            return None
+    if len(digits) not in (5, 9):
+        return None
+    return "".join(digits[:5])
+
+
+def los_angeles_postal_codes() -> set[str]:
+    """ZIPs whose majority county in the Census crosswalk is 06037.
+
+    Parts of one ZCTA are summed by county. Los Angeles County must have
+    strictly more land area than every other county. Water area is used only
+    when land area ties. A tie on both is not a majority, so that ZIP is
+    left out. A place name that contains Los Angeles is not consulted.
+    """
+    request = urllib.request.Request(
+        CROSSWALK_URL,
+        headers={"User-Agent": USER_AGENT, "Accept": "text/plain,*/*"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            text = response.read().decode("utf-8-sig")
+    except urllib.error.HTTPError as exc:
+        raise SystemExit(
+            f"Census ZCTA-county crosswalk returned HTTP {exc.code}: {CROSSWALK_URL}"
+        ) from exc
+    reader = csv.DictReader(io.StringIO(text), delimiter="|")
+    required = {
+        "GEOID_ZCTA5_20",
+        "GEOID_COUNTY_20",
+        "AREALAND_PART",
+        "AREAWATER_PART",
+    }
+    missing = required.difference(reader.fieldnames or [])
+    if missing:
+        raise SystemExit(f"Census crosswalk is missing columns: {sorted(missing)}")
+    parts: dict[str, dict[str, list[int]]] = {}
+    for row in reader:
+        zcta = (row.get("GEOID_ZCTA5_20") or "").strip()
+        county = (row.get("GEOID_COUNTY_20") or "").strip()
+        if len(zcta) != 5 or not zcta.isdigit():
+            continue
+        if len(county) != 5 or not county.isdigit():
+            continue
+        try:
+            land = int(row.get("AREALAND_PART") or 0)
+            water = int(row.get("AREAWATER_PART") or 0)
+        except ValueError:
+            continue
+        county_area = parts.setdefault(zcta, {}).setdefault(county, [0, 0])
+        county_area[0] += land
+        county_area[1] += water
+    kept: set[str] = set()
+    for zcta, counties in parts.items():
+        los_angeles = counties.get(LA_COUNTY_FIPS)
+        if los_angeles is None or los_angeles == [0, 0]:
+            continue
+        if any(
+            area >= los_angeles
+            for county, area in counties.items()
+            if county != LA_COUNTY_FIPS
+        ):
+            continue
+        kept.add(zcta)
+    if not kept:
+        raise SystemExit(
+            f"Census crosswalk did not identify any {LA_COUNTY_FIPS} ZIPs."
+        )
+    return kept
 
 
 def require_header(fieldnames: list[str] | None) -> list[str]:
@@ -201,15 +286,17 @@ def require_header(fieldnames: list[str] | None) -> list[str]:
     return names
 
 
-def iter_california_rows(reader: csv.DictReader, pull_date: str):
+def iter_los_angeles_rows(
+    reader: csv.DictReader, pull_date: str, postal_codes: set[str]
+):
     require_header(reader.fieldnames)
     for row in reader:
-        zip_name = (row.get("zip_name") or "").strip()
-        if not is_california_zip(zip_name):
+        postal_code = postal_code_key(row.get("postal_code"))
+        if postal_code is None or postal_code not in postal_codes:
             continue
+        zip_name = (row.get("zip_name") or "").strip()
         month = month_text((row.get("month_date_yyyymm") or "").strip())
-        postal_code = (row.get("postal_code") or "").strip()
-        if month is None or not postal_code:
+        if month is None:
             continue
         measures = []
         for column in MEASURE_COLUMNS:
@@ -247,9 +334,6 @@ def schema_sql() -> str:
         lines.append(f"    {name} {COLUMN_TYPES[name]}{null_sql}")
     body = ",\n".join(lines)
     return f"""
-DROP TABLE IF EXISTS metric_observation;
-DROP TABLE IF EXISTS region;
-
 CREATE TABLE IF NOT EXISTS {TABLE} (
 {body},
     PRIMARY KEY (postal_code, month_date_yyyymm)
@@ -383,10 +467,10 @@ def ensure_schema(conn) -> None:
             """
             SELECT column_name, udt_name
             FROM information_schema.columns
-            WHERE table_schema = current_schema()
+            WHERE table_schema = 'public'
               AND table_name = %s
             """,
-            (TABLE,),
+            (TABLE_NAME,),
         )
         found = {name: udt for name, udt in cur.fetchall()}
         for name in list(found):
@@ -418,20 +502,20 @@ def prepare_staging(conn) -> None:
     )
     with conn.transaction():
         with conn.cursor() as cur:
-            cur.execute("DROP TABLE IF EXISTS staging_zip_inventory")
             cur.execute(
                 f"""
-                CREATE TEMP TABLE staging_zip_inventory (
+                CREATE TEMP TABLE IF NOT EXISTS staging_redfin_real_estate_value (
 {typed},
                     load_seq bigint NOT NULL
                 )
                 """
             )
+            cur.execute("DELETE FROM staging_redfin_real_estate_value")
 
 
 def copy_batch(conn, rows: list[tuple]) -> None:
     column_list = ", ".join(STAGING_COLUMNS)
-    copy_sql = f"COPY staging_zip_inventory ({column_list}) FROM STDIN"
+    copy_sql = f"COPY staging_redfin_real_estate_value ({column_list}) FROM STDIN"
     with conn.transaction():
         with conn.cursor() as cur:
             with cur.copy(copy_sql) as copy:
@@ -452,7 +536,7 @@ def replace_table(conn) -> int:
                     INSERT INTO {TABLE} ({columns})
                     SELECT DISTINCT ON (postal_code, month_date_yyyymm)
                         {columns}
-                    FROM staging_zip_inventory
+                    FROM staging_redfin_real_estate_value
                     ORDER BY postal_code, month_date_yyyymm, load_seq DESC
                     """
                 )
@@ -490,13 +574,17 @@ def replace_table(conn) -> int:
 
 
 def load_history(conn, url: str, pull_date: str) -> int:
+    postal_codes = los_angeles_postal_codes()
+    print(
+        f"Majority Los Angeles County ZIPs in {CROSSWALK_URL}: {len(postal_codes)}"
+    )
     prepare_staging(conn)
     reader, response = open_csv(url)
     staged = 0
     seq = 0
     batch: list[tuple] = []
     try:
-        for row in iter_california_rows(reader, pull_date):
+        for row in iter_los_angeles_rows(reader, pull_date, postal_codes):
             seq += 1
             batch.append((*row, seq))
             if len(batch) >= BATCH_ROWS:
@@ -540,10 +628,10 @@ def main() -> int:
             ensure_schema(conn)
         count = load_history(conn, url, pull_date)
     if count == 0:
-        print("No California ZIP rows were loaded.", file=sys.stderr)
+        print("No Los Angeles County ZIP rows were loaded.", file=sys.stderr)
         return 1
     print(
-        f"Replaced {TABLE} with {count} California ZIP months "
+        f"Replaced {TABLE} with {count} Los Angeles County ZIP months "
         f"and overwrote {OUTPUT_CSV_NAME}."
     )
     return 0
