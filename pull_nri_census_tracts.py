@@ -22,9 +22,10 @@ PAGE_SIZE = 2000
 WHERE = "STATEABBRV = 'CA'"
 ORDER = "TRACTFIPS"
 
-# Tract ids, then each hazard's loss, score, and rating. Names are the
-# service fields: EALT is expected annual loss, EALS is the score, EALR is
-# the rating. Inland flood is IFLD and coastal flood is CFLD.
+# Tract ids, then each hazard's loss, score, rating, and annualized
+# frequency. Names are the service fields: EALT is expected annual loss,
+# EALS is the score, EALR is the rating, and AFREQ is annualized frequency.
+# Inland flood is IFLD and coastal flood is CFLD.
 FIELDS = (
     "TRACTFIPS",
     "COUNTY",
@@ -33,27 +34,35 @@ FIELDS = (
     "IFLD_EALT",
     "IFLD_EALS",
     "IFLD_EALR",
+    "IFLD_AFREQ",
     "CFLD_EALT",
     "CFLD_EALS",
     "CFLD_EALR",
+    "CFLD_AFREQ",
     "HWAV_EALT",
     "HWAV_EALS",
     "HWAV_EALR",
+    "HWAV_AFREQ",
     "SWND_EALT",
     "SWND_EALS",
     "SWND_EALR",
+    "SWND_AFREQ",
     "LNDS_EALT",
     "LNDS_EALS",
     "LNDS_EALR",
+    "LNDS_AFREQ",
     "WFIR_EALT",
     "WFIR_EALS",
     "WFIR_EALR",
+    "WFIR_AFREQ",
     "ERQK_EALT",
     "ERQK_EALS",
     "ERQK_EALR",
+    "ERQK_AFREQ",
     "TSUN_EALT",
     "TSUN_EALS",
     "TSUN_EALR",
+    "TSUN_AFREQ",
 )
 USER_AGENT = "real-estate-analysis"
 
