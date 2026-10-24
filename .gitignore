@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+nfhl_flood_zones_los_angeles.geojson
+nfhl_flood_zones_los_angeles.geojson.tmp
