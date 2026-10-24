@@ -1,0 +1,31 @@
+name: Pull Los Angeles County NFHL flood zones
+
+on:
+  schedule:
+    # 16:00 UTC on January 1 and July 1 only (every six months).
+    - cron: "0 16 1 1,7 *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pull-nfhl-flood-zones
+  cancel-in-progress: false
+
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Pull Los Angeles County NFHL flood zones
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python pull_nfhl_flood_zones.py
