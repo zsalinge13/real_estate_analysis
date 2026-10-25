@@ -7,6 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: read
 
 concurrency:
@@ -31,3 +32,11 @@ jobs:
           REFRESH_REVIEW_WEBHOOK_URL: ${{ secrets.REFRESH_REVIEW_WEBHOOK_URL }}
           REFRESH_REVIEW_WEBHOOK_KEY: ${{ secrets.REFRESH_REVIEW_WEBHOOK_KEY }}
         run: python pull_nfhl_flood_zones.py
+      - name: Upload NFHL flood zone CSV
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nfhl-flood-zones
+          path: nfhl_flood_zones.csv
+          retention-days: 90
+          if-no-files-found: error

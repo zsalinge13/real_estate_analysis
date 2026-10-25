@@ -3,12 +3,14 @@
 Layer 28 has no county-name field. The county id is DFIRM_ID. Los Angeles
 County FIPS is 06037, so the query keeps DFIRM_ID LIKE '06037%'. Geometry is
 WGS84 GeoJSON. Each run overwrites nfhl_flood_zones_los_angeles.geojson and
-replaces every row in public.nfhl_flood_zones. The connection string is
+nfhl_flood_zones.csv, then replaces every row in public.nfhl_flood_zones.
+The CSV has the loaded columns except geometry. The connection string is
 DATABASE_URL in the environment.
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import sys
@@ -22,6 +24,7 @@ SERVICE = (
     "https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28/query"
 )
 OUTPUT = Path(__file__).resolve().parent / "nfhl_flood_zones_los_angeles.geojson"
+OUTPUT_CSV = Path(__file__).resolve().parent / "nfhl_flood_zones.csv"
 PAGE_SIZE = 200
 WHERE = "DFIRM_ID LIKE '06037%'"
 ORDER = "OBJECTID"
@@ -51,6 +54,8 @@ COLUMNS = (
     "county",
     "geometry",
 )
+# Same loaded columns, without the polygon. Tableau Public opens this CSV.
+CSV_COLUMNS = tuple(name for name in COLUMNS if name != "geometry")
 USER_AGENT = "real-estate-analysis"
 MAX_FEATURES = 100_000
 
@@ -200,6 +205,24 @@ def write_geojson(path: Path, features: list[dict]) -> None:
         handle.write("\n]}\n")
 
 
+def csv_cell(value: object) -> object:
+    if value is None:
+        return ""
+    return value
+
+
+def write_csv(path: Path, features: list[dict]) -> None:
+    """Write loaded attributes from features already fetched. No geometry."""
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(CSV_COLUMNS)
+        for feature in features:
+            properties = feature["properties"]
+            writer.writerow(
+                [csv_cell(properties.get(name.upper())) for name in CSV_COLUMNS]
+            )
+
+
 def notify_refresh_review(table: str) -> int:
     """POST a success notice after the load. Never print the webhook URL or key."""
     url = os.environ.get("REFRESH_REVIEW_WEBHOOK_URL", "").strip()
@@ -247,15 +270,20 @@ def main() -> int:
             )
             return 1
         tmp = OUTPUT.with_name(OUTPUT.name + ".tmp")
+        csv_tmp = OUTPUT_CSV.with_name(OUTPUT_CSV.name + ".tmp")
         try:
             write_geojson(tmp, features)
+            write_csv(csv_tmp, features)
             count = replace_rows(conn, features)
         except Exception:
             tmp.unlink(missing_ok=True)
+            csv_tmp.unlink(missing_ok=True)
             raise
         tmp.replace(OUTPUT)
+        csv_tmp.replace(OUTPUT_CSV)
     print(
-        f"Replaced {TABLE} with {count} features and overwrote {OUTPUT.name}."
+        f"Replaced {TABLE} with {count} features and overwrote "
+        f"{OUTPUT.name} and {OUTPUT_CSV.name}."
     )
     return notify_refresh_review("nfhl_flood_zones")
 
