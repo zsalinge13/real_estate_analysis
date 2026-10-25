@@ -11,6 +11,7 @@ import csv
 import json
 import os
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 from decimal import Decimal
@@ -372,6 +373,41 @@ def load_table(fields: tuple[str, ...], rows: list[tuple]) -> int:
     return count
 
 
+def notify_refresh_review(table: str) -> int:
+    """POST a success notice after the load. Never print the webhook URL or key."""
+    url = os.environ.get("REFRESH_REVIEW_WEBHOOK_URL", "").strip()
+    key = os.environ.get("REFRESH_REVIEW_WEBHOOK_KEY", "").strip()
+    if not url or not key:
+        print("The refresh review webhook is not configured.")
+        return 0
+    workflow = os.environ.get("GITHUB_WORKFLOW", "").strip() or "local"
+    body = json.dumps(
+        {"workflow": workflow, "table": table, "conclusion": "success"}
+    ).encode()
+    try:
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {key}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        exc.close()
+    except Exception:
+        print("The data load succeeded but the review trigger failed.")
+        return 1
+    if status < 200 or status >= 300:
+        print("The data load succeeded but the review trigger failed.")
+        return 1
+    return 0
+
+
 def main() -> int:
     fields = output_fields()
     tmp = OUTPUT.with_name(OUTPUT.name + ".tmp")
@@ -400,7 +436,7 @@ def main() -> int:
         return 0
     count = load_table(fields, rows)
     print(f"Replaced {TABLE} with {count} rows.")
-    return 0
+    return notify_refresh_review(TABLE_NAME)
 
 
 if __name__ == "__main__":
