@@ -1,0 +1,33 @@
+name: Pull National Risk Index census tracts
+
+on:
+  schedule:
+    # 16:00 UTC on January 1 and July 1 only (every six months).
+    - cron: "0 16 1 1,7 *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pull-nri-census-tracts
+  cancel-in-progress: false
+
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Pull Los Angeles County National Risk Index tracts
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          REFRESH_REVIEW_WEBHOOK_URL: ${{ secrets.REFRESH_REVIEW_WEBHOOK_URL }}
+          REFRESH_REVIEW_WEBHOOK_KEY: ${{ secrets.REFRESH_REVIEW_WEBHOOK_KEY }}
+        run: python pull_nri_census_tracts.py
