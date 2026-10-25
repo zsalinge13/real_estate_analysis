@@ -28,4 +28,6 @@ jobs:
       - name: Load California ZIP inventory
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          REFRESH_REVIEW_WEBHOOK_URL: ${{ secrets.REFRESH_REVIEW_WEBHOOK_URL }}
+          REFRESH_REVIEW_WEBHOOK_KEY: ${{ secrets.REFRESH_REVIEW_WEBHOOK_KEY }}
         run: python load_california.py
