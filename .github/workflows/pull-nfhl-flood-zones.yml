@@ -28,4 +28,6 @@ jobs:
       - name: Pull Los Angeles County NFHL flood zones
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          REFRESH_REVIEW_WEBHOOK_URL: ${{ secrets.REFRESH_REVIEW_WEBHOOK_URL }}
+          REFRESH_REVIEW_WEBHOOK_KEY: ${{ secrets.REFRESH_REVIEW_WEBHOOK_KEY }}
         run: python pull_nfhl_flood_zones.py
