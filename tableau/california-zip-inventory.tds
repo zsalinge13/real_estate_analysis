@@ -1,0 +1,36 @@
+<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='california-zip-inventory' inline='true' source-platform='linux' version='18.1' xmlns:user='http://www.tableausoftware.com/xml/user'>
+  <!-- Live PostgreSQL connection. Edit server, dbname, and username, then enter the password in Tableau. Do not store the password in this file. -->
+  <connection authentication='username-password' class='postgres' dbname='postgres' odbc-native-protocol='yes' port='5432' server='YOUR_PROJECT.pooler.supabase.com' sslmode='require' username='postgres.YOUR_PROJECT_REF'>
+    <relation name='redfin_real_estate_value' table='[public].[redfin_real_estate_value]' type='table' />
+    <cols>
+      <map key='[month_date_yyyymm]' value='[redfin_real_estate_value].[month_date_yyyymm]' />
+      <map key='[postal_code]' value='[redfin_real_estate_value].[postal_code]' />
+      <map key='[zip_name]' value='[redfin_real_estate_value].[zip_name]' />
+      <map key='[median_listing_price]' value='[redfin_real_estate_value].[median_listing_price]' />
+      <map key='[median_listing_price_mm]' value='[redfin_real_estate_value].[median_listing_price_mm]' />
+      <map key='[median_listing_price_yy]' value='[redfin_real_estate_value].[median_listing_price_yy]' />
+      <map key='[active_listing_count]' value='[redfin_real_estate_value].[active_listing_count]' />
+      <map key='[median_listing_price_per_square_foot]' value='[redfin_real_estate_value].[median_listing_price_per_square_foot]' />
+      <map key='[median_listing_price_per_square_foot_mm]' value='[redfin_real_estate_value].[median_listing_price_per_square_foot_mm]' />
+      <map key='[median_listing_price_per_square_foot_yy]' value='[redfin_real_estate_value].[median_listing_price_per_square_foot_yy]' />
+      <map key='[date_pulled_yyyymmdd]' value='[redfin_real_estate_value].[date_pulled_yyyymmdd]' />
+    </cols>
+  </connection>
+  <aliases enabled='yes' />
+  <!-- Text yyyy_mm, for example 2026_09. No date role. -->
+  <column datatype='string' name='[month_date_yyyymm]' role='dimension' type='nominal' />
+  <column datatype='string' name='[postal_code]' role='dimension' type='nominal' />
+  <column datatype='string' name='[zip_name]' role='dimension' type='nominal' />
+  <!-- Plain number. No currency format. -->
+  <column datatype='real' name='[median_listing_price]' role='measure' type='quantitative' />
+  <column datatype='real' default-format='p0.00%' name='[median_listing_price_mm]' role='measure' type='quantitative' />
+  <column datatype='real' default-format='p0.00%' name='[median_listing_price_yy]' role='measure' type='quantitative' />
+  <column datatype='integer' default-format='n#,##0' name='[active_listing_count]' role='measure' type='quantitative' />
+  <!-- Plain number. No currency format. -->
+  <column datatype='real' name='[median_listing_price_per_square_foot]' role='measure' type='quantitative' />
+  <column datatype='real' default-format='p0.00%' name='[median_listing_price_per_square_foot_mm]' role='measure' type='quantitative' />
+  <column datatype='real' default-format='p0.00%' name='[median_listing_price_per_square_foot_yy]' role='measure' type='quantitative' />
+  <!-- Text yyyy_mm_dd, for example 2026_10_23. No date role. -->
+  <column datatype='string' name='[date_pulled_yyyymmdd]' role='dimension' type='nominal' />
+</datasource>
