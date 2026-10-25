@@ -3,3 +3,5 @@
 __pycache__/
 *.pyc
 california_zip_inventory.csv.tmp
+nri_census_tracts_ca.csv
+nri_census_tracts_ca.csv.tmp
