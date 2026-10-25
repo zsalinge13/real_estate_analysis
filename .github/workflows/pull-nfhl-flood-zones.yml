@@ -40,3 +40,17 @@ jobs:
           path: nfhl_flood_zones.csv
           retention-days: 90
           if-no-files-found: error
+      - name: Export Supabase backup CSV
+        id: backup
+        if: failure()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python export_supabase_backup.py nfhl_flood_zones
+      - name: Upload Supabase backup CSV
+        if: failure() && steps.backup.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nfhl-flood-zones
+          path: nfhl_flood_zones.csv
+          retention-days: 90
+          if-no-files-found: error

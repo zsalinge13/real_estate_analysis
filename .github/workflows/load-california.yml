@@ -40,3 +40,17 @@ jobs:
           path: california_zip_inventory.csv
           retention-days: 90
           if-no-files-found: error
+      - name: Export Supabase backup CSV
+        id: backup
+        if: failure()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python export_supabase_backup.py redfin_real_estate_value
+      - name: Upload Supabase backup CSV
+        if: failure() && steps.backup.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: redfin-real-estate-value
+          path: california_zip_inventory.csv
+          retention-days: 90
+          if-no-files-found: error
