@@ -7,6 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: read
 
 concurrency:
@@ -31,3 +32,25 @@ jobs:
           REFRESH_REVIEW_WEBHOOK_URL: ${{ secrets.REFRESH_REVIEW_WEBHOOK_URL }}
           REFRESH_REVIEW_WEBHOOK_KEY: ${{ secrets.REFRESH_REVIEW_WEBHOOK_KEY }}
         run: python pull_nri_census_tracts.py
+      - name: Upload National Risk Index census tract CSV
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nri-census-tracts-ca
+          path: nri_census_tracts_ca.csv
+          retention-days: 90
+          if-no-files-found: error
+      - name: Export Supabase backup CSV
+        id: backup
+        if: failure()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python export_supabase_backup.py nri_census_tracts_ca
+      - name: Upload Supabase backup CSV
+        if: failure() && steps.backup.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nri-census-tracts-ca
+          path: nri_census_tracts_ca.csv
+          retention-days: 90
+          if-no-files-found: error
