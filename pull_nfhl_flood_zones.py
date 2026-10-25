@@ -4,8 +4,9 @@ Layer 28 has no county-name field. The county id is DFIRM_ID. Los Angeles
 County FIPS is 06037, so the query keeps DFIRM_ID LIKE '06037%'. Geometry is
 WGS84 GeoJSON. Each run overwrites nfhl_flood_zones_los_angeles.geojson and
 nfhl_flood_zones.csv, then replaces every row in public.nfhl_flood_zones.
-The CSV has the loaded columns except geometry. The connection string is
-DATABASE_URL in the environment.
+The CSV includes every loaded column. geometry is the same compact WGS84
+GeoJSON text stored in the table. The connection string is DATABASE_URL in
+the environment.
 """
 
 from __future__ import annotations
@@ -54,8 +55,10 @@ COLUMNS = (
     "county",
     "geometry",
 )
-# Same loaded columns, without the polygon. Tableau Public opens this CSV.
-CSV_COLUMNS = tuple(name for name in COLUMNS if name != "geometry")
+# Same columns as the table. geometry stays in the CSV as GeoJSON text.
+CSV_COLUMNS = COLUMNS
+# Backup rows are ordered by attributes. geometry is selected, not sorted.
+BACKUP_ORDER = tuple(name for name in COLUMNS if name != "geometry")
 USER_AGENT = "real-estate-analysis"
 MAX_FEATURES = 100_000
 
@@ -212,15 +215,22 @@ def csv_cell(value: object) -> object:
 
 
 def write_csv(path: Path, features: list[dict]) -> None:
-    """Write loaded attributes from features already fetched. No geometry."""
+    """Write every loaded column. geometry matches the text stored in Supabase.
+
+    csv.QUOTE_MINIMAL quotes any field that contains a comma or a quote, which
+    compact GeoJSON always does, and doubles quotes inside that field.
+    """
+    if CSV_COLUMNS != COLUMNS:
+        raise SystemExit("CSV columns must match the loaded table columns.")
     with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle, lineterminator="\n")
+        writer = csv.writer(
+            handle,
+            lineterminator="\n",
+            quoting=csv.QUOTE_MINIMAL,
+        )
         writer.writerow(CSV_COLUMNS)
         for feature in features:
-            properties = feature["properties"]
-            writer.writerow(
-                [csv_cell(properties.get(name.upper())) for name in CSV_COLUMNS]
-            )
+            writer.writerow([csv_cell(value) for value in db_row(feature)])
 
 
 def notify_refresh_review(table: str) -> int:

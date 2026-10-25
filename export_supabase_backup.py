@@ -1,8 +1,8 @@
 """Export the current Supabase table when a load workflow fails.
 
-The CSV filename and columns match the successful load artifact. Polygon
-geometry is omitted. This script does not print the connection string or
-row contents.
+The CSV filename and columns match the successful load artifact. The flood-zone
+export includes geometry as GeoJSON text. Other exports still omit a geometry
+column. This script does not print the connection string or row contents.
 """
 
 from __future__ import annotations
@@ -92,7 +92,7 @@ def build_specs() -> dict[str, Spec]:
             path=pull_nfhl_flood_zones.OUTPUT_CSV,
             connect=pull_nfhl_flood_zones.connect,
             columns=flood_columns,
-            order_by=pull_nfhl_flood_zones.CSV_COLUMNS,
+            order_by=pull_nfhl_flood_zones.BACKUP_ORDER,
         ),
     )
     return {spec.table_name: spec for spec in specs}
@@ -119,6 +119,17 @@ def quote_column(name: str) -> str:
     return pull_nri_census_tracts.quote_ident(name)
 
 
+def selected_columns(spec: Spec, names: tuple[str, ...]) -> tuple[str, ...]:
+    """Columns written to the backup CSV.
+
+    Flood zones keep geometry so the backup matches nfhl_flood_zones.csv from
+    a successful pull. Other tables still drop a geometry column.
+    """
+    if spec.table == pull_nfhl_flood_zones.TABLE:
+        return tuple(names)
+    return tuple(name for name in names if name != "geometry")
+
+
 def export_connection(conn, spec: Spec) -> int:
     """Write spec.path from the current table. Read only."""
     with conn.transaction():
@@ -126,9 +137,7 @@ def export_connection(conn, spec: Spec) -> int:
             cur.execute("SET TRANSACTION READ ONLY")
             if not table_exists(cur, spec.table_name):
                 raise SystemExit(NO_PRIOR_DATA)
-            columns = tuple(
-                name for name in spec.columns(cur) if name != "geometry"
-            )
+            columns = selected_columns(spec, tuple(spec.columns(cur)))
             if not columns:
                 raise SystemExit(NO_PRIOR_DATA)
             quoted = [quote_column(name) for name in columns]
@@ -148,7 +157,11 @@ def export_connection(conn, spec: Spec) -> int:
             written = 0
             try:
                 with tmp.open("w", newline="", encoding="utf-8") as handle:
-                    writer = csv.writer(handle, lineterminator="\n")
+                    writer = csv.writer(
+                        handle,
+                        lineterminator="\n",
+                        quoting=csv.QUOTE_MINIMAL,
+                    )
                     writer.writerow(columns)
                     while True:
                         chunk = cur.fetchmany(FETCH_SIZE)
