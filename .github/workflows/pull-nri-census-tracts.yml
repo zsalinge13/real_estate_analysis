@@ -54,3 +54,22 @@ jobs:
           path: nri_census_tracts_ca.csv
           retention-days: 90
           if-no-files-found: error
+      - name: Build National Risk Index tract shapes
+        id: shapes
+        if: always() && !cancelled()
+        run: |
+          if [ -s nri_census_tracts_ca.csv ]; then
+            python build_nri_tract_shapes.py
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "nri_census_tracts_ca.csv is absent. Skipping tract shapes."
+            echo "built=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload National Risk Index tract shapes
+        if: always() && !cancelled() && steps.shapes.outputs.built == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nri-census-tract-shapes
+          path: nri_census_tract_shapes.geojson
+          retention-days: 90
+          if-no-files-found: error
