@@ -2,8 +2,8 @@ name: Pull Census ZIP population
 
 on:
   schedule:
-    # 16:00 UTC on January 1 only (once a year).
-    - cron: "0 16 1 1 *"
+    # 16:00 UTC on January 1 and July 1 only (every six months).
+    - cron: "0 16 1 1,7 *"
   workflow_dispatch:
 
 permissions:

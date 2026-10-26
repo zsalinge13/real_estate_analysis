@@ -90,7 +90,7 @@ Columns are `acs_year`, `zip`, `median_household_income` (`B19013_001E`), `per_c
 
 The data request is sent without an API key. If Census requires a key, the script reads `CENSUS_API_KEY` and does not print it. Add that repository secret when the keyless call is rejected.
 
-`.github/workflows/pull-census-zip-population.yml` runs at 16:00 UTC on January 1 (`0 16 1 1 *`) and on `workflow_dispatch`. After a successful load it uploads `census_zip_population.csv` as the `census-zip-population` artifact and keeps it for 90 days. If the load step fails, the job exports the current `public.census_zip_population` rows and uploads the same artifact. The job passes `DATABASE_URL`, `CENSUS_API_KEY`, and the refresh-review webhook secrets.
+`.github/workflows/pull-census-zip-population.yml` runs at 16:00 UTC on January 1 and July 1 (`0 16 1 1,7 *`) and on `workflow_dispatch`. After a successful load it uploads `census_zip_population.csv` as the `census-zip-population` artifact and keeps it for 90 days. If the load step fails, the job exports the current `public.census_zip_population` rows and uploads the same artifact. The job passes `DATABASE_URL`, `CENSUS_API_KEY`, and the refresh-review webhook secrets.
 
 ## National procedure counts and surgeon fees
 
