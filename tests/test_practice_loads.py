@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import io
 import os
 import unittest
+import urllib.error
 from datetime import datetime, timezone
 from decimal import Decimal
+from email.message import Message
+from unittest.mock import patch
 
 import pull_census_zip_population as census
 import pull_procedure_surgeon_fees as procedures
@@ -436,6 +440,97 @@ class CensusTests(unittest.TestCase):
         self.assertIn("error while running your query", shown)
         self.assertNotIn("developers.html", shown)
         self.assertNotIn("://", shown)
+
+    def test_unreachable_network_is_retried_without_printing_the_key(self):
+        class Response:
+            status = 200
+            headers = {"Content-Type": "application/json"}
+
+            def read(self):
+                return b"[]"
+
+            def close(self):
+                return None
+
+        calls = {"n": 0}
+        url = "https://api.census.gov/data/2024/acs/acs5?get=NAME&key=example-key"
+
+        def fake_urlopen(_request, timeout=0):
+            calls["n"] += 1
+            self.assertEqual(timeout, 180)
+            if calls["n"] == 1:
+                raise urllib.error.URLError(OSError(101, "Network is unreachable"))
+            return Response()
+
+        stdout = io.StringIO()
+        with (
+            patch.object(census.urllib.request, "urlopen", fake_urlopen),
+            patch.object(census.time, "sleep") as slept,
+            patch("sys.stdout", stdout),
+        ):
+            status, _headers, body = census.request_bytes(url)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"[]")
+        self.assertEqual(calls["n"], 2)
+        slept.assert_called_once_with(2)
+        shown = stdout.getvalue()
+        self.assertIn("could not connect", shown)
+        self.assertNotIn("example-key", shown)
+        self.assertNotIn(url, shown)
+
+    def test_unreachable_network_is_reported_after_the_last_attempt(self):
+        calls = {"n": 0}
+        url = "https://api.census.gov/data/2024/acs/acs5?get=NAME&key=example-key"
+
+        def fake_urlopen(_request, timeout=0):
+            calls["n"] += 1
+            raise urllib.error.URLError(OSError(101, "Network is unreachable"))
+
+        stdout = io.StringIO()
+        with (
+            patch.object(census.urllib.request, "urlopen", fake_urlopen),
+            patch.object(census.time, "sleep") as slept,
+            patch("sys.stdout", stdout),
+        ):
+            with self.assertRaises(urllib.error.URLError) as caught:
+                census.request_bytes(url)
+        self.assertEqual(calls["n"], census.CONNECT_ATTEMPTS)
+        self.assertEqual(slept.call_count, census.CONNECT_ATTEMPTS - 1)
+        self.assertIn("Network is unreachable", str(caught.exception))
+        self.assertNotIn("example-key", str(caught.exception))
+        shown = stdout.getvalue()
+        self.assertEqual(shown.count("Retrying."), census.CONNECT_ATTEMPTS - 1)
+        self.assertNotIn("example-key", shown)
+        self.assertNotIn(url, shown)
+        self.assertEqual(
+            census.public_error(caught.exception),
+            "<urlopen error [Errno 101] Network is unreachable>",
+        )
+
+    def test_http_status_is_not_retried(self):
+        calls = {"n": 0}
+
+        def fake_urlopen(request, timeout=0):
+            calls["n"] += 1
+            raise urllib.error.HTTPError(
+                request.full_url,
+                500,
+                "Error",
+                Message(),
+                io.BytesIO(b"There was an error while running your query."),
+            )
+
+        with (
+            patch.object(census.urllib.request, "urlopen", fake_urlopen),
+            patch.object(census.time, "sleep") as slept,
+        ):
+            status, _headers, body = census.request_bytes(
+                "https://api.census.gov/data/2024/acs/acs5"
+            )
+        self.assertEqual(calls["n"], 1)
+        slept.assert_not_called()
+        self.assertEqual(status, 500)
+        self.assertIn(b"error while running your query", body)
 
 
 if __name__ == "__main__":

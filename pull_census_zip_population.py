@@ -15,6 +15,7 @@ A query sent without a state is retried with California when Census reports
 ambiguous geography or HTTP 500 ("error while running your query").
 
 When CENSUS_API_KEY is set, it is sent on the first request and is never printed.
+A dropped connection is retried. The request URL is not printed.
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ OUTPUT_CSV = Path(__file__).resolve().parent / OUTPUT_CSV_NAME
 USER_AGENT = load_california.USER_AGENT
 BATCH_SIZE = 20
 VARIABLE_CHUNK = 20
+CONNECT_ATTEMPTS = 4
 GEO_COLUMN = "zip code tabulation area"
 CALIFORNIA_STATE = "06"
 KEY_REQUIRED = (
@@ -305,7 +307,8 @@ def looks_like_key_error(status: int, headers, body: bytes) -> bool:
     )
 
 
-def request_bytes(url: str) -> tuple[int, dict[str, str], bytes]:
+def open_census(url: str) -> tuple[int, dict[str, str], bytes]:
+    """GET one Census URL once. An HTTP status is returned, not raised."""
     request = urllib.request.Request(
         url,
         headers={"User-Agent": USER_AGENT, "Accept": "application/json,*/*"},
@@ -313,9 +316,11 @@ def request_bytes(url: str) -> tuple[int, dict[str, str], bytes]:
     try:
         response = urllib.request.urlopen(request, timeout=180)
     except urllib.error.HTTPError as exc:
-        body = exc.read()
-        headers = {key: value for key, value in exc.headers.items()}
-        exc.close()
+        try:
+            body = exc.read()
+            headers = {key: value for key, value in exc.headers.items()}
+        finally:
+            exc.close()
         return exc.code, headers, body
     try:
         headers = {key: value for key, value in response.headers.items()}
@@ -324,6 +329,28 @@ def request_bytes(url: str) -> tuple[int, dict[str, str], bytes]:
     finally:
         response.close()
     return status, headers, body
+
+
+def request_bytes(url: str) -> tuple[int, dict[str, str], bytes]:
+    """GET a Census URL. Retry a dropped connection. Do not retry an HTTP status.
+
+    The URL is not printed: it can contain CENSUS_API_KEY.
+    """
+    error: urllib.error.URLError | None = None
+    for attempt in range(CONNECT_ATTEMPTS):
+        try:
+            return open_census(url)
+        except urllib.error.URLError as exc:
+            # HTTPError is a URLError, and open_census already turned it into
+            # a status. This branch is a dropped connection or a timeout.
+            error = exc
+            if attempt + 1 == CONNECT_ATTEMPTS:
+                break
+            print("The Census request could not connect. Retrying.", flush=True)
+            time.sleep(2 * (attempt + 1))
+    if error is None:
+        raise urllib.error.URLError("The Census request did not run.")
+    raise error
 
 
 class KeyRequired(Exception):
