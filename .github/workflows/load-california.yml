@@ -1,4 +1,4 @@
-name: Load California ZIP inventory
+name: Aesthetic surgery data
 
 on:
   schedule:
@@ -26,7 +26,7 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Load California ZIP inventory
+      - name: Aesthetic surgery data
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           REFRESH_REVIEW_WEBHOOK_URL: ${{ secrets.REFRESH_REVIEW_WEBHOOK_URL }}

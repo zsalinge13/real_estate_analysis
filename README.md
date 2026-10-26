@@ -60,7 +60,7 @@ The command replaces the table and overwrites `california_zip_inventory.csv`.
 
 ### Scheduled refresh
 
-`.github/workflows/load-california.yml` runs at 16:00 UTC on January 1 and July 1 only (`0 16 1 1,7 *`), and when you start it by hand (`workflow_dispatch`). No other months are scheduled. Add a repository secret named `DATABASE_URL` with the same session-pooler URL. The workflow writes `california_zip_inventory.csv` in the job workspace. It does not commit a newer extract on its own. After that load succeeds, the job uploads `california_zip_inventory.csv` as the `redfin-real-estate-value` artifact and keeps it for 90 days. If the load step fails, the job exports the current `public.redfin_real_estate_value` rows to that same CSV and uploads the same artifact. An empty or missing table fails the backup and does not invent rows.
+The Aesthetic surgery data workflow (`.github/workflows/load-california.yml`) runs at 16:00 UTC on January 1 and July 1 only (`0 16 1 1,7 *`), and when you start it by hand (`workflow_dispatch`). No other months are scheduled. Add a repository secret named `DATABASE_URL` with the same session-pooler URL. The workflow writes `california_zip_inventory.csv` in the job workspace. It does not commit a newer extract on its own. After that load succeeds, the job uploads `california_zip_inventory.csv` as the `redfin-real-estate-value` artifact and keeps it for 90 days. If the load step fails, the job exports the current `public.redfin_real_estate_value` rows to that same CSV and uploads the same artifact. An empty or missing table fails the backup and does not invent rows.
 
 ## Natural hazards
 
