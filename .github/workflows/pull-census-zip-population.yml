@@ -1,0 +1,57 @@
+name: Pull Census ZIP population
+
+on:
+  schedule:
+    # 16:00 UTC on January 1 only (once a year).
+    - cron: "0 16 1 1 *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: pull-census-zip-population
+  cancel-in-progress: false
+
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Pull Los Angeles County ACS ZIP population
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CENSUS_API_KEY: ${{ secrets.CENSUS_API_KEY }}
+          REFRESH_REVIEW_WEBHOOK_URL: ${{ secrets.REFRESH_REVIEW_WEBHOOK_URL }}
+          REFRESH_REVIEW_WEBHOOK_KEY: ${{ secrets.REFRESH_REVIEW_WEBHOOK_KEY }}
+        run: python pull_census_zip_population.py
+      - name: Upload Census ZIP population CSV
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: census-zip-population
+          path: census_zip_population.csv
+          retention-days: 90
+          if-no-files-found: error
+      - name: Export Supabase backup CSV
+        id: backup
+        if: failure()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python export_supabase_backup.py census_zip_population
+      - name: Upload Supabase backup CSV
+        if: failure() && steps.backup.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: census-zip-population
+          path: census_zip_population.csv
+          retention-days: 90
+          if-no-files-found: error

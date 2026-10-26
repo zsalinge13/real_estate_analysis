@@ -14,8 +14,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import load_california
+import pull_census_zip_population
 import pull_nfhl_flood_zones
 import pull_nri_census_tracts
+import pull_procedure_surgeon_fees
 
 NO_PRIOR_DATA = "There is no prior data to export."
 EXPORT_FAILED = "Could not export the Supabase backup."
@@ -44,6 +46,14 @@ def price_columns(_cur) -> tuple[str, ...]:
 
 def flood_columns(_cur) -> tuple[str, ...]:
     return pull_nfhl_flood_zones.CSV_COLUMNS
+
+
+def census_columns(_cur) -> tuple[str, ...]:
+    return pull_census_zip_population.COLUMNS
+
+
+def procedure_columns(_cur) -> tuple[str, ...]:
+    return pull_procedure_surgeon_fees.COLUMNS
 
 
 def nri_columns(cur) -> tuple[str, ...]:
@@ -93,6 +103,20 @@ def build_specs() -> dict[str, Spec]:
             connect=pull_nfhl_flood_zones.connect,
             columns=flood_columns,
             order_by=pull_nfhl_flood_zones.BACKUP_ORDER,
+        ),
+        Spec(
+            table=pull_census_zip_population.TABLE,
+            path=pull_census_zip_population.OUTPUT_CSV,
+            connect=pull_census_zip_population.connect,
+            columns=census_columns,
+            order_by=("acs_year", "zip"),
+        ),
+        Spec(
+            table=pull_procedure_surgeon_fees.TABLE,
+            path=pull_procedure_surgeon_fees.OUTPUT_CSV,
+            connect=pull_procedure_surgeon_fees.connect,
+            columns=procedure_columns,
+            order_by=("report_year", "procedure"),
         ),
     )
     return {spec.table_name: spec for spec in specs}

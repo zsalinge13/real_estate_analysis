@@ -9,3 +9,7 @@ nfhl_flood_zones_los_angeles.geojson
 nfhl_flood_zones_los_angeles.geojson.tmp
 nfhl_flood_zones.csv
 nfhl_flood_zones.csv.tmp
+census_zip_population.csv
+census_zip_population.csv.tmp
+procedure_surgeon_fees.csv
+procedure_surgeon_fees.csv.tmp
