@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -146,7 +147,31 @@ class CensusTests(unittest.TestCase):
         self.assertTrue(census.looks_like_key_error(302, headers, b""))
         self.assertTrue(census.looks_like_key_error(200, {}, b"<title>Missing Key</title>"))
         url = census.census_data_url(2024, ("B19013_001E",), ["90001"])
+        self.assertIn("in=state:06", url)
         self.assertNotIn("key=", url)
+        captured: list[str] = []
+
+        def fake_request(requested: str):
+            captured.append(requested)
+            return 200, {}, b'[["B19013_001E","zip code tabulation area"],["1","90001"]]'
+
+        original = census.request_bytes
+        previous = os.environ.get(census.CENSUS_API_KEY_ENV)
+        os.environ[census.CENSUS_API_KEY_ENV] = "example-key"
+        try:
+            census.request_bytes = fake_request
+            census.fetch_with_optional_key(
+                "https://api.census.gov/data/2024/acs/acs5?get=B19013_001E"
+            )
+        finally:
+            census.request_bytes = original
+            if previous is None:
+                os.environ.pop(census.CENSUS_API_KEY_ENV, None)
+            else:
+                os.environ[census.CENSUS_API_KEY_ENV] = previous
+        self.assertEqual(len(captured), 1)
+        self.assertIn("key=example-key", captured[0])
+        self.assertNotIn("example-key", url)
 
     def test_variable_chunks_cover_every_code(self):
         variables = tuple(f"B{index:05d}E" for index in range(43))
@@ -178,7 +203,9 @@ class CensusTests(unittest.TestCase):
         census.fetch_with_optional_key = fake
         try:
             with self.assertRaises(SystemExit) as caught:
-                census.fetch_query(2023, ["90001"], ("B19013_001E",))
+                census.fetch_query(
+                    2023, ["90001"], ("B19013_001E",), state=census.CALIFORNIA_STATE
+                )
         finally:
             census.fetch_with_optional_key = original
         self.assertIn("HTTP 500", str(caught.exception))
@@ -199,7 +226,9 @@ class CensusTests(unittest.TestCase):
         original = census.fetch_with_optional_key
         census.fetch_with_optional_key = fake
         try:
-            rows = census.fetch_query(2023, ["90001", "90002"], ("B19013_001E",))
+            rows = census.fetch_query(
+                2023, ["90001", "90002"], ("B19013_001E",), state=""
+            )
         finally:
             census.fetch_with_optional_key = original
         self.assertEqual(
@@ -249,6 +278,39 @@ class CensusTests(unittest.TestCase):
         finally:
             census.fetch_with_optional_key = original
         self.assertEqual(rows, [])
+
+    def test_server_error_without_state_retries_in_california(self):
+        def fake(url: str) -> bytes:
+            if "state:06" not in url:
+                raise SystemExit(
+                    "The Census API returned HTTP 500: "
+                    "There was an error while running your query. "
+                    "https://api.census.gov/data/developers.html"
+                )
+            return (
+                b'[["B19013_001E","zip code tabulation area"],'
+                b'["10","90001"]]'
+            )
+
+        original = census.fetch_with_optional_key
+        census.fetch_with_optional_key = fake
+        try:
+            rows = census.fetch_query(2023, ["90001"], ("B19013_001E",), state="")
+        finally:
+            census.fetch_with_optional_key = original
+        self.assertEqual(rows[0]["zip code tabulation area"], "90001")
+        self.assertEqual(rows[0]["B19013_001E"], "10")
+        shown = census.public_error(
+            SystemExit(
+                "The Census API returned HTTP 500: "
+                "There was an error while running your query. "
+                "https://api.census.gov/data/developers.html"
+            )
+        )
+        self.assertIn("HTTP 500", shown)
+        self.assertIn("error while running your query", shown)
+        self.assertNotIn("developers.html", shown)
+        self.assertNotIn("://", shown)
 
 
 if __name__ == "__main__":

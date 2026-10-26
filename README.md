@@ -88,7 +88,7 @@ The first load inserts the latest ACS 5-year vintage and the previous vintage. A
 
 Columns are `acs_year`, `zip`, `median_household_income` (`B19013_001E`), `per_capita_income` (`B19301_001E`), `median_age` (`B01002_001E`), `male_population` and `female_population` from `B01001`, `adult_population` (age 18 and older, summed from the `B01001` age bands), and `population_18_34`, `population_35_44`, `population_45_54`, `population_55_64`, and `population_65_plus`. Census sentinel values are stored as null. The primary key is (`zip`, `acs_year`).
 
-The data request is sent without an API key. If Census requires a key, the script reads `CENSUS_API_KEY` and does not print it. Add that repository secret when the keyless call is rejected.
+Los Angeles County ACS queries include California (`in=state:06`). When `CENSUS_API_KEY` is set, the script sends it on the first request and does not print it. A query that omitted the state is retried with California if Census returns an ambiguous-geography error or HTTP 500.
 
 `.github/workflows/pull-census-zip-population.yml` runs at 16:00 UTC on January 1 and July 1 (`0 16 1 1,7 *`) and on `workflow_dispatch`. After a successful load it uploads `census_zip_population.csv` as the `census-zip-population` artifact and keeps it for 90 days. If the load step fails, the job exports the current `public.census_zip_population` rows and uploads the same artifact. The job passes `DATABASE_URL`, `CENSUS_API_KEY`, and the refresh-review webhook secrets.
 

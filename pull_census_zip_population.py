@@ -10,8 +10,11 @@ A later run inserts a vintage only when it is not already stored. Older years
 stay in public.census_zip_population. The CSV is still written when
 DATABASE_URL is unset.
 
-The data API is called without a key first. If Census requires one, the key
-is read from CENSUS_API_KEY and is never printed.
+Los Angeles County ACS data queries always include California (in=state:06).
+A query sent without a state is retried with California when Census reports
+ambiguous geography or HTTP 500 ("error while running your query").
+
+When CENSUS_API_KEY is set, it is sent on the first request and is never printed.
 """
 
 from __future__ import annotations
@@ -41,6 +44,7 @@ USER_AGENT = load_california.USER_AGENT
 BATCH_SIZE = 20
 VARIABLE_CHUNK = 20
 GEO_COLUMN = "zip code tabulation area"
+CALIFORNIA_STATE = "06"
 KEY_REQUIRED = (
     "The Census American Community Survey API requires a key. "
     "Set the CENSUS_API_KEY secret. The repository does not contain a key."
@@ -207,14 +211,14 @@ def census_data_url(
     variables: tuple[str, ...],
     zips: list[str],
     key: str = "",
-    state: str = "",
+    state: str = CALIFORNIA_STATE,
 ) -> str:
     fields = {
         "get": ",".join(variables),
         "for": GEO_COLUMN + ":" + ",".join(zips),
     }
-    # Census asks for a state when a ZCTA list is ambiguous. These ZIPs are
-    # Los Angeles County, so the qualifier is California.
+    # These ZIPs are Los Angeles County. Census resolves a ZCTA list only when
+    # the query names California; omitting the state often returns HTTP 500.
     if state:
         fields["in"] = f"state:{state}"
     query = urllib.parse.urlencode(fields, quote_via=quote_census)
@@ -231,13 +235,19 @@ def census_message(status: int, body: bytes) -> str:
     text = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", text)
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"(?i)\bkey=[^&\s]+", "key=[REDACTED]", text)
-    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"(?i)https?://\S+", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     if len(text) > 200:
         text = text[:200].rstrip() + "..."
     if text:
         return f"The Census API returned HTTP {status}: {text}"
     return f"The Census API returned HTTP {status}."
+
+
+def query_server_error(message: str) -> bool:
+    """True when Census failed the query instead of naming a geography problem."""
+    lowered = message.lower()
+    return "http 500" in lowered or "error while running your query" in lowered
 
 
 def geography_problem(message: str) -> str | None:
@@ -319,7 +329,7 @@ class KeyRequired(Exception):
 
 
 def fetch_bytes(url: str) -> bytes:
-    """GET a Census URL. Retry once with CENSUS_API_KEY when Census asks for one."""
+    """GET a Census URL. A missing or rejected key raises KeyRequired."""
     status, headers, body = request_bytes(url)
     if status in {301, 302, 303, 307, 308} or looks_like_key_error(status, headers, body):
         raise KeyRequired()
@@ -328,25 +338,33 @@ def fetch_bytes(url: str) -> bytes:
     return body
 
 
+def with_census_key(url: str, key: str) -> str:
+    """Append a Census key without printing it. Leave a URL that already has one."""
+    if not key or "key=" in url.split("#", 1)[0]:
+        return url
+    joiner = "&" if "?" in url else "?"
+    return url + joiner + "key=" + urllib.parse.quote(key, safe="")
+
+
 def fetch_with_optional_key(url: str) -> bytes:
+    """GET a Census URL. Send CENSUS_API_KEY on the first request when it is set."""
+    key = os.environ.get(CENSUS_API_KEY_ENV, "").strip()
     try:
-        return fetch_bytes(url)
+        return fetch_bytes(with_census_key(url, key))
     except KeyRequired:
-        key = os.environ.get(CENSUS_API_KEY_ENV, "").strip()
         if not key:
             raise SystemExit(KEY_REQUIRED)
-        if "key=" in url.split("#", 1)[0]:
-            raise SystemExit("The Census API rejected CENSUS_API_KEY.")
-        joiner = "&" if "?" in url else "?"
-        try:
-            return fetch_bytes(url + joiner + "key=" + urllib.parse.quote(key, safe=""))
-        except KeyRequired:
-            raise SystemExit("The Census API rejected CENSUS_API_KEY.") from None
+        raise SystemExit("The Census API rejected CENSUS_API_KEY.") from None
 
 
 def public_error(exc: BaseException) -> str:
     text = str(exc)
+    text = re.sub(r"(?i)\bkey=[^&\s]+", "key=[REDACTED]", text)
+    text = re.sub(r"(?i)https?://\S+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
     lowered = text.lower()
+    if text == KEY_REQUIRED:
+        return text
     if (
         "://" in text
         or "postgres" in lowered
@@ -354,11 +372,7 @@ def public_error(exc: BaseException) -> str:
         or "password" in lowered
         or CENSUS_API_KEY_ENV in text
     ):
-        if text == KEY_REQUIRED:
-            return text
         return "The Census ZIP load failed."
-    if isinstance(exc, SystemExit) and isinstance(exc.code, str) and exc.code:
-        return exc.code
     if text:
         return text
     return "The Census ZIP load failed."
@@ -523,8 +537,16 @@ def parse_table(body: bytes) -> list[dict[str, str]]:
     return records
 
 
+def exit_text(exc: SystemExit) -> str:
+    if isinstance(exc.code, str) and exc.code:
+        return exc.code
+    return str(exc) or "The Census ZIP load failed."
+
+
 def key_failure(exc: SystemExit) -> bool:
-    message = public_error(exc)
+    # Use the raw message. public_error hides the env-var name, which would
+    # make a rejected key look like a geography error and split the query.
+    message = exit_text(exc)
     return message == KEY_REQUIRED or "rejected CENSUS_API_KEY" in message
 
 
@@ -532,7 +554,7 @@ def fetch_query(
     year: int,
     zips: list[str],
     variables: tuple[str, ...],
-    state: str = "",
+    state: str = CALIFORNIA_STATE,
 ) -> list[dict[str, str]]:
     """Download one ACS table. Split a query Census rejects, and keep the API text."""
     if not zips or not variables:
@@ -543,7 +565,7 @@ def fetch_query(
     except SystemExit as exc:
         if key_failure(exc):
             raise
-        return recover_query(year, zips, variables, state, public_error(exc))
+        return recover_query(year, zips, variables, state, exit_text(exc))
     try:
         return parse_table(body)
     except SystemExit:
@@ -558,8 +580,8 @@ def recover_query(
     message: str,
 ) -> list[dict[str, str]]:
     problem = geography_problem(message)
-    if problem == "ambiguous" and not state:
-        return fetch_query(year, zips, variables, state="06")
+    if not state and (problem == "ambiguous" or query_server_error(message)):
+        return fetch_query(year, zips, variables, state=CALIFORNIA_STATE)
     if problem == "unknown" and len(zips) == 1:
         return []
     if len(variables) > 1:
@@ -581,7 +603,7 @@ def fetch_year(year: int, zips: list[str], variables: tuple[str, ...]) -> list[d
     records: list[dict[str, str]] = []
     for group in variable_chunks(variables):
         for batch in chunks(zips, BATCH_SIZE):
-            records.extend(fetch_query(year, list(batch), group))
+            records.extend(fetch_query(year, list(batch), group, state=CALIFORNIA_STATE))
             time.sleep(0.1)
     return merge_records(records)
 
