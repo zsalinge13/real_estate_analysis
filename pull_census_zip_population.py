@@ -19,6 +19,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -37,7 +38,9 @@ TABLE = "public.census_zip_population"
 OUTPUT_CSV_NAME = "census_zip_population.csv"
 OUTPUT_CSV = Path(__file__).resolve().parent / OUTPUT_CSV_NAME
 USER_AGENT = load_california.USER_AGENT
-BATCH_SIZE = 40
+BATCH_SIZE = 20
+VARIABLE_CHUNK = 20
+GEO_COLUMN = "zip code tabulation area"
 KEY_REQUIRED = (
     "The Census American Community Survey API requires a key. "
     "Set the CENSUS_API_KEY secret. The repository does not contain a key."
@@ -199,18 +202,78 @@ def quote_census(value: str, safe: str = "", encoding: str | None = None, errors
     )
 
 
-def census_data_url(year: int, variables: tuple[str, ...], zips: list[str], key: str = "") -> str:
-    query = urllib.parse.urlencode(
-        {
-            "get": ",".join(variables),
-            "for": "zip code tabulation area:" + ",".join(zips),
-        },
-        quote_via=quote_census,
-    )
+def census_data_url(
+    year: int,
+    variables: tuple[str, ...],
+    zips: list[str],
+    key: str = "",
+    state: str = "",
+) -> str:
+    fields = {
+        "get": ",".join(variables),
+        "for": GEO_COLUMN + ":" + ",".join(zips),
+    }
+    # Census asks for a state when a ZCTA list is ambiguous. These ZIPs are
+    # Los Angeles County, so the qualifier is California.
+    if state:
+        fields["in"] = f"state:{state}"
+    query = urllib.parse.urlencode(fields, quote_via=quote_census)
     url = f"https://api.census.gov/data/{year}/acs/acs5?{query}"
     if key:
         url += "&key=" + urllib.parse.quote(key, safe="")
     return url
+
+
+def census_message(status: int, body: bytes) -> str:
+    """Short API error with secrets and links removed."""
+    text = body[:700].decode("utf-8", errors="replace")
+    text = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", text)
+    text = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"(?i)\bkey=[^&\s]+", "key=[REDACTED]", text)
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > 200:
+        text = text[:200].rstrip() + "..."
+    if text:
+        return f"The Census API returned HTTP {status}: {text}"
+    return f"The Census API returned HTTP {status}."
+
+
+def geography_problem(message: str) -> str | None:
+    lowered = message.lower()
+    if "ambiguous geography" in lowered or "qualify it with state" in lowered:
+        return "ambiguous"
+    if (
+        "unknown geography" in lowered
+        or "unknown/unsupported geography" in lowered
+        or "not a valid geography" in lowered
+    ):
+        return "unknown"
+    return None
+
+
+def variable_chunks(variables: tuple[str, ...], size: int = VARIABLE_CHUNK) -> list[tuple[str, ...]]:
+    if size < 1:
+        raise SystemExit("The ACS variable chunk size is invalid.")
+    return [tuple(variables[index : index + size]) for index in range(0, len(variables), size)]
+
+
+def merge_records(*groups: list[dict[str, str]]) -> list[dict[str, str]]:
+    merged: dict[str, dict[str, str]] = {}
+    order: list[str] = []
+    for records in groups:
+        for record in records:
+            zip_code = (record.get(GEO_COLUMN) or "").strip()
+            if not zip_code:
+                continue
+            current = merged.get(zip_code)
+            if current is None:
+                current = {}
+                merged[zip_code] = current
+                order.append(zip_code)
+            current.update(record)
+    return [merged[zip_code] for zip_code in order]
 
 
 def looks_like_key_error(status: int, headers, body: bytes) -> bool:
@@ -261,7 +324,7 @@ def fetch_bytes(url: str) -> bytes:
     if status in {301, 302, 303, 307, 308} or looks_like_key_error(status, headers, body):
         raise KeyRequired()
     if status != 200:
-        raise SystemExit(f"The Census API returned HTTP {status}.")
+        raise SystemExit(census_message(status, body))
     return body
 
 
@@ -449,7 +512,7 @@ def parse_table(body: bytes) -> list[dict[str, str]]:
     if not payload or not isinstance(payload, list) or not payload[0]:
         raise SystemExit("The Census API returned an empty table.")
     header = payload[0]
-    geo_name = "zip code tabulation area"
+    geo_name = GEO_COLUMN
     if geo_name not in header:
         raise SystemExit("The Census API table has no ZCTA column.")
     records = []
@@ -460,48 +523,67 @@ def parse_table(body: bytes) -> list[dict[str, str]]:
     return records
 
 
-def fetch_batch(year: int, zips: list[str], variables: tuple[str, ...]) -> list[dict[str, str]] | None:
-    """Return rows, or None when this geography list is not a published ZCTA set."""
-    url = census_data_url(year, variables, zips)
+def key_failure(exc: SystemExit) -> bool:
+    message = public_error(exc)
+    return message == KEY_REQUIRED or "rejected CENSUS_API_KEY" in message
+
+
+def fetch_query(
+    year: int,
+    zips: list[str],
+    variables: tuple[str, ...],
+    state: str = "",
+) -> list[dict[str, str]]:
+    """Download one ACS table. Split a query Census rejects, and keep the API text."""
+    if not zips or not variables:
+        return []
+    url = census_data_url(year, variables, zips, state=state)
     try:
         body = fetch_with_optional_key(url)
     except SystemExit as exc:
-        message = public_error(exc)
-        if message == KEY_REQUIRED or "rejected CENSUS_API_KEY" in message:
+        if key_failure(exc):
             raise
-        if len(zips) == 1:
-            return None
-        raise
-    return parse_table(body)
+        return recover_query(year, zips, variables, state, public_error(exc))
+    try:
+        return parse_table(body)
+    except SystemExit:
+        return recover_query(year, zips, variables, state, census_message(200, body))
+
+
+def recover_query(
+    year: int,
+    zips: list[str],
+    variables: tuple[str, ...],
+    state: str,
+    message: str,
+) -> list[dict[str, str]]:
+    problem = geography_problem(message)
+    if problem == "ambiguous" and not state:
+        return fetch_query(year, zips, variables, state="06")
+    if problem == "unknown" and len(zips) == 1:
+        return []
+    if len(variables) > 1:
+        middle = len(variables) // 2
+        left = fetch_query(year, zips, variables[:middle], state)
+        time.sleep(0.05)
+        right = fetch_query(year, zips, variables[middle:], state)
+        return merge_records(left, right)
+    if len(zips) > 1:
+        middle = len(zips) // 2
+        left = fetch_query(year, zips[:middle], variables, state)
+        time.sleep(0.05)
+        right = fetch_query(year, zips[middle:], variables, state)
+        return left + right
+    raise SystemExit(message)
 
 
 def fetch_year(year: int, zips: list[str], variables: tuple[str, ...]) -> list[dict[str, str]]:
     records: list[dict[str, str]] = []
-    for batch in chunks(zips, BATCH_SIZE):
-        try:
-            parsed = fetch_batch(year, batch, variables)
-        except SystemExit as exc:
-            message = public_error(exc)
-            if message == KEY_REQUIRED or "rejected CENSUS_API_KEY" in message:
-                raise
-            if len(batch) == 1:
-                continue
-            for zip_code in batch:
-                time.sleep(0.1)
-                one = fetch_batch(year, [zip_code], variables)
-                if one:
-                    records.extend(one)
-            continue
-        if parsed is None:
-            for zip_code in batch:
-                time.sleep(0.1)
-                one = fetch_batch(year, [zip_code], variables)
-                if one:
-                    records.extend(one)
-            continue
-        records.extend(parsed)
-        time.sleep(0.15)
-    return records
+    for group in variable_chunks(variables):
+        for batch in chunks(zips, BATCH_SIZE):
+            records.extend(fetch_query(year, list(batch), group))
+            time.sleep(0.1)
+    return merge_records(records)
 
 
 def rows_for_vintage(year: int, zips: list[str]) -> list[tuple]:
