@@ -79,3 +79,29 @@ When `DATABASE_URL` is set, the script replaces every row in `public.nri_census_
 It queries layer 28 of the [NFHL MapServer](https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28). That layer has no county-name field. The county id is `DFIRM_ID`, Los Angeles County FIPS is `06037`, and the filter is `DFIRM_ID LIKE '06037%'`. `returnGeometry` is true, coordinates are WGS84, and results are paged. Attributes kept are `DFIRM_ID`, `FLD_ZONE`, `ZONE_SUBTY`, `SFHA_TF`, `STATIC_BFE`, and `DEPTH`. Each feature also has `COUNTY` set to `Los Angeles`.
 
 The connection string is the `DATABASE_URL` environment variable, the same as the price load. The script creates `public.nfhl_flood_zones` when that table is missing. Its columns are `dfirm_id`, `fld_zone`, `zone_subty`, `sfha_tf`, `static_bfe`, `depth`, `county`, and `geometry`. `geometry` is the polygon as GeoJSON text. A run deletes and reinserts only that table. Install `psycopg` from `requirements.txt`.
+
+## Census ZIP population
+
+`pull_census_zip_population.py` loads American Community Survey 5-year estimates for the Los Angeles County ZIP codes in the home-value extract. A ZIP is kept only when it is in `california_zip_inventory.csv` and the same Census ZCTA-to-county relationship file used by `load_california.py` says Los Angeles County, FIPS `06037`, is its majority county by land area. The stored geography is the ZIP Code Tabulation Area, in the `zip` column. The script does not read office, dermatology, or NPI locations.
+
+The first load inserts the latest ACS 5-year vintage and the previous vintage. A later run inserts a vintage only when that year is not already in `public.census_zip_population`. Older years are not deleted. After the estimates download, the script writes `census_zip_population.csv` even when `DATABASE_URL` is unset, and in that case it leaves the table unchanged. That CSV is the two vintages from the run. It is not committed. The estimates request is the step that needs a Census key; without one, no CSV is written.
+
+Columns are `acs_year`, `zip`, `median_household_income` (`B19013_001E`), `per_capita_income` (`B19301_001E`), `median_age` (`B01002_001E`), `male_population` and `female_population` from `B01001`, `adult_population` (age 18 and older, summed from the `B01001` age bands), and `population_18_34`, `population_35_44`, `population_45_54`, `population_55_64`, and `population_65_plus`. Census sentinel values are stored as null. The primary key is (`zip`, `acs_year`).
+
+The data request is sent without an API key. If Census requires a key, the script reads `CENSUS_API_KEY` and does not print it. Add that repository secret when the keyless call is rejected.
+
+`.github/workflows/pull-census-zip-population.yml` runs at 16:00 UTC on January 1 (`0 16 1 1 *`) and on `workflow_dispatch`. After a successful load it uploads `census_zip_population.csv` as the `census-zip-population` artifact and keeps it for 90 days. If the load step fails, the job exports the current `public.census_zip_population` rows and uploads the same artifact. The job passes `DATABASE_URL`, `CENSUS_API_KEY`, and the refresh-review webhook secrets.
+
+## National procedure counts and surgeon fees
+
+`pull_procedure_surgeon_fees.py` loads national aesthetic procedure counts and surgeon fee ranges from the American Society of Plastic Surgeons procedural statistics reports. The table is national. It is not a Los Angeles fee. `fee_basis` says: national surgeon fee only, excludes anesthesia and facility, not Los Angeles. There are no office locations.
+
+Each run tries the official PDF for the current year back through 2024:
+
+`https://www.plasticsurgery.org/documents/news/statistics/{year}/plastic-surgery-statistics-report-{year}.pdf`
+
+It upserts the years it can read and does not delete other years in `public.procedure_surgeon_fees`. The primary key is (`procedure`, `report_year`). A checked-in seed is used only when that year's official PDF cannot be fetched. The 2024 URL currently returns 404, so `seeds/procedure_surgeon_fees_2024.csv` supplies the 2024 counts and fee ranges read from that report. When the URL works again, the PDF replaces the seed. The 2025 report publishes counts and does not publish surgeon fees, so 2025 fee columns stay null. 2024 fees are not copied onto 2025.
+
+2024 publishes separate upper and lower blepharoplasty fee ranges. Those two ranges are not combined into one eyelid-surgery fee, so `eyelid surgery` keeps its published count and null fee columns.
+
+The CSV `procedure_surgeon_fees.csv` is written even when `DATABASE_URL` is unset. It is not committed. `.github/workflows/pull-procedure-surgeon-fees.yml` runs at 16:00 UTC on January 1 and on `workflow_dispatch`. The job installs `poppler-utils` for `pdftotext`. After success it uploads `procedure_surgeon_fees.csv` as the `procedure-surgeon-fees` artifact for 90 days. If the load fails, it exports the current table to that same CSV and uploads the same artifact. The job passes `DATABASE_URL` and the refresh-review webhook secrets.
