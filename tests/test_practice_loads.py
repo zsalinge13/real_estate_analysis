@@ -104,9 +104,127 @@ class CensusTests(unittest.TestCase):
         self.assertEqual(kept, {"90001", "90210"})
 
     def test_new_vintage_only(self):
-        self.assertEqual(census.vintages_to_insert([2023, 2024], set()), [2023, 2024])
-        self.assertEqual(census.vintages_to_insert([2023, 2024], {2023}), [2024])
-        self.assertEqual(census.vintages_to_insert([2024, 2025], {2023, 2024}), [2025])
+        self.assertEqual(census.vintages_to_insert([2024], set()), [2024])
+        self.assertEqual(census.vintages_to_insert([2024], {2023}), [2024])
+        self.assertEqual(census.vintages_to_insert([2024], {2023, 2024}), [])
+
+    def test_latest_vintage_is_only_the_newest_published_year(self):
+        def fake_request(url: str):
+            if "/2026/" in url or "/2025/" in url:
+                return 404, {}, b"<html><title>HTTP Status 404 Not Found</title></html>"
+            if "/2024/" in url:
+                return 200, {}, b'{"name": "B19013_001E"}'
+            if "/2023/" in url:
+                raise AssertionError("an older vintage must not be required")
+            raise AssertionError("unexpected Census year")
+
+        original = census.request_bytes
+        previous = os.environ.get(census.CENSUS_API_KEY_ENV)
+        os.environ.pop(census.CENSUS_API_KEY_ENV, None)
+        census.request_bytes = fake_request
+        try:
+            self.assertEqual(census.latest_vintage(2026), 2024)
+        finally:
+            census.request_bytes = original
+            if previous is None:
+                os.environ.pop(census.CENSUS_API_KEY_ENV, None)
+            else:
+                os.environ[census.CENSUS_API_KEY_ENV] = previous
+
+    def test_invalid_key_page_is_not_an_unpublished_vintage(self):
+        def fake_request(_url: str):
+            return (
+                200,
+                {"Content-Type": "text/html"},
+                b"<html><title>Invalid Key</title>invalid_key.html</html>",
+            )
+
+        original = census.request_bytes
+        previous = os.environ.get(census.CENSUS_API_KEY_ENV)
+        os.environ[census.CENSUS_API_KEY_ENV] = "example-key"
+        census.request_bytes = fake_request
+        try:
+            with self.assertRaises(SystemExit) as caught:
+                census.latest_vintage(2026)
+        finally:
+            census.request_bytes = original
+            if previous is None:
+                os.environ.pop(census.CENSUS_API_KEY_ENV, None)
+            else:
+                os.environ[census.CENSUS_API_KEY_ENV] = previous
+        self.assertEqual(census.exit_text(caught.exception), census.REJECTED_KEY)
+        shown = census.public_error(caught.exception)
+        self.assertEqual(shown, census.REJECTED_KEY)
+        self.assertNotIn("two ACS", shown)
+        self.assertNotIn("example-key", shown)
+        self.assertNotIn("did not list", shown)
+
+    def test_stored_vintage_inserts_nothing_and_does_not_delete(self):
+        class Cursor:
+            def __init__(self, years: set[int]):
+                self.years = years
+                self.statements: list[str] = []
+                self.inserted: list[tuple] = []
+                self._rows = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def execute(self, sql, _params=None):
+                text = " ".join(sql.split())
+                self.statements.append(text)
+                if "information_schema.tables" in text:
+                    self._rows = [(1,)]
+                elif "DISTINCT acs_year" in text:
+                    self._rows = [(year,) for year in sorted(self.years)]
+                elif "COUNT(*)" in text:
+                    self._rows = [(len(self.years) + len(self.inserted),)]
+                else:
+                    self._rows = None
+
+            def executemany(self, sql, rows):
+                self.statements.append(" ".join(sql.split()))
+                self.inserted.extend(rows)
+
+            def fetchone(self):
+                return None if not self._rows else self._rows[0]
+
+            def fetchall(self):
+                return list(self._rows or [])
+
+        class Connection:
+            def __init__(self, years: set[int]):
+                self.cursor_obj = Cursor(years)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def transaction(self):
+                return self
+
+            def cursor(self):
+                return self.cursor_obj
+
+        stored = Connection({2023, 2024})
+        inserted, total = census.insert_new_years(stored, [(2024, "90001")])
+        self.assertEqual(inserted, 0)
+        self.assertEqual(total, 2)
+        self.assertEqual(stored.cursor_obj.inserted, [])
+        self.assertNotIn("delete", " ".join(stored.cursor_obj.statements).lower())
+
+        missing = Connection({2023})
+        row = (2024, "90001")
+        inserted, total = census.insert_new_years(missing, [row])
+        self.assertEqual(inserted, 1)
+        self.assertEqual(total, 2)
+        self.assertEqual(missing.cursor_obj.inserted, [row])
+        self.assertNotIn("delete", " ".join(missing.cursor_obj.statements).lower())
 
     def test_age_bands_sum_adults_and_drop_sentinels(self):
         self.assertIsNone(census.parse_estimate("-666666666"))
@@ -146,6 +264,13 @@ class CensusTests(unittest.TestCase):
         headers = {"X-DataWebAPI-KeyError": "1", "Location": "https://api.census.gov/data/missing_key.html"}
         self.assertTrue(census.looks_like_key_error(302, headers, b""))
         self.assertTrue(census.looks_like_key_error(200, {}, b"<title>Missing Key</title>"))
+        self.assertTrue(
+            census.looks_like_key_error(
+                200,
+                {"Location": "https://api.census.gov/data/invalid_key.html"},
+                b"<html><title>Invalid Key</title></html>",
+            )
+        )
         url = census.census_data_url(2024, ("B19013_001E",), ["90001"])
         self.assertIn("in=state:06", url)
         self.assertNotIn("key=", url)

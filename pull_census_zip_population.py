@@ -5,8 +5,8 @@ price script's Los Angeles County filter: Census ZCTA-to-county relationship
 file, FIPS 06037, majority land area. ZCTAs are stored in the zip column.
 This script does not read office, dermatology, or NPI locations.
 
-The first load inserts the latest ACS 5-year vintage and the previous one.
-A later run inserts a vintage only when it is not already stored. Older years
+A run fetches and inserts only the latest published ACS 5-year vintage.
+That vintage is inserted only when it is not already stored. Older years
 stay in public.census_zip_population. The CSV is still written when
 DATABASE_URL is unset.
 
@@ -49,6 +49,7 @@ KEY_REQUIRED = (
     "The Census American Community Survey API requires a key. "
     "Set the CENSUS_API_KEY secret. The repository does not contain a key."
 )
+REJECTED_KEY = "The Census API rejected CENSUS_API_KEY."
 COLUMNS = (
     "acs_year",
     "zip",
@@ -188,7 +189,8 @@ def los_angeles_home_value_zips() -> set[str]:
     print(
         f"Home-value file ZIPs: {len(home_value)}. "
         f"Majority Los Angeles County ZIPs: {len(county)}. "
-        f"Kept: {len(kept)}."
+        f"Kept: {len(kept)}.",
+        flush=True,
     )
     if not kept:
         raise SystemExit(
@@ -290,7 +292,7 @@ def looks_like_key_error(status: int, headers, body: bytes) -> bool:
     if headers.get("X-DataWebAPI-KeyError"):
         return True
     location = headers.get("Location") or ""
-    if "missing_key" in location:
+    if "missing_key" in location or "invalid_key" in location:
         return True
     if status in {401, 403}:
         return True
@@ -354,7 +356,7 @@ def fetch_with_optional_key(url: str) -> bytes:
     except KeyRequired:
         if not key:
             raise SystemExit(KEY_REQUIRED)
-        raise SystemExit("The Census API rejected CENSUS_API_KEY.") from None
+        raise SystemExit(REJECTED_KEY) from None
 
 
 def public_error(exc: BaseException) -> str:
@@ -363,7 +365,7 @@ def public_error(exc: BaseException) -> str:
     text = re.sub(r"(?i)https?://\S+", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     lowered = text.lower()
-    if text == KEY_REQUIRED:
+    if text in {KEY_REQUIRED, REJECTED_KEY}:
         return text
     if (
         "://" in text
@@ -385,7 +387,9 @@ def vintage_published(year: int) -> bool:
     try:
         body = fetch_with_optional_key(url)
     except SystemExit as exc:
-        if exc.code == KEY_REQUIRED:
+        # A rejected key is HTTP 200 HTML (invalid_key.html). That is not an
+        # unpublished vintage, and it must not be reported as a missing year.
+        if key_failure(exc):
             raise
         return False
     if not body.lstrip().startswith(b"{"):
@@ -397,17 +401,14 @@ def vintage_published(year: int) -> bool:
     return payload.get("name") == "B19013_001E"
 
 
-def latest_vintages(this_year: int) -> list[int]:
-    """The newest published ACS 5-year vintage and the one before it."""
-    found: list[int] = []
+def latest_vintage(this_year: int) -> int:
+    """The newest published ACS 5-year vintage."""
     year = this_year
-    while year >= 2009 and len(found) < 2:
+    while year >= 2009:
         if vintage_published(year):
-            found.append(year)
+            return year
         year -= 1
-    if len(found) < 2:
-        raise SystemExit("The Census API did not list two ACS 5-year vintages.")
-    return sorted(found)
+    raise SystemExit("The Census API did not list an ACS 5-year vintage.")
 
 
 def group_labels(year: int) -> dict[str, str]:
@@ -544,10 +545,10 @@ def exit_text(exc: SystemExit) -> str:
 
 
 def key_failure(exc: SystemExit) -> bool:
-    # Use the raw message. public_error hides the env-var name, which would
-    # make a rejected key look like a geography error and split the query.
+    # Use the raw message. A redacted public string would no longer name the
+    # key failure, and the query would be split instead of stopped.
     message = exit_text(exc)
-    return message == KEY_REQUIRED or "rejected CENSUS_API_KEY" in message
+    return message in {KEY_REQUIRED, REJECTED_KEY}
 
 
 def fetch_query(
@@ -624,7 +625,10 @@ def rows_for_vintage(year: int, zips: list[str]) -> list[tuple]:
             for code in variables
         }
         rows.append(row_from_estimates(year, zip_code, estimates))
-    print(f"ACS {year}: {len(rows)} of {len(zips)} Los Angeles County home-value ZIPs.")
+    print(
+        f"ACS {year}: {len(rows)} of {len(zips)} Los Angeles County home-value ZIPs.",
+        flush=True,
+    )
     if len(rows) < max(1, len(zips) // 2):
         raise SystemExit(
             f"ACS {year} returned too few Los Angeles County home-value ZIPs."
@@ -768,13 +772,10 @@ def notify_refresh_review(table: str) -> int:
 def main() -> int:
     try:
         zips = sorted(los_angeles_home_value_zips())
-        vintages = latest_vintages(datetime.now(timezone.utc).year)
-        print(f"ACS 5-year vintages: {vintages[0]} and {vintages[1]}.")
-        for year in vintages:
-            verify_labels(year)
-        rows: list[tuple] = []
-        for year in vintages:
-            rows.extend(rows_for_vintage(year, zips))
+        vintage = latest_vintage(datetime.now(timezone.utc).year)
+        print(f"ACS 5-year vintage: {vintage}.", flush=True)
+        verify_labels(vintage)
+        rows = rows_for_vintage(vintage, zips)
         rows.sort(key=lambda row: (row[0], row[1]))
     except SystemExit as exc:
         print(public_error(exc), file=sys.stderr)
