@@ -148,6 +148,108 @@ class CensusTests(unittest.TestCase):
         url = census.census_data_url(2024, ("B19013_001E",), ["90001"])
         self.assertNotIn("key=", url)
 
+    def test_variable_chunks_cover_every_code(self):
+        variables = tuple(f"B{index:05d}E" for index in range(43))
+        chunks = census.variable_chunks(variables)
+        self.assertTrue(chunks)
+        self.assertTrue(all(1 <= len(chunk) <= census.VARIABLE_CHUNK for chunk in chunks))
+        self.assertEqual(tuple(code for chunk in chunks for code in chunk), variables)
+
+    def test_census_message_drops_markup_links_and_keys(self):
+        body = (
+            b"<html><title>Query failed</title>"
+            b"<a href='https://example.com/path?key=secret-value'>docs</a></html>"
+        )
+        message = census.census_message(400, body)
+        self.assertIn("HTTP 400", message)
+        self.assertIn("Query failed", message)
+        self.assertNotIn("secret-value", message)
+        self.assertNotIn("example.com", message)
+        self.assertNotIn("<", message)
+
+    def test_http_error_for_one_zip_is_not_treated_as_missing(self):
+        def fake(_url: str) -> bytes:
+            raise SystemExit(
+                "The Census API returned HTTP 500: "
+                "There was an error while running your query."
+            )
+
+        original = census.fetch_with_optional_key
+        census.fetch_with_optional_key = fake
+        try:
+            with self.assertRaises(SystemExit) as caught:
+                census.fetch_query(2023, ["90001"], ("B19013_001E",))
+        finally:
+            census.fetch_with_optional_key = original
+        self.assertIn("HTTP 500", str(caught.exception))
+        self.assertNotIn("too few", str(caught.exception))
+
+    def test_ambiguous_zcta_list_retries_in_california(self):
+        def fake(url: str) -> bytes:
+            if "state:06" not in url:
+                raise SystemExit(
+                    "The Census API returned HTTP 400: error: ambiguous geography. "
+                    "You must either specify a wildcard or full qualify it with state."
+                )
+            return (
+                b'[["B19013_001E","zip code tabulation area"],'
+                b'["10","90001"],["11","90002"]]'
+            )
+
+        original = census.fetch_with_optional_key
+        census.fetch_with_optional_key = fake
+        try:
+            rows = census.fetch_query(2023, ["90001", "90002"], ("B19013_001E",))
+        finally:
+            census.fetch_with_optional_key = original
+        self.assertEqual(
+            [row["zip code tabulation area"] for row in rows],
+            ["90001", "90002"],
+        )
+
+    def test_rejected_variable_list_is_split_and_merged(self):
+        def fake(url: str) -> bytes:
+            get = url.split("get=", 1)[1].split("&", 1)[0]
+            codes = [code for code in get.split(",") if code]
+            if len(codes) > 1:
+                raise SystemExit(
+                    "The Census API returned HTTP 500: "
+                    "There was an error while running your query."
+                )
+            code = codes[0]
+            return (
+                f'[["{code}","zip code tabulation area"],["5","90001"]]'
+            ).encode()
+
+        original = census.fetch_with_optional_key
+        census.fetch_with_optional_key = fake
+        try:
+            rows = census.fetch_query(
+                2023,
+                ["90001"],
+                ("B19013_001E", "B19301_001E"),
+            )
+        finally:
+            census.fetch_with_optional_key = original
+        self.assertEqual(rows[0]["zip code tabulation area"], "90001")
+        self.assertEqual(rows[0]["B19013_001E"], "5")
+        self.assertEqual(rows[0]["B19301_001E"], "5")
+
+    def test_unknown_geography_for_one_zip_is_skipped(self):
+        def fake(_url: str) -> bytes:
+            raise SystemExit(
+                "The Census API returned HTTP 400: unknown geography "
+                "zip code tabulation area:99999"
+            )
+
+        original = census.fetch_with_optional_key
+        census.fetch_with_optional_key = fake
+        try:
+            rows = census.fetch_query(2023, ["99999"], ("B19013_001E",))
+        finally:
+            census.fetch_with_optional_key = original
+        self.assertEqual(rows, [])
+
 
 if __name__ == "__main__":
     unittest.main()
