@@ -11,5 +11,7 @@ nfhl_flood_zones.csv
 nfhl_flood_zones.csv.tmp
 census_zip_population.csv
 census_zip_population.csv.tmp
+zip_census_redfin_join.csv
+zip_census_redfin_join.csv.tmp
 procedure_surgeon_fees.csv
 procedure_surgeon_fees.csv.tmp

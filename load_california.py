@@ -10,11 +10,17 @@ ZCTA-to-county relationship file says Los Angeles County (FIPS 06037) is its
 majority county by land area. The place name is not used. Only the
 listing-price and active-count columns below are loaded.
 
-Each run replaces public.redfin_real_estate_value. Existing rows in that table are
-deleted, then the current extract is inserted, so a ZIP or month that left
-the file does not stay in the table. No other table is dropped or altered.
-The same extract is written to california_zip_inventory.csv, overwriting that
-file. The filename does not change from run to run.
+A scheduled or manual run replaces public.redfin_real_estate_value. Existing
+rows in that table are deleted, then the current extract is inserted, so a
+ZIP or month that left the file does not stay in the table. No other table
+is dropped or altered. The same extract is written to
+california_zip_inventory.csv, overwriting that file. The filename does not
+change from run to run.
+
+python load_california.py --census-year YYYY keeps only months in that
+calendar year. Those rows are inserted or updated. Months already stored
+are not deleted. The CSV from that run contains that year only. The chained
+Census workflow uses this so older Redfin months stay in Supabase.
 """
 
 from __future__ import annotations
@@ -189,6 +195,68 @@ def month_text(yyyymm: str) -> str | None:
     return f"{year:04d}_{month:02d}"
 
 
+def in_census_year(month: str, year: int) -> bool:
+    """True when `month` is `yyyy_mm` in the Census calendar year."""
+    if isinstance(year, bool) or not isinstance(year, int):
+        return False
+    if len(month) != 7 or month[4] != "_":
+        return False
+    if month[:4] != f"{year:04d}" or not month[5:].isdigit():
+        return False
+    return 1 <= int(month[5:]) <= 12
+
+
+def parse_census_year(raw: str) -> int:
+    text = raw.strip()
+    if len(text) != 4 or not text.isdigit():
+        raise SystemExit(
+            "The Census acs_year must be a four-digit year. "
+            f"Got {raw!r}."
+        )
+    year = int(text)
+    if year < 2009 or year > 2100:
+        raise SystemExit(f"The Census acs_year {year} is outside 2009-2100.")
+    return year
+
+
+def census_year_arg(argv: list[str]) -> int | None:
+    """None means the full replace. A year means upsert that year only."""
+    if len(argv) == 1:
+        return None
+    if len(argv) == 3 and argv[1] == "--census-year":
+        return parse_census_year(argv[2])
+    raise SystemExit("Usage: python load_california.py [--census-year YYYY]")
+
+
+def census_year_month_pattern(year: int) -> str:
+    """Postgres regex for `yyyy_mm` months in one calendar year."""
+    if isinstance(year, bool) or not isinstance(year, int):
+        raise SystemExit("The Census year is not an integer.")
+    return f"^{year:04d}_(0[1-9]|1[0-2])$"
+
+
+def census_year_upsert_sql() -> str:
+    """Insert or update staged rows. The statement does not delete anything."""
+    columns = ", ".join(LOAD_COLUMNS)
+    assignments = ", ".join(
+        f"{name} = EXCLUDED.{name}"
+        for name in LOAD_COLUMNS
+        if name not in {"postal_code", "month_date_yyyymm"}
+    )
+    sql = (
+        f"INSERT INTO {TABLE} ({columns}) "
+        "SELECT DISTINCT ON (postal_code, month_date_yyyymm) "
+        f"{columns} "
+        "FROM staging_redfin_real_estate_value "
+        "ORDER BY postal_code, month_date_yyyymm, load_seq DESC "
+        "ON CONFLICT (postal_code, month_date_yyyymm) DO UPDATE SET "
+        f"{assignments}"
+    )
+    if "DELETE" in sql.upper():
+        raise SystemExit("The census-year Redfin load must not delete rows.")
+    return sql
+
+
 def pull_date_text(moment: datetime | None = None) -> str:
     """Calendar date of the run in America/Los_Angeles, as yyyy_mm_dd text."""
     current = moment if moment is not None else datetime.now(PACIFIC)
@@ -288,7 +356,10 @@ def require_header(fieldnames: list[str] | None) -> list[str]:
 
 
 def iter_los_angeles_rows(
-    reader: csv.DictReader, pull_date: str, postal_codes: set[str]
+    reader: csv.DictReader,
+    pull_date: str,
+    postal_codes: set[str],
+    census_year: int | None = None,
 ):
     require_header(reader.fieldnames)
     for row in reader:
@@ -298,6 +369,8 @@ def iter_los_angeles_rows(
         zip_name = (row.get("zip_name") or "").strip()
         month = month_text((row.get("month_date_yyyymm") or "").strip())
         if month is None:
+            continue
+        if census_year is not None and not in_census_year(month, census_year):
             continue
         measures = []
         for column in MEASURE_COLUMNS:
@@ -574,18 +647,104 @@ def replace_table(conn) -> int:
     return count
 
 
-def load_history(conn, url: str, pull_date: str) -> int:
+class CensusYearRejected(Exception):
+    """The census-year load stopped before changing stored Redfin months."""
+
+
+def upsert_census_year(conn, year: int) -> int:
+    """Insert or update one census calendar year and write that year to the CSV.
+
+    Months already stored outside this load stay in the table.
+    """
+    pattern = census_year_month_pattern(year)
+    sql = census_year_upsert_sql()
+    columns = ", ".join(LOAD_COLUMNS)
+    select_sql = (
+        f"SELECT {columns} FROM ("
+        "SELECT DISTINCT ON (postal_code, month_date_yyyymm) "
+        f"{columns}, load_seq "
+        "FROM staging_redfin_real_estate_value "
+        "ORDER BY postal_code, month_date_yyyymm, load_seq DESC"
+        ") AS census_year_rows "
+        "ORDER BY postal_code, month_date_yyyymm"
+    )
+    tmp = OUTPUT_CSV.with_name(OUTPUT_CSV.name + ".tmp")
+    count = 0
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM staging_redfin_real_estate_value
+                    WHERE month_date_yyyymm !~ %s
+                    """,
+                    (pattern,),
+                )
+                outside = cur.fetchone()[0]
+                if outside:
+                    raise CensusYearRejected(
+                        f"Refusing to load {outside} Redfin rows outside {year}."
+                    )
+                cur.execute(sql)
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM (
+                        SELECT DISTINCT postal_code, month_date_yyyymm
+                        FROM staging_redfin_real_estate_value
+                    ) AS keyed
+                    """
+                )
+                count = cur.fetchone()[0]
+            with tmp.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle, lineterminator="\n")
+                writer.writerow(LOAD_COLUMNS)
+                written = 0
+                with conn.cursor() as cur:
+                    cur.execute(select_sql)
+                    while True:
+                        chunk = cur.fetchmany(BATCH_ROWS)
+                        if not chunk:
+                            break
+                        for row in chunk:
+                            writer.writerow([csv_value(value) for value in row])
+                            written += 1
+            if written != count:
+                raise CensusYearRejected(
+                    f"The Census-year CSV has {written} rows and the load has {count}."
+                )
+        os.replace(tmp, OUTPUT_CSV)
+    except CensusYearRejected as exc:
+        tmp.unlink(missing_ok=True)
+        raise SystemExit(str(exc)) from None
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return count
+
+
+def load_history(
+    conn, url: str, pull_date: str, census_year: int | None = None
+) -> int:
     postal_codes = los_angeles_postal_codes()
     print(
         f"Majority Los Angeles County ZIPs in {CROSSWALK_URL}: {len(postal_codes)}"
     )
+    if census_year is not None:
+        print(
+            f"Loading Redfin months in {census_year} only. "
+            "Other years are not pulled. Stored months are not deleted."
+        )
     prepare_staging(conn)
     reader, response = open_csv(url)
     staged = 0
     seq = 0
     batch: list[tuple] = []
     try:
-        for row in iter_los_angeles_rows(reader, pull_date, postal_codes):
+        for row in iter_los_angeles_rows(
+            reader, pull_date, postal_codes, census_year
+        ):
             seq += 1
             batch.append((*row, seq))
             if len(batch) >= BATCH_ROWS:
@@ -599,7 +758,9 @@ def load_history(conn, url: str, pull_date: str) -> int:
         response.close()
     if staged == 0:
         return 0
-    return replace_table(conn)
+    if census_year is None:
+        return replace_table(conn)
+    return upsert_census_year(conn, census_year)
 
 
 def connect():
@@ -654,22 +815,43 @@ def notify_refresh_review(table: str) -> int:
     return 0
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    census_year = census_year_arg(list(sys.argv if argv is None else argv))
     pull_date = pull_date_text()
     url = discover_history_url()
     print(f"ZIP history CSV: {url}")
     print(f"date_pulled_yyyymmdd: {pull_date}")
+    if census_year is None:
+        print(f"Replacing {TABLE} with every Los Angeles County month in the file.")
+    else:
+        print(
+            f"Census year {census_year}: upserting that Redfin year only. "
+            f"Older months already in {TABLE} are kept."
+        )
     with connect() as conn:
         with conn.transaction():
             ensure_schema(conn)
-        count = load_history(conn, url, pull_date)
+        count = load_history(conn, url, pull_date, census_year)
     if count == 0:
-        print("No Los Angeles County ZIP rows were loaded.", file=sys.stderr)
+        if census_year is None:
+            print("No Los Angeles County ZIP rows were loaded.", file=sys.stderr)
+        else:
+            print(
+                f"No Los Angeles County ZIP rows were loaded for {census_year}.",
+                file=sys.stderr,
+            )
         return 1
-    print(
-        f"Replaced {TABLE} with {count} Los Angeles County ZIP months "
-        f"and overwrote {OUTPUT_CSV_NAME}."
-    )
+    if census_year is None:
+        print(
+            f"Replaced {TABLE} with {count} Los Angeles County ZIP months "
+            f"and overwrote {OUTPUT_CSV_NAME}."
+        )
+    else:
+        print(
+            f"Upserted {count} Los Angeles County ZIP months for {census_year} "
+            f"into {TABLE}. Other months already stored were kept. "
+            f"Overwrote {OUTPUT_CSV_NAME} with {census_year} only."
+        )
     return notify_refresh_review(TABLE_NAME)
 
 
