@@ -566,7 +566,7 @@ class CensusTests(unittest.TestCase):
 
         def fake_urlopen(_request, timeout=0):
             calls["n"] += 1
-            self.assertEqual(timeout, 180)
+            self.assertEqual(timeout, 2700)
             if calls["n"] == 1:
                 raise urllib.error.URLError(OSError(101, "Network is unreachable"))
             return Response()
