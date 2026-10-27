@@ -13,6 +13,11 @@ one report year onto another.
 
 Every row upserted in a run gets the same dataset_updated_at. A report
 year this run does not write keeps the timestamp it already had.
+
+marketing_bullets is text and is not part of the primary key. This load
+adds the column and does not fill it. The census-year rank writes that
+text. An upsert leaves an existing value in place. A new report year is
+inserted with the column blank.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ import dataset_stamp
 DATABASE_URL_ENV = "DATABASE_URL"
 TABLE_NAME = "procedure_surgeon_fees"
 TABLE = "public.procedure_surgeon_fees"
+MARKETING_BULLETS = "marketing_bullets"
 OUTPUT_CSV_NAME = "procedure_surgeon_fees.csv"
 OUTPUT_CSV = Path(__file__).resolve().parent / OUTPUT_CSV_NAME
 SEED_DIR = Path(__file__).resolve().parent / "seeds"
@@ -461,9 +467,17 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     fee_basis text NOT NULL,
     source_url text NOT NULL,
     {dataset_stamp.COLUMN} {dataset_stamp.SQL_TYPE},
+    {MARKETING_BULLETS} text,
     PRIMARY KEY (procedure, report_year)
 );
 """
+
+
+def ensure_marketing_bullets(cur) -> None:
+    """Add the text column this table owns. Do not fill it here."""
+    cur.execute(
+        f"ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS {MARKETING_BULLETS} text"
+    )
 
 
 def upsert_rows(conn, rows: list[tuple], updated_at: datetime | None = None) -> int:
@@ -487,6 +501,7 @@ def upsert_rows(conn, rows: list[tuple], updated_at: datetime | None = None) -> 
                 f"ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS "
                 f"{dataset_stamp.COLUMN} {dataset_stamp.SQL_TYPE}"
             )
+            ensure_marketing_bullets(cur)
             cur.executemany(sql, stamped)
             cur.execute(f"SELECT COUNT(*) FROM {TABLE}")
             return cur.fetchone()[0]

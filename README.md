@@ -113,6 +113,18 @@ The file is `zip_census_redfin_join.csv`. Columns are the Census columns, then t
 
 The scheduled and manual California runs do not write this join. They still replace the whole price table.
 
+## Cash-pay ZIP rank
+
+After that join succeeds, the same California job runs `rank_cash_pay_zips.py` on `zip_census_redfin_join.csv`. The script ranks ZIPs already in the join. It does not rebuild the join, and it does not delete `public.redfin_real_estate_value`. The scheduled and manual California runs do not rank.
+
+A ZIP is skipped for a persona when that persona's age count, `adult_population`, `median_household_income`, `per_capita_income`, or `median_listing_price` is blank, when `adult_population` is zero, or when `active_listing_count` is blank or under 10. Ages 55 and older use `population_55_64` plus `population_65_plus`, and a blank in either band skips the ZIP for that persona. The middles of household income, per-person income, and listing price are recalculated from the ZIPs that remain. They are not fixed dollar amounts.
+
+Ages 18 to 34, 35 to 44, and 45 to 54 stay on the list when household income and listing price are both at or above those middles. Ages 55 and older stay when listing price and per-person income are both at or above those middles. The largest age share is rank 1. An equal share keeps the higher household income first for the working-age personas and the higher listing price first for ages 55 and older. Each persona keeps 25 ZIPs, or every ZIP that passed when fewer than 25 do. One ZIP can be on more than one persona. The female share is stored and shown. It does not change the rank. `median_age` and `median_listing_price_per_square_foot` are stored as checks and do not change the rank.
+
+The file is `cash_pay_zip_rank.csv`. The workflow uploads it as the artifact `cash-pay-zip-rank` on that same California run, kept for 90 days. When `DATABASE_URL` is set, those rows replace `public.cash_pay_zip_rank`. The replace writes one `dataset_updated_at` on the rank rows. Replacing the rank table does not drop it and does not modify the flood or risk tables.
+
+The same run writes `marketing_bullets` on `public.procedure_surgeon_fees`. That text column is not part of the primary key. Every row of the latest `report_year` gets bullet text for the personas that procedure uses: the ranked ZIP names and why they passed. Procedures that use the same personas get the same text. Older report years are set blank in that column. The January fee load does not write this text.
+
 ## National procedure counts and surgeon fees
 
 `pull_procedure_surgeon_fees.py` loads national aesthetic procedure counts and surgeon fee ranges from the American Society of Plastic Surgeons procedural statistics reports. The table is national. It is not a Los Angeles fee. `fee_basis` says: national surgeon fee only, excludes anesthesia and facility, not Los Angeles. There are no office locations.
@@ -121,7 +133,7 @@ Each run tries the official PDF for the current year back through 2024:
 
 `https://www.plasticsurgery.org/documents/news/statistics/{year}/plastic-surgery-statistics-report-{year}.pdf`
 
-It upserts the years it can read and does not delete other years in `public.procedure_surgeon_fees`. Each row upserted in a run gets the same `dataset_updated_at`. A year this run does not write keeps the timestamp it already had. The primary key is (`procedure`, `report_year`). A checked-in seed is used only when that year's official PDF cannot be fetched. The 2024 URL currently returns 404, so `seeds/procedure_surgeon_fees_2024.csv` supplies the 2024 counts and fee ranges read from that report. When the URL works again, the PDF replaces the seed. The 2025 report publishes counts and does not publish surgeon fees, so 2025 fee columns stay null. 2024 fees are not copied onto 2025.
+It upserts the years it can read and does not delete other years in `public.procedure_surgeon_fees`. Each row upserted in a run gets the same `dataset_updated_at`. A year this run does not write keeps the timestamp it already had. The primary key is (`procedure`, `report_year`). `marketing_bullets` is a text column on this table. This load adds it when the table is created or when the column is missing, and the upsert does not change it. A new report year is inserted with that column blank. The census-year rank is what fills the latest report year. A checked-in seed is used only when that year's official PDF cannot be fetched. The 2024 URL currently returns 404, so `seeds/procedure_surgeon_fees_2024.csv` supplies the 2024 counts and fee ranges read from that report. When the URL works again, the PDF replaces the seed. The 2025 report publishes counts and does not publish surgeon fees, so 2025 fee columns stay null. 2024 fees are not copied onto 2025.
 
 2024 publishes separate upper and lower blepharoplasty fee ranges. Those two ranges are not combined into one eyelid-surgery fee, so `eyelid surgery` keeps its published count and null fee columns.
 

@@ -258,11 +258,17 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("zip-census-redfin-join", text)
         self.assertIn("actions/upload-artifact@v4", text)
         self.assertNotIn("pull-procedure-surgeon-fees", text)
+        join_at = text.index("python join_census_redfin.py")
+        rank_at = text.index("python rank_cash_pay_zips.py zip_census_redfin_join.csv")
+        self.assertLess(join_at, rank_at)
+        self.assertIn("name: cash-pay-zip-rank", text)
+        self.assertLess(rank_at, text.index("name: cash-pay-zip-rank"))
 
     def test_procedure_workflow_is_not_part_of_the_chain(self):
         text = (ROOT / ".github/workflows/pull-procedure-surgeon-fees.yml").read_text()
         self.assertNotIn("workflow_run", text)
         self.assertNotIn("zip_census_redfin_join", text)
+        self.assertNotIn("rank_cash_pay_zips.py", text)
 
     def test_census_safeguards_stay_in_place(self):
         workflow = (ROOT / ".github/workflows/pull-census-zip-population.yml").read_text()
