@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import io
 import os
+import tempfile
 import unittest
 import urllib.error
 from datetime import datetime, timezone
 from decimal import Decimal
 from email.message import Message
+from pathlib import Path
 from unittest.mock import patch
 
 import pull_census_zip_population as census
@@ -165,8 +167,8 @@ class CensusTests(unittest.TestCase):
 
     def test_stored_vintage_inserts_nothing_and_does_not_delete(self):
         class Cursor:
-            def __init__(self, years: set[int]):
-                self.years = years
+            def __init__(self, pairs: set[tuple[int, str]]):
+                self.pairs = set(pairs)
                 self.statements: list[str] = []
                 self.inserted: list[tuple] = []
                 self._rows = None
@@ -180,18 +182,17 @@ class CensusTests(unittest.TestCase):
             def execute(self, sql, _params=None):
                 text = " ".join(sql.split())
                 self.statements.append(text)
-                if "information_schema.tables" in text:
-                    self._rows = [(1,)]
-                elif "DISTINCT acs_year" in text:
-                    self._rows = [(year,) for year in sorted(self.years)]
+                if "SELECT acs_year, zip" in text:
+                    self._rows = list(self.pairs)
                 elif "COUNT(*)" in text:
-                    self._rows = [(len(self.years) + len(self.inserted),)]
+                    self._rows = [(len(self.pairs),)]
                 else:
                     self._rows = None
 
             def executemany(self, sql, rows):
                 self.statements.append(" ".join(sql.split()))
                 self.inserted.extend(rows)
+                self.pairs.update((int(row[0]), str(row[1])) for row in rows)
 
             def fetchone(self):
                 return None if not self._rows else self._rows[0]
@@ -200,8 +201,8 @@ class CensusTests(unittest.TestCase):
                 return list(self._rows or [])
 
         class Connection:
-            def __init__(self, years: set[int]):
-                self.cursor_obj = Cursor(years)
+            def __init__(self, pairs: set[tuple[int, str]]):
+                self.cursor_obj = Cursor(pairs)
 
             def __enter__(self):
                 return self
@@ -215,20 +216,27 @@ class CensusTests(unittest.TestCase):
             def cursor(self):
                 return self.cursor_obj
 
-        stored = Connection({2023, 2024})
+        stored = Connection({(2023, "90001"), (2024, "90001")})
         inserted, total = census.insert_new_years(stored, [(2024, "90001")])
         self.assertEqual(inserted, 0)
         self.assertEqual(total, 2)
         self.assertEqual(stored.cursor_obj.inserted, [])
         self.assertNotIn("delete", " ".join(stored.cursor_obj.statements).lower())
 
-        missing = Connection({2023})
+        missing = Connection({(2023, "90001")})
         row = (2024, "90001")
         inserted, total = census.insert_new_years(missing, [row])
         self.assertEqual(inserted, 1)
         self.assertEqual(total, 2)
         self.assertEqual(missing.cursor_obj.inserted, [row])
         self.assertNotIn("delete", " ".join(missing.cursor_obj.statements).lower())
+
+        partial = Connection({(2024, "90001")})
+        added = (2024, "90210")
+        inserted, total = census.insert_new_years(partial, [added])
+        self.assertEqual(inserted, 1)
+        self.assertEqual(partial.cursor_obj.inserted, [added])
+        self.assertNotIn("delete", " ".join(partial.cursor_obj.statements).lower())
 
     def test_age_bands_sum_adults_and_drop_sentinels(self):
         self.assertIsNone(census.parse_estimate("-666666666"))
@@ -333,32 +341,32 @@ class CensusTests(unittest.TestCase):
         census.fetch_with_optional_key = fake
         try:
             with self.assertRaises(SystemExit) as caught:
-                census.fetch_query(
-                    2023, ["90001"], ("B19013_001E",), state=census.CALIFORNIA_STATE
-                )
+                census.fetch_query(2023, ["90001"], ("B19013_001E",))
         finally:
             census.fetch_with_optional_key = original
         self.assertIn("HTTP 500", str(caught.exception))
         self.assertNotIn("too few", str(caught.exception))
 
-    def test_ambiguous_zcta_list_retries_in_california(self):
+    def test_ambiguous_zcta_list_splits_without_a_state(self):
         def fake(url: str) -> bytes:
-            if "state:06" not in url:
+            self.assertNotIn("state:06", url)
+            self.assertNotIn("in=", url)
+            for_part = url.split("for=", 1)[1].split("&", 1)[0]
+            zips = for_part.split(":", 1)[1].split(",")
+            if len(zips) > 1:
                 raise SystemExit(
                     "The Census API returned HTTP 400: error: ambiguous geography. "
                     "You must either specify a wildcard or full qualify it with state."
                 )
+            zip_code = zips[0]
             return (
-                b'[["B19013_001E","zip code tabulation area"],'
-                b'["10","90001"],["11","90002"]]'
-            )
+                f'[["B19013_001E","zip code tabulation area"],["10","{zip_code}"]]'
+            ).encode()
 
         original = census.fetch_with_optional_key
         census.fetch_with_optional_key = fake
         try:
-            rows = census.fetch_query(
-                2023, ["90001", "90002"], ("B19013_001E",), state=""
-            )
+            rows = census.fetch_query(2023, ["90001", "90002"], ("B19013_001E",))
         finally:
             census.fetch_with_optional_key = original
         self.assertEqual(
@@ -480,36 +488,27 @@ class CensusTests(unittest.TestCase):
         self.assertIn("hierarchy", str(caught.exception))
         self.assertNotIn("too few", str(caught.exception))
 
-    def test_state_hierarchy_is_retried_without_a_state(self):
+    def test_hierarchy_error_does_not_add_a_state(self):
+        seen: list[str] = []
+
         def fake(url: str) -> bytes:
-            if "state:06" in url:
-                raise SystemExit(
-                    "The Census API returned HTTP 400: "
-                    "error: unknown/unsupported geography hierarchy"
-                )
-            return (
-                b'[["B19013_001E","zip code tabulation area"],'
-                b'["10","90001"],["11","90002"]]'
+            seen.append(url)
+            raise SystemExit(
+                "The Census API returned HTTP 400: "
+                "error: unknown/unsupported geography hierarchy"
             )
 
         original = census.fetch_with_optional_key
         census.fetch_with_optional_key = fake
-        stdout = io.StringIO()
         try:
-            with patch("sys.stdout", stdout):
-                rows = census.fetch_query(
-                    2024,
-                    ["90001", "90002"],
-                    ("B19013_001E",),
-                    state=census.CALIFORNIA_STATE,
-                )
+            with self.assertRaises(SystemExit) as caught:
+                census.fetch_query(2024, ["90001", "90002"], ("B19013_001E",))
         finally:
             census.fetch_with_optional_key = original
-        self.assertEqual(
-            [row["zip code tabulation area"] for row in rows],
-            ["90001", "90002"],
-        )
-        self.assertIn("does not use a state", stdout.getvalue())
+        self.assertEqual(len(seen), 1)
+        self.assertNotIn("state:06", seen[0])
+        self.assertNotIn("in=", seen[0])
+        self.assertIn("hierarchy", str(caught.exception))
 
     def test_unknown_geography_list_splits_zips_before_variables(self):
         calls: list[str] = []
@@ -640,6 +639,169 @@ class CensusTests(unittest.TestCase):
         slept.assert_not_called()
         self.assertEqual(status, 500)
         self.assertIn(b"error while running your query", body)
+
+    def test_field_groups_are_separate_calls(self):
+        groups = dict(census.field_groups())
+        self.assertEqual(list(groups), ["income", "age", "sex", "age_bands"])
+        self.assertEqual(groups["income"], ("B19013_001E", "B19301_001E"))
+        self.assertEqual(groups["age"], ("B01002_001E",))
+        self.assertEqual(groups["sex"], ("B01001_002E", "B01001_026E"))
+        self.assertIn("B01001_007E", groups["age_bands"])
+        self.assertNotIn("B19013_001E", groups["age_bands"])
+        self.assertTrue(all(1 <= len(codes) <= 50 for codes in groups.values()))
+        self.assertGreaterEqual(census.BATCH_SIZE, 20)
+        self.assertLessEqual(census.BATCH_SIZE, 40)
+
+        calls: list[str] = []
+
+        def fake(url: str) -> bytes:
+            calls.append(url)
+            self.assertNotIn("state:06", url)
+            self.assertNotIn("in=", url)
+            codes = url.split("get=", 1)[1].split("&", 1)[0].split(",")
+            if "B19013_001E" in codes and "B01002_001E" in codes:
+                raise AssertionError("income and age were requested together")
+            if "B01001_007E" in codes:
+                raise SystemExit(
+                    "The Census API returned HTTP 500: "
+                    "There was an error while running your query."
+                )
+            names = ",".join(f'"{code}"' for code in codes)
+            values = ",".join('"1"' for _ in codes)
+            return (
+                f'[[{names},"zip code tabulation area"],[{values},"90001"]]'
+            ).encode()
+
+        original = census.fetch_with_optional_key
+        census.fetch_with_optional_key = fake
+        try:
+            with patch.object(census.time, "sleep"), self.assertRaises(SystemExit):
+                census.fetch_zip_batch(2024, ["90001", "94102"])
+        finally:
+            census.fetch_with_optional_key = original
+        self.assertGreaterEqual(len(calls), 4)
+        self.assertIn("B19013_001E", calls[0])
+        self.assertIn("B19301_001E", calls[0])
+        self.assertNotIn("B01002_001E", calls[0])
+        self.assertIn("B01002_001E", calls[1])
+        self.assertNotIn("B19013_001E", calls[1])
+        self.assertIn("B01001_002E", calls[2])
+        self.assertIn("B01001_026E", calls[2])
+        self.assertNotIn("B19013_001E", calls[2])
+        self.assertIn("B01001_007E", calls[3])
+        income_calls = [url for url in calls if "B19013_001E" in url]
+        self.assertEqual(len(income_calls), 1)
+        self.assertIn("94102", calls[0])
+
+    def test_dataframe_keeps_los_angeles_after_the_california_download(self):
+        text = (
+            "GEOID_ZCTA5_20|GEOID_COUNTY_20|AREALAND_PART|AREAWATER_PART\n"
+            "90001|06037|10|0\n"
+            "94102|06075|5|0\n"
+            "10001|36061|5|0\n"
+            "89001|32003|9|0\n"
+            "89001|06071|1|0\n"
+            "00000|06037|0|0\n"
+        )
+        california = census.california_zctas_from_crosswalk(text)
+        self.assertEqual(california, {"90001", "94102", "89001"})
+        frame = census.pd.DataFrame(
+            [
+                {census.GEO_COLUMN: "90001", "B19013_001E": "10"},
+                {census.GEO_COLUMN: "94102", "B19013_001E": "20"},
+                {census.GEO_COLUMN: "10001", "B19013_001E": "30"},
+                {census.GEO_COLUMN: "89001", "B19013_001E": "40"},
+            ]
+        )
+        kept = census.filter_downloaded_zips(
+            frame, california, {"90001", "90210"}
+        )
+        self.assertEqual(kept[census.GEO_COLUMN].tolist(), ["90001"])
+
+    def test_finished_batch_is_saved_before_the_next_request(self):
+        requested: list[list[str]] = []
+
+        def fake_batch(_year: int, zips: list[str]):
+            requested.append(list(zips))
+            if zips[0] == "94103":
+                raise TimeoutError("timed out")
+            return [
+                {census.GEO_COLUMN: "90001", "B19013_001E": "10"},
+                {census.GEO_COLUMN: "94102", "B19013_001E": "11"},
+            ]
+
+        saved: list[list[str]] = []
+
+        def on_batch(all_rows, _new_rows):
+            census.write_csv(all_rows)
+            saved.append([row[1] for row in all_rows])
+
+        original = census.fetch_zip_batch
+        census.fetch_zip_batch = fake_batch
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "census_zip_population.csv"
+                with (
+                    patch.object(census, "OUTPUT_CSV", output),
+                    patch.object(census, "BATCH_SIZE", 2),
+                    patch.object(census.time, "sleep"),
+                    self.assertRaises(TimeoutError),
+                ):
+                    census.rows_for_vintage(
+                        2024,
+                        ["90001", "94102", "94103", "94104"],
+                        {"90001"},
+                        on_batch,
+                    )
+                self.assertEqual(requested, [["90001", "94102"], ["94103", "94104"]])
+                self.assertEqual(saved, [["90001"]])
+                text = output.read_text(encoding="utf-8")
+        finally:
+            census.fetch_zip_batch = original
+        self.assertIn("90001", text)
+        self.assertNotIn("94102", text)
+        self.assertNotIn("94103", text)
+
+    def test_read_timeout_is_retried_like_a_dropped_connection(self):
+        class Response:
+            def __init__(self, body: bytes | None):
+                self.status = 200
+                self.headers = {}
+                self._body = body
+
+            def read(self):
+                if self._body is None:
+                    raise TimeoutError("The read operation timed out")
+                return self._body
+
+            def close(self):
+                return None
+
+        calls = {"n": 0}
+
+        def fake_urlopen(_request, timeout=0):
+            calls["n"] += 1
+            self.assertEqual(timeout, 2700)
+            if calls["n"] == 1:
+                return Response(None)
+            return Response(b"[]")
+
+        stdout = io.StringIO()
+        with (
+            patch.object(census.urllib.request, "urlopen", fake_urlopen),
+            patch.object(census.time, "sleep") as slept,
+            patch("sys.stdout", stdout),
+        ):
+            status, _headers, body = census.request_bytes(
+                "https://api.census.gov/data/2024/acs/acs5?get=NAME"
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"[]")
+        self.assertEqual(calls["n"], 2)
+        slept.assert_called_once_with(2)
+        shown = stdout.getvalue()
+        self.assertIn("timed out", shown)
+        self.assertIn("Retrying.", shown)
 
 
 if __name__ == "__main__":

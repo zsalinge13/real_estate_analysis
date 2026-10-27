@@ -1,28 +1,34 @@
 """Load ACS 5-year income, age, and sex for Los Angeles County home-value ZIPs.
 
-The ZIP list is the postal codes in the home-value extract that also pass the
-price script's Los Angeles County filter: Census ZCTA-to-county relationship
-file, FIPS 06037, majority land area. ZCTAs are stored in the zip column.
-This script does not read office, dermatology, or NPI locations.
+The Census download requests California ZCTAs. Those codes come from the
+ZCTA-to-county relationship file (any area in a county whose FIPS starts
+with 06). The data query lists those ZCTAs and does not send in=state.
+ZCTAs are not nested in a state, and in=state:06 is an unsupported hierarchy.
+Census reports that as "unknown/unsupported geography hierarchy" (sometimes
+spelled "heirarchy"). That is not a missing ZIP.
 
-A run fetches and inserts only the latest published ACS 5-year vintage.
-That vintage is inserted only when it is not already stored. Older years
-stay in public.census_zip_population. The CSV is still written when
-DATABASE_URL is unset.
+After each batch is downloaded, the rows go into a dataframe. The dataframe
+keeps California ZCTAs, then the Los Angeles County ZIP codes that are in
+the home-value extract and whose majority land area is Los Angeles County
+(FIPS 06037). ZCTAs are stored in the zip column. This script does not read
+office, dermatology, or NPI locations.
 
-ACS 5-year ZCTA queries do not include a state. That geography is not nested
-in a state, and in=state is an unsupported hierarchy. Census reports that as
-"unknown/unsupported geography hierarchy" (sometimes spelled "heirarchy").
-That is not a missing ZIP. A query that included a state is retried without
-it. Ambiguous geography is retried with California.
+A run fetches only the latest published ACS 5-year vintage. Income, age,
+sex, and age bands are separate requests, about 30 ZIP codes at a time, one
+batch after another. A failure retries that piece. Each finished batch is
+saved before the next batch starts. A dropped connection or a read timeout
+is retried after a short pause. The read timeout is 45 minutes. Older years
+stay in public.census_zip_population. A ZIP already stored for that year is
+not inserted again. The CSV is still written when DATABASE_URL is unset.
 
 When CENSUS_API_KEY is set, it is sent on the first request and is never printed.
-A dropped connection is retried. The request URL is not printed.
+The request URL is not printed.
 """
 
 from __future__ import annotations
 
 import csv
+import io
 import json
 import os
 import re
@@ -35,6 +41,8 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+import pandas as pd
+
 import load_california
 
 DATABASE_URL_ENV = "DATABASE_URL"
@@ -44,11 +52,11 @@ TABLE = "public.census_zip_population"
 OUTPUT_CSV_NAME = "census_zip_population.csv"
 OUTPUT_CSV = Path(__file__).resolve().parent / OUTPUT_CSV_NAME
 USER_AGENT = load_california.USER_AGENT
-BATCH_SIZE = 20
+# One ACS call asks for about 20 to 40 California ZCTAs, then the next batch.
+BATCH_SIZE = 30
 VARIABLE_CHUNK = 20
 CONNECT_ATTEMPTS = 4
 GEO_COLUMN = "zip code tabulation area"
-CALIFORNIA_STATE = "06"
 KEY_REQUIRED = (
     "The Census American Community Survey API requires a key. "
     "Set the CENSUS_API_KEY secret. The repository does not contain a key."
@@ -145,16 +153,41 @@ def band_codes() -> dict[str, tuple[str, ...]]:
     return codes
 
 
-def estimate_variables() -> tuple[str, ...]:
-    variables = [
-        MEASURES["median_household_income"],
-        MEASURES["per_capita_income"],
-        MEASURES["median_age"],
-        SEX_TOTALS["male_population"][0],
-        SEX_TOTALS["female_population"][0],
-    ]
+def field_groups() -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Income, age, sex, and age bands are separate Census calls.
+
+    A failure retries the piece that failed. It does not repeat the pieces
+    that already succeeded.
+    """
+    band_variables: list[str] = []
     for codes in band_codes().values():
-        variables.extend(codes)
+        band_variables.extend(codes)
+    groups = (
+        (
+            "income",
+            (
+                MEASURES["median_household_income"],
+                MEASURES["per_capita_income"],
+            ),
+        ),
+        ("age", (MEASURES["median_age"],)),
+        (
+            "sex",
+            (
+                SEX_TOTALS["male_population"][0],
+                SEX_TOTALS["female_population"][0],
+            ),
+        ),
+        ("age_bands", tuple(band_variables)),
+    )
+    for name, variables in groups:
+        if not variables or len(variables) > 50:
+            raise SystemExit(f"The ACS {name} request has more than 50 variables.")
+    return groups
+
+
+def estimate_variables() -> tuple[str, ...]:
+    variables = [code for _name, codes in field_groups() for code in codes]
     if len(variables) > 50:
         raise SystemExit("The ACS request has more than 50 variables.")
     return tuple(variables)
@@ -203,6 +236,99 @@ def los_angeles_home_value_zips() -> set[str]:
     return kept
 
 
+def california_zctas_from_crosswalk(text: str) -> set[str]:
+    """ZCTAs with area in a California county.
+
+    This reads the relationship file. It is not an ACS data query and does
+    not send in=state.
+    """
+    reader = csv.DictReader(io.StringIO(text), delimiter="|")
+    required = {
+        "GEOID_ZCTA5_20",
+        "GEOID_COUNTY_20",
+        "AREALAND_PART",
+        "AREAWATER_PART",
+    }
+    missing = required.difference(reader.fieldnames or [])
+    if missing:
+        raise SystemExit(f"Census crosswalk is missing columns: {sorted(missing)}")
+    found: set[str] = set()
+    for row in reader:
+        zcta = (row.get("GEOID_ZCTA5_20") or "").strip()
+        county = (row.get("GEOID_COUNTY_20") or "").strip()
+        if len(zcta) != 5 or not zcta.isdigit():
+            continue
+        if not (len(county) == 5 and county.isdigit() and county.startswith("06")):
+            continue
+        try:
+            land = int(row.get("AREALAND_PART") or 0)
+            water = int(row.get("AREAWATER_PART") or 0)
+        except ValueError:
+            continue
+        if land + water <= 0:
+            continue
+        found.add(zcta)
+    if not found:
+        raise SystemExit("Census crosswalk did not identify any California ZIPs.")
+    return found
+
+
+def california_zctas() -> list[str]:
+    """California ZCTAs to request from the ACS data API."""
+    request = urllib.request.Request(
+        load_california.CROSSWALK_URL,
+        headers={"User-Agent": USER_AGENT, "Accept": "text/plain,*/*"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            text = response.read().decode("utf-8-sig")
+    except urllib.error.HTTPError as exc:
+        raise SystemExit(
+            f"Census ZCTA-county crosswalk returned HTTP {exc.code}."
+        ) from exc
+    return sorted(california_zctas_from_crosswalk(text))
+
+
+def normalize_zip(raw: object) -> str:
+    text = str(raw or "").strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    if not text.isdigit():
+        return ""
+    return text.zfill(5)
+
+
+def records_to_frame(records: list[dict[str, str]]) -> pd.DataFrame:
+    frame = pd.DataFrame.from_records(records)
+    if frame.empty:
+        return frame
+    if GEO_COLUMN not in frame.columns:
+        raise SystemExit("The Census API table has no ZCTA column.")
+    return frame
+
+
+def filter_downloaded_zips(
+    frame: pd.DataFrame,
+    california_zips: set[str],
+    la_zips: set[str],
+) -> pd.DataFrame:
+    """Keep California ZCTAs, then the Los Angeles County home-value set.
+
+    The Census response is already in a dataframe. This does not change the
+    request that downloaded it.
+    """
+    if frame.empty:
+        return frame
+    if GEO_COLUMN not in frame.columns:
+        raise SystemExit("The Census API table has no ZCTA column.")
+    normalized = frame[GEO_COLUMN].map(normalize_zip)
+    california = frame.loc[normalized.isin(california_zips)].copy()
+    if california.empty:
+        return california
+    normalized = california[GEO_COLUMN].map(normalize_zip)
+    return california.loc[normalized.isin(la_zips)].copy()
+
+
 def quote_census(value: str, safe: str = "", encoding: str | None = None, errors: str | None = None) -> str:
     return urllib.parse.quote(
         value,
@@ -217,17 +343,16 @@ def census_data_url(
     variables: tuple[str, ...],
     zips: list[str],
     key: str = "",
-    state: str = "",
 ) -> str:
+    """ACS ZCTA data query. Never sends in=state.
+
+    California is chosen by the ZCTA list and the dataframe filter. A state
+    qualifier on this get query is an unsupported geography hierarchy.
+    """
     fields = {
         "get": ",".join(variables),
         "for": GEO_COLUMN + ":" + ",".join(zips),
     }
-    # ACS 5-year ZCTAs are summary level 860 and have no state parent. The
-    # published examples omit in=state. Sending a state is an unsupported
-    # hierarchy, not a way to limit the list to California.
-    if state:
-        fields["in"] = f"state:{state}"
     query = urllib.parse.urlencode(fields, quote_via=quote_census)
     url = f"https://api.census.gov/data/{year}/acs/acs5?{query}"
     if key:
@@ -332,22 +457,40 @@ def open_census(url: str) -> tuple[int, dict[str, str], bytes]:
     return status, headers, body
 
 
-def request_bytes(url: str) -> tuple[int, dict[str, str], bytes]:
-    """GET a Census URL. Retry a dropped connection. Do not retry an HTTP status.
+def retry_notice(exc: BaseException) -> str:
+    """Same retry line for a dropped connection and a read timeout."""
+    reason = getattr(exc, "reason", None)
+    text = str(exc).lower()
+    timed_out = (
+        isinstance(exc, TimeoutError)
+        or isinstance(reason, TimeoutError)
+        or "timed out" in text
+    )
+    if timed_out:
+        return "The Census request timed out. Retrying."
+    return "The Census request could not connect. Retrying."
 
+
+def request_bytes(url: str) -> tuple[int, dict[str, str], bytes]:
+    """GET a Census URL. Retry a dropped connection or a read timeout.
+
+    Do not retry an HTTP status. The pause between tries is short.
     The URL is not printed: it can contain CENSUS_API_KEY.
     """
-    error: urllib.error.URLError | None = None
+    error: Exception | None = None
     for attempt in range(CONNECT_ATTEMPTS):
         try:
             return open_census(url)
-        except urllib.error.URLError as exc:
+        except urllib.error.HTTPError:
+            raise
+        except (urllib.error.URLError, TimeoutError) as exc:
             # HTTPError is a URLError, and open_census already turned it into
-            # a status. This branch is a dropped connection or a timeout.
+            # a status. urlopen wraps a connect timeout as URLError. A timeout
+            # while reading the body is TimeoutError from response.read().
             error = exc
             if attempt + 1 == CONNECT_ATTEMPTS:
                 break
-            print("The Census request could not connect. Retrying.", flush=True)
+            print(retry_notice(exc), flush=True)
             time.sleep(2 * (attempt + 1))
     if error is None:
         raise urllib.error.URLError("The Census request did not run.")
@@ -485,8 +628,14 @@ def verify_labels(year: int) -> None:
 def parse_estimate(raw: object) -> Decimal | None:
     if raw is None:
         return None
+    try:
+        missing = bool(pd.isna(raw))
+    except TypeError:
+        missing = False
+    if missing:
+        return None
     text = str(raw).strip()
-    if text in {"", "null", "None", "-", "N"}:
+    if text.lower() in {"", "null", "none", "-", "n", "nan"}:
         return None
     try:
         number = Decimal(text)
@@ -583,88 +732,104 @@ def fetch_query(
     year: int,
     zips: list[str],
     variables: tuple[str, ...],
-    state: str = "",
-    adjusted: bool = False,
 ) -> list[dict[str, str]]:
-    """Download one ACS table. Split a query Census rejects, and keep the API text."""
+    """Download one ACS field piece. Split a query Census rejects.
+
+    The data URL never includes in=state. California is not applied here.
+    """
     if not zips or not variables:
         return []
-    url = census_data_url(year, variables, zips, state=state)
+    url = census_data_url(year, variables, zips)
     try:
         body = fetch_with_optional_key(url)
     except SystemExit as exc:
         if key_failure(exc):
             raise
-        return recover_query(year, zips, variables, state, exit_text(exc), adjusted)
+        return recover_query(year, zips, variables, exit_text(exc))
     try:
         return parse_table(body)
     except SystemExit:
-        return recover_query(
-            year, zips, variables, state, census_message(200, body), adjusted
-        )
+        return recover_query(year, zips, variables, census_message(200, body))
 
 
 def recover_query(
     year: int,
     zips: list[str],
     variables: tuple[str, ...],
-    state: str,
     message: str,
-    adjusted: bool = False,
 ) -> list[dict[str, str]]:
+    """Retry the failed piece by splitting it. Do not add a state."""
     problem = geography_problem(message)
-    # One geography adjustment. Flipping again would loop: a state query is an
-    # unsupported ZCTA hierarchy, and a stateless query can be ambiguous.
-    if problem == "hierarchy" and state and not adjusted:
-        print("The Census ZCTA query does not use a state. Retrying.", flush=True)
-        return fetch_query(year, zips, variables, state="", adjusted=True)
-    if problem == "ambiguous" and not state and not adjusted:
-        return fetch_query(
-            year, zips, variables, state=CALIFORNIA_STATE, adjusted=True
-        )
     if problem == "hierarchy":
         raise SystemExit(message)
+    # A list of ZCTAs can be called ambiguous. Split the ZIP list. Do not
+    # qualify the data query with in=state:06.
+    if problem in {"unknown", "ambiguous"} and len(zips) > 1:
+        middle = len(zips) // 2
+        left = fetch_query(year, zips[:middle], variables)
+        time.sleep(0.05)
+        right = fetch_query(year, zips[middle:], variables)
+        return left + right
     if problem == "unknown" and len(zips) == 1:
         return []
-    if problem == "unknown" and len(zips) > 1:
-        middle = len(zips) // 2
-        left = fetch_query(year, zips[:middle], variables, state, adjusted)
-        time.sleep(0.05)
-        right = fetch_query(year, zips[middle:], variables, state, adjusted)
-        return left + right
+    if problem == "ambiguous":
+        raise SystemExit(message)
     if len(variables) > 1:
         middle = len(variables) // 2
-        left = fetch_query(year, zips, variables[:middle], state, adjusted)
+        left = fetch_query(year, zips, variables[:middle])
         time.sleep(0.05)
-        right = fetch_query(year, zips, variables[middle:], state, adjusted)
+        right = fetch_query(year, zips, variables[middle:])
         return merge_records(left, right)
     if len(zips) > 1:
         middle = len(zips) // 2
-        left = fetch_query(year, zips[:middle], variables, state, adjusted)
+        left = fetch_query(year, zips[:middle], variables)
         time.sleep(0.05)
-        right = fetch_query(year, zips[middle:], variables, state, adjusted)
+        right = fetch_query(year, zips[middle:], variables)
         return left + right
     raise SystemExit(message)
 
 
-def fetch_year(year: int, zips: list[str], variables: tuple[str, ...]) -> list[dict[str, str]]:
+def fetch_field_piece(
+    year: int,
+    zips: list[str],
+    variables: tuple[str, ...],
+) -> list[dict[str, str]]:
+    """Download one field group for one ZIP batch.
+
+    A timeout, a dropped connection, or a split of a rejected query stays
+    inside this piece. Earlier field groups are not requested again.
+    """
+    return fetch_query(year, zips, variables)
+
+
+def fetch_zip_batch(year: int, zips: list[str]) -> list[dict[str, str]]:
+    """Request income, then age, then sex, then age bands."""
     records: list[dict[str, str]] = []
-    for group in variable_chunks(variables):
-        for batch in chunks(zips, BATCH_SIZE):
-            records.extend(fetch_query(year, list(batch), group))
+    groups = field_groups()
+    for index, (_name, variables) in enumerate(groups):
+        records.extend(fetch_field_piece(year, list(zips), variables))
+        if index + 1 != len(groups):
             time.sleep(0.1)
     return merge_records(records)
 
 
-def rows_for_vintage(year: int, zips: list[str]) -> list[tuple]:
-    variables = estimate_variables()
-    records = fetch_year(year, zips, variables)
-    wanted = set(zips)
+def rows_from_download(
+    year: int,
+    records: list[dict[str, str]],
+    variables: tuple[str, ...],
+    california_zips: set[str],
+    la_zips: set[str],
+    seen: set[str],
+) -> list[tuple]:
+    """Turn one downloaded batch into rows, then keep Los Angeles County."""
+    frame = records_to_frame(records)
+    kept = filter_downloaded_zips(frame, california_zips, la_zips)
+    if kept.empty:
+        return []
     rows: list[tuple] = []
-    seen: set[str] = set()
-    for record in records:
-        zip_code = (record.get("zip code tabulation area") or "").strip().zfill(5)
-        if zip_code not in wanted or zip_code in seen:
+    for record in kept.to_dict(orient="records"):
+        zip_code = normalize_zip(record.get(GEO_COLUMN))
+        if zip_code not in la_zips or zip_code in seen:
             continue
         seen.add(zip_code)
         estimates = {
@@ -672,15 +837,44 @@ def rows_for_vintage(year: int, zips: list[str]) -> list[tuple]:
             for code in variables
         }
         rows.append(row_from_estimates(year, zip_code, estimates))
+    return rows
+
+
+def rows_for_vintage(
+    year: int,
+    california_zips: list[str],
+    la_zips: set[str],
+    on_batch,
+) -> list[tuple]:
+    """Download California ZCTAs in batches and checkpoint after each one."""
+    variables = estimate_variables()
+    california = set(california_zips)
+    rows: list[tuple] = []
+    seen: set[str] = set()
+    total = len(california_zips)
+    for index, batch in enumerate(chunks(list(california_zips), BATCH_SIZE)):
+        if index:
+            time.sleep(0.1)
+        print(
+            f"ACS {year}: downloading {len(batch)} California ZIPs "
+            f"({index * BATCH_SIZE + len(batch)} of {total}).",
+            flush=True,
+        )
+        records = fetch_zip_batch(year, list(batch))
+        new_rows = rows_from_download(
+            year, records, variables, california, la_zips, seen
+        )
+        rows.extend(new_rows)
+        on_batch(list(rows), new_rows)
     print(
-        f"ACS {year}: {len(rows)} of {len(zips)} Los Angeles County home-value ZIPs.",
+        f"ACS {year}: {len(rows)} of {len(la_zips)} Los Angeles County home-value ZIPs.",
         flush=True,
     )
-    if len(rows) < max(1, len(zips) // 2):
+    if len(rows) < max(1, len(la_zips) // 2):
         raise SystemExit(
             f"ACS {year} returned too few Los Angeles County home-value ZIPs."
         )
-    rows.sort(key=lambda row: row[1])
+    rows.sort(key=lambda row: (row[0], row[1]))
     return rows
 
 
@@ -741,25 +935,21 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
 """
 
 
-def stored_years(cur) -> set[int]:
-    cur.execute(
-        """
-        SELECT 1
-        FROM information_schema.tables
-        WHERE table_schema = 'public'
-          AND table_name = %s
-          AND table_type = 'BASE TABLE'
-        """,
-        (TABLE_NAME,),
-    )
-    if cur.fetchone() is None:
+def stored_pairs(cur, years: list[int]) -> set[tuple[int, str]]:
+    """ZIP and year pairs already stored. The table exists when this runs."""
+    if not years:
         return set()
-    cur.execute(f"SELECT DISTINCT acs_year FROM {TABLE}")
-    return {int(year) for (year,) in cur.fetchall()}
+    cur.execute(
+        f"SELECT acs_year, zip FROM {TABLE} WHERE acs_year = ANY(%s)",
+        (years,),
+    )
+    return {(int(year), str(zip_code)) for year, zip_code in cur.fetchall()}
 
 
 def insert_new_years(conn, rows: list[tuple]) -> tuple[int, int]:
-    """Insert vintages that are not already stored. Do not delete older years."""
+    """Insert ZIP rows that are not already stored. Do not delete older years."""
+    if not rows:
+        return 0, 0
     column_list = ", ".join(COLUMNS)
     placeholders = ", ".join(["%s"] * len(COLUMNS))
     sql = (
@@ -769,16 +959,35 @@ def insert_new_years(conn, rows: list[tuple]) -> tuple[int, int]:
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(schema_sql())
-            already = stored_years(cur)
-            pending_years = vintages_to_insert(
-                sorted({int(row[0]) for row in rows}), already
-            )
-            pending = [row for row in rows if int(row[0]) in pending_years]
+            years = sorted({int(row[0]) for row in rows})
+            already = stored_pairs(cur, years)
+            pending = [
+                row
+                for row in rows
+                if (int(row[0]), str(row[1])) not in already
+            ]
             if pending:
                 cur.executemany(sql, pending)
             cur.execute(f"SELECT COUNT(*) FROM {TABLE}")
             total = cur.fetchone()[0]
     return len(pending), total
+
+
+def checkpoint_download(holder: dict, rows_so_far: list[tuple], new_rows: list[tuple]) -> None:
+    """Write finished rows before the next Census batch starts."""
+    ordered = sorted(rows_so_far, key=lambda row: (row[0], row[1]))
+    write_csv(ordered)
+    print(
+        f"Saved {len(ordered)} Los Angeles County rows to {OUTPUT_CSV_NAME}.",
+        flush=True,
+    )
+    if not database_url() or not new_rows:
+        return
+    if holder.get("conn") is None:
+        holder["conn"] = connect()
+    added, total = insert_new_years(holder["conn"], new_rows)
+    holder["inserted"] = holder.get("inserted", 0) + added
+    holder["total"] = total
 
 
 def notify_refresh_review(table: str) -> int:
@@ -817,33 +1026,48 @@ def notify_refresh_review(table: str) -> int:
 
 
 def main() -> int:
+    holder: dict = {"conn": None, "inserted": 0, "total": None}
+    rows: list[tuple] | None = None
     try:
-        zips = sorted(los_angeles_home_value_zips())
+        california = california_zctas()
+        la_zips = los_angeles_home_value_zips()
+        print(f"California ZCTAs to request: {len(california)}.", flush=True)
         vintage = latest_vintage(datetime.now(timezone.utc).year)
         print(f"ACS 5-year vintage: {vintage}.", flush=True)
         verify_labels(vintage)
-        rows = rows_for_vintage(vintage, zips)
-        rows.sort(key=lambda row: (row[0], row[1]))
+
+        def on_batch(rows_so_far: list[tuple], new_rows: list[tuple]) -> None:
+            checkpoint_download(holder, rows_so_far, new_rows)
+
+        rows = rows_for_vintage(vintage, california, la_zips, on_batch)
     except SystemExit as exc:
         print(public_error(exc), file=sys.stderr)
-        return 1
+        rows = None
     except Exception as exc:
         print(public_error(exc), file=sys.stderr)
+        rows = None
+    finally:
+        conn = holder.get("conn")
+        if conn is not None:
+            conn.close()
+    if rows is None:
         return 1
-    write_csv(rows)
     print(f"Wrote {len(rows)} rows to {OUTPUT_CSV_NAME}.")
     if not database_url():
         print(f"{DATABASE_URL_ENV} is not set. Left {TABLE} unchanged.")
         return 0
-    try:
-        with connect() as conn:
-            inserted, total = insert_new_years(conn, rows)
-    except SystemExit as exc:
-        print(public_error(exc), file=sys.stderr)
-        return 1
-    except Exception as exc:
-        print(public_error(exc), file=sys.stderr)
-        return 1
+    inserted = holder["inserted"]
+    total = holder["total"]
+    if total is None:
+        try:
+            with connect() as conn:
+                inserted, total = insert_new_years(conn, rows)
+        except SystemExit as exc:
+            print(public_error(exc), file=sys.stderr)
+            return 1
+        except Exception as exc:
+            print(public_error(exc), file=sys.stderr)
+            return 1
     print(
         f"Inserted {inserted} new rows into {TABLE}. "
         f"The table has {total} rows. Older vintages were kept."
