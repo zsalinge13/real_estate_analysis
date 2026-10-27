@@ -276,7 +276,8 @@ class CensusTests(unittest.TestCase):
             )
         )
         url = census.census_data_url(2024, ("B19013_001E",), ["90001"])
-        self.assertIn("in=state:06", url)
+        self.assertNotIn("in=", url)
+        self.assertNotIn("state", url)
         self.assertNotIn("key=", url)
         captured: list[str] = []
 
@@ -408,38 +409,146 @@ class CensusTests(unittest.TestCase):
             census.fetch_with_optional_key = original
         self.assertEqual(rows, [])
 
-    def test_server_error_without_state_retries_in_california(self):
+    def test_server_error_does_not_add_a_state(self):
+        seen: list[str] = []
+
         def fake(url: str) -> bytes:
-            if "state:06" not in url:
-                raise SystemExit(
-                    "The Census API returned HTTP 500: "
-                    "There was an error while running your query. "
-                    "https://api.census.gov/data/developers.html"
-                )
-            return (
-                b'[["B19013_001E","zip code tabulation area"],'
-                b'["10","90001"]]'
+            seen.append(url)
+            raise SystemExit(
+                "The Census API returned HTTP 500: "
+                "There was an error while running your query. "
+                "https://api.census.gov/data/developers.html"
             )
 
         original = census.fetch_with_optional_key
         census.fetch_with_optional_key = fake
         try:
-            rows = census.fetch_query(2023, ["90001"], ("B19013_001E",), state="")
+            with self.assertRaises(SystemExit) as caught:
+                census.fetch_query(2024, ["90001"], ("B19013_001E",))
         finally:
             census.fetch_with_optional_key = original
-        self.assertEqual(rows[0]["zip code tabulation area"], "90001")
-        self.assertEqual(rows[0]["B19013_001E"], "10")
-        shown = census.public_error(
-            SystemExit(
-                "The Census API returned HTTP 500: "
-                "There was an error while running your query. "
-                "https://api.census.gov/data/developers.html"
-            )
-        )
+        self.assertEqual(len(seen), 1)
+        self.assertNotIn("state:06", seen[0])
+        self.assertIn("HTTP 500", str(caught.exception))
+        shown = census.public_error(caught.exception)
         self.assertIn("HTTP 500", shown)
         self.assertIn("error while running your query", shown)
         self.assertNotIn("developers.html", shown)
         self.assertNotIn("://", shown)
+
+    def test_zcta_url_omits_the_state(self):
+        url = census.census_data_url(2024, ("B19013_001E",), ["90001", "90210"])
+        self.assertIn("zip%20code%20tabulation%20area:90001,90210", url)
+        self.assertNotIn("in=", url)
+        self.assertNotIn("state", url)
+
+    def test_hierarchy_error_is_not_a_missing_zip(self):
+        self.assertEqual(
+            census.geography_problem(
+                "The Census API returned HTTP 400: "
+                "error: unknown/unsupported geography hierarchy"
+            ),
+            "hierarchy",
+        )
+        self.assertEqual(
+            census.geography_problem(
+                "error: unknown/unsupported geography heirarchy"
+            ),
+            "hierarchy",
+        )
+        self.assertEqual(
+            census.geography_problem(
+                "The Census API returned HTTP 400: unknown geography "
+                "zip code tabulation area:99999"
+            ),
+            "unknown",
+        )
+
+        def fake(_url: str) -> bytes:
+            raise SystemExit(
+                "The Census API returned HTTP 400: "
+                "error: unknown/unsupported geography hierarchy"
+            )
+
+        original = census.fetch_with_optional_key
+        census.fetch_with_optional_key = fake
+        try:
+            with self.assertRaises(SystemExit) as caught:
+                census.fetch_query(2024, ["90001"], ("B19013_001E",))
+        finally:
+            census.fetch_with_optional_key = original
+        self.assertIn("hierarchy", str(caught.exception))
+        self.assertNotIn("too few", str(caught.exception))
+
+    def test_state_hierarchy_is_retried_without_a_state(self):
+        def fake(url: str) -> bytes:
+            if "state:06" in url:
+                raise SystemExit(
+                    "The Census API returned HTTP 400: "
+                    "error: unknown/unsupported geography hierarchy"
+                )
+            return (
+                b'[["B19013_001E","zip code tabulation area"],'
+                b'["10","90001"],["11","90002"]]'
+            )
+
+        original = census.fetch_with_optional_key
+        census.fetch_with_optional_key = fake
+        stdout = io.StringIO()
+        try:
+            with patch("sys.stdout", stdout):
+                rows = census.fetch_query(
+                    2024,
+                    ["90001", "90002"],
+                    ("B19013_001E",),
+                    state=census.CALIFORNIA_STATE,
+                )
+        finally:
+            census.fetch_with_optional_key = original
+        self.assertEqual(
+            [row["zip code tabulation area"] for row in rows],
+            ["90001", "90002"],
+        )
+        self.assertIn("does not use a state", stdout.getvalue())
+
+    def test_unknown_geography_list_splits_zips_before_variables(self):
+        calls: list[str] = []
+
+        def fake(url: str) -> bytes:
+            calls.append(url)
+            for_part = url.split("for=", 1)[1].split("&", 1)[0]
+            zips = for_part.split(":", 1)[1].split(",")
+            if zips == ["99999"]:
+                raise SystemExit(
+                    "The Census API returned HTTP 400: unknown geography "
+                    "zip code tabulation area:99999"
+                )
+            if len(zips) > 1:
+                raise SystemExit(
+                    "The Census API returned HTTP 400: unknown geography "
+                    "zip code tabulation area"
+                )
+            return (
+                b'[["B19013_001E","B19301_001E","zip code tabulation area"],'
+                b'["5","6","90001"]]'
+            )
+
+        original = census.fetch_with_optional_key
+        census.fetch_with_optional_key = fake
+        try:
+            rows = census.fetch_query(
+                2024, ["90001", "99999"], ("B19013_001E", "B19301_001E")
+            )
+        finally:
+            census.fetch_with_optional_key = original
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["zip code tabulation area"], "90001")
+        self.assertEqual(rows[0]["B19301_001E"], "6")
+        self.assertEqual(len(calls), 3)
+        for url in calls:
+            get = url.split("get=", 1)[1].split("&", 1)[0]
+            self.assertIn("B19013_001E", get)
+            self.assertIn("B19301_001E", get)
 
     def test_unreachable_network_is_retried_without_printing_the_key(self):
         class Response:
