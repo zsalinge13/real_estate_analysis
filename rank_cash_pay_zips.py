@@ -1,0 +1,711 @@
+"""Rank Los Angeles County ZIPs from the Census-Redfin join.
+
+The input is the join that just succeeded. This script does not rebuild
+that join and does not delete Redfin months. Each persona keeps the top 25
+ZIPs that pass its cash screen. The same run writes marketing_bullets on
+the latest procedure_surgeon_fees report year. Older report years are left
+blank in that column. The fee load owns the column and does not fill it.
+"""
+
+from __future__ import annotations
+
+import csv
+import os
+import sys
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
+from pathlib import Path
+
+import dataset_stamp
+import load_california
+import pull_procedure_surgeon_fees as procedures
+
+RANK_TABLE_NAME = "cash_pay_zip_rank"
+RANK_TABLE = "public.cash_pay_zip_rank"
+DELETE_RANK_SQL = f"DELETE FROM {RANK_TABLE}"
+OUTPUT_CSV_NAME = "cash_pay_zip_rank.csv"
+OUTPUT_CSV = Path(__file__).resolve().parent / OUTPUT_CSV_NAME
+MIN_ACTIVE_LISTINGS = 10
+TOP_N = 25
+DATABASE_URL_ENV = load_california.DATABASE_URL_ENV
+
+# Equal age shares are the close case. The higher cash signal ranks first.
+# Household income is that signal for working-age personas. Listing price is
+# that signal for ages 55 and older. The female share is not a rank key.
+
+
+@dataclass(frozen=True)
+class Persona:
+    label: str
+    age_columns: tuple[str, ...]
+    cash: str
+    age_phrase: str
+
+
+PERSONAS = (
+    Persona("18 to 34", ("population_18_34",), "working", "ages 18 to 34"),
+    Persona("35 to 44", ("population_35_44",), "working", "ages 35 to 44"),
+    Persona("45 to 54", ("population_45_54",), "working", "ages 45 to 54"),
+    Persona(
+        "55 and older",
+        ("population_55_64", "population_65_plus"),
+        "older",
+        "ages 55 and older",
+    ),
+)
+PERSONA_BY_LABEL = {persona.label: persona for persona in PERSONAS}
+
+# The ZIP rank does not change by procedure. A procedure uses these persona
+# lists, and procedures that use the same lists get the same bullet text.
+PROCEDURE_PERSONAS = {
+    "breast augmentation": ("18 to 34", "35 to 44"),
+    "breast lift": ("35 to 44", "45 to 54"),
+    "breast reduction": ("18 to 34", "35 to 44", "45 to 54"),
+    "liposuction": ("18 to 34", "35 to 44", "45 to 54"),
+    "tummy tuck": ("35 to 44", "45 to 54"),
+    "arm lift": ("35 to 44", "45 to 54", "55 and older"),
+    "thigh lift": ("35 to 44", "45 to 54", "55 and older"),
+    "buttock augmentation with fat grafting": ("18 to 34", "35 to 44"),
+    "eyelid surgery": ("45 to 54", "55 and older"),
+    "facelift": ("45 to 54", "55 and older"),
+    "neck lift": ("45 to 54", "55 and older"),
+    "rhinoplasty": ("18 to 34", "35 to 44"),
+    "forehead lift": ("45 to 54", "55 and older"),
+}
+
+RANK_COLUMNS = (
+    "persona",
+    "rank",
+    "zip",
+    "zip_name",
+    "age_share",
+    "median_household_income",
+    "per_capita_income",
+    "median_listing_price",
+    "active_listing_count",
+    "male_population",
+    "female_population",
+    "female_share",
+    "median_age",
+    "median_listing_price_per_square_foot",
+    "household_income_middle",
+    "per_capita_income_middle",
+    "listing_price_middle",
+    "acs_year",
+    "month_date_yyyymm",
+    "date_pulled_yyyymmdd",
+)
+COLUMN_TYPES = {
+    "persona": "text",
+    "rank": "integer",
+    "zip": "text",
+    "zip_name": "text",
+    "age_share": "numeric",
+    "median_household_income": "integer",
+    "per_capita_income": "integer",
+    "median_listing_price": "numeric",
+    "active_listing_count": "integer",
+    "male_population": "integer",
+    "female_population": "integer",
+    "female_share": "numeric",
+    "median_age": "numeric",
+    "median_listing_price_per_square_foot": "numeric",
+    "household_income_middle": "numeric",
+    "per_capita_income_middle": "numeric",
+    "listing_price_middle": "numeric",
+    "acs_year": "integer",
+    "month_date_yyyymm": "text",
+    "date_pulled_yyyymmdd": "text",
+}
+NOT_NULL_COLUMNS = {
+    "persona",
+    "rank",
+    "zip",
+    "zip_name",
+    "age_share",
+    "median_household_income",
+    "per_capita_income",
+    "median_listing_price",
+    "active_listing_count",
+    "household_income_middle",
+    "per_capita_income_middle",
+    "listing_price_middle",
+    "acs_year",
+    "month_date_yyyymm",
+    "date_pulled_yyyymmdd",
+}
+JOIN_FIELDS = (
+    "zip",
+    "postal_code",
+    "zip_name",
+    "median_household_income",
+    "per_capita_income",
+    "median_age",
+    "male_population",
+    "female_population",
+    "adult_population",
+    "population_18_34",
+    "population_35_44",
+    "population_45_54",
+    "population_55_64",
+    "population_65_plus",
+    "median_listing_price",
+    "median_listing_price_per_square_foot",
+    "active_listing_count",
+    "acs_year",
+    "month_date_yyyymm",
+    "date_pulled_yyyymmdd",
+)
+INTEGER_RANK_COLUMNS = {
+    name for name, sql_type in COLUMN_TYPES.items() if sql_type == "integer"
+}
+
+if set(PROCEDURE_PERSONAS) != set(procedures.PROCEDURES):
+    raise SystemExit("Every procedure needs a persona list.")
+if any(label not in PERSONA_BY_LABEL for labels in PROCEDURE_PERSONAS.values() for label in labels):
+    raise SystemExit("A procedure lists an unknown persona.")
+if "DELETE" in DELETE_RANK_SQL.upper() and "redfin_real_estate_value" in DELETE_RANK_SQL:
+    raise SystemExit("The rank refresh must not delete Redfin rows.")
+
+
+@dataclass
+class PersonaRank:
+    persona: Persona
+    household_income_middle: Decimal | None
+    per_capita_income_middle: Decimal | None
+    listing_price_middle: Decimal | None
+    rows: list[dict]
+
+
+def quote_ident(name: str) -> str:
+    if load_california.IDENT_RE.fullmatch(name) is None:
+        raise SystemExit(f"Refusing unexpected column {name!r}.")
+    return name
+
+
+def blank(value: object) -> bool:
+    if value is None:
+        return True
+    return str(value).strip() == ""
+
+
+def as_decimal(value: object) -> Decimal | None:
+    if blank(value):
+        return None
+    try:
+        return Decimal(str(value).strip())
+    except Exception as exc:
+        raise SystemExit(f"{value!r} is not a number.") from exc
+
+
+def as_int(value: object, column: str) -> int | None:
+    number = as_decimal(value)
+    if number is None:
+        return None
+    if number != number.to_integral_value():
+        raise SystemExit(f"{column} is not a whole number.")
+    return int(number)
+
+
+def middle(values: list[Decimal]) -> Decimal:
+    """The middle of the values that remain. An even count averages the two middles."""
+    ordered = sorted(values)
+    count = len(ordered)
+    if count == 0:
+        raise SystemExit("Cannot find the middle of an empty list.")
+    half = count // 2
+    if count % 2 == 1:
+        return ordered[half]
+    return (ordered[half - 1] + ordered[half]) / Decimal(2)
+
+
+def format_money(value: Decimal) -> str:
+    integral = value.to_integral_value()
+    if value == integral:
+        return f"${int(integral):,}"
+    return f"${value:,.2f}"
+
+
+def format_percent(share: Decimal) -> str:
+    points = (share * Decimal(100)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    return f"{points}%"
+
+
+def read_join_csv(path: Path) -> list[dict[str, str]]:
+    if not path.is_file():
+        raise SystemExit(f"{path} is missing.")
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        missing = [name for name in JOIN_FIELDS if name not in (reader.fieldnames or [])]
+        if missing:
+            raise SystemExit(f"{path.name} is missing columns: {missing}")
+        rows: list[dict[str, str]] = []
+        for raw in reader:
+            rows.append(
+                {
+                    key: "" if value is None else value
+                    for key, value in raw.items()
+                    if key is not None
+                }
+            )
+        return rows
+
+
+def female_share(row: dict[str, str]) -> Decimal | None:
+    male = as_int(row.get("male_population"), "male_population")
+    female = as_int(row.get("female_population"), "female_population")
+    if male is None or female is None:
+        return None
+    total = male + female
+    if total <= 0:
+        return None
+    return Decimal(female) / Decimal(total)
+
+
+def age_count(row: dict[str, str], persona: Persona) -> int | None:
+    total = 0
+    for column in persona.age_columns:
+        value = as_int(row.get(column), column)
+        if value is None:
+            return None
+        total += value
+    return total
+
+
+def screen_row(row: dict[str, str], persona: Persona) -> dict | None:
+    """Return the measures used for one persona, or None when the ZIP is skipped."""
+    counted = age_count(row, persona)
+    adults = as_int(row.get("adult_population"), "adult_population")
+    household = as_int(row.get("median_household_income"), "median_household_income")
+    per_capita = as_int(row.get("per_capita_income"), "per_capita_income")
+    price = as_decimal(row.get("median_listing_price"))
+    listings = as_int(row.get("active_listing_count"), "active_listing_count")
+    if (
+        counted is None
+        or adults is None
+        or adults <= 0
+        or household is None
+        or per_capita is None
+        or price is None
+        or listings is None
+        or listings < MIN_ACTIVE_LISTINGS
+    ):
+        return None
+    zip_code = str(row.get("zip") or "").strip()
+    if not zip_code:
+        raise SystemExit("The join has a row without a ZIP.")
+    postal = str(row.get("postal_code") or "").strip()
+    if postal and postal != zip_code:
+        raise SystemExit(f"ZIP {zip_code} does not match postal code {postal}.")
+    year = as_int(row.get("acs_year"), "acs_year")
+    month = str(row.get("month_date_yyyymm") or "").strip()
+    pulled = str(row.get("date_pulled_yyyymmdd") or "").strip()
+    if year is None or not month or not pulled:
+        raise SystemExit(f"ZIP {zip_code} is missing the join freshness fields.")
+    return {
+        "zip": zip_code,
+        "zip_name": str(row.get("zip_name") or "").strip(),
+        "age_count": counted,
+        "adult_population": adults,
+        "age_share": Decimal(counted) / Decimal(adults),
+        "median_household_income": household,
+        "per_capita_income": per_capita,
+        "median_listing_price": price,
+        "active_listing_count": listings,
+        "male_population": as_int(row.get("male_population"), "male_population"),
+        "female_population": as_int(row.get("female_population"), "female_population"),
+        "female_share": female_share(row),
+        "median_age": as_decimal(row.get("median_age")),
+        "median_listing_price_per_square_foot": as_decimal(
+            row.get("median_listing_price_per_square_foot")
+        ),
+        "acs_year": year,
+        "month_date_yyyymm": month,
+        "date_pulled_yyyymmdd": pulled,
+    }
+
+
+def passes_cash(row: dict, persona: Persona, income_middle, per_capita_middle, price_middle) -> bool:
+    if persona.cash == "working":
+        return (
+            Decimal(row["median_household_income"]) >= income_middle
+            and row["median_listing_price"] >= price_middle
+        )
+    if persona.cash == "older":
+        return (
+            row["median_listing_price"] >= price_middle
+            and Decimal(row["per_capita_income"]) >= per_capita_middle
+        )
+    raise SystemExit(f"Unknown cash test {persona.cash!r}.")
+
+
+def cash_signal(row: dict, persona: Persona) -> Decimal:
+    if persona.cash == "working":
+        return Decimal(row["median_household_income"])
+    return row["median_listing_price"]
+
+
+def rank_persona(rows: list[dict[str, str]], persona: Persona) -> PersonaRank:
+    prepared = []
+    seen: set[str] = set()
+    for row in rows:
+        screened = screen_row(row, persona)
+        if screened is None:
+            continue
+        if screened["zip"] in seen:
+            raise SystemExit(f"The join has more than one row for ZIP {screened['zip']}.")
+        seen.add(screened["zip"])
+        prepared.append(screened)
+    if not prepared:
+        return PersonaRank(persona, None, None, None, [])
+    income_middle = middle(
+        [Decimal(row["median_household_income"]) for row in prepared]
+    )
+    per_capita_middle = middle([Decimal(row["per_capita_income"]) for row in prepared])
+    price_middle = middle([row["median_listing_price"] for row in prepared])
+    kept = [
+        row
+        for row in prepared
+        if passes_cash(row, persona, income_middle, per_capita_middle, price_middle)
+    ]
+    kept.sort(
+        key=lambda row: (
+            -row["age_share"],
+            -cash_signal(row, persona),
+            row["zip"],
+        )
+    )
+    ranked = kept[:TOP_N]
+    for index, row in enumerate(ranked, start=1):
+        row["persona"] = persona.label
+        row["rank"] = index
+        row["household_income_middle"] = income_middle
+        row["per_capita_income_middle"] = per_capita_middle
+        row["listing_price_middle"] = price_middle
+    return PersonaRank(
+        persona,
+        income_middle,
+        per_capita_middle,
+        price_middle,
+        ranked,
+    )
+
+
+def rank_personas(rows: list[dict[str, str]]) -> list[PersonaRank]:
+    """Rank each persona from the join rows. Do not add or drop a ZIP by name."""
+    zips = [str(row.get("zip") or "").strip() for row in rows]
+    if any(not zip_code for zip_code in zips):
+        raise SystemExit("The join has a row without a ZIP.")
+    if len(zips) != len(set(zips)):
+        raise SystemExit("The join has more than one row for a ZIP.")
+    return [rank_persona(rows, persona) for persona in PERSONAS]
+
+
+def place_name(row: dict) -> str:
+    name = str(row.get("zip_name") or "").strip()
+    if not name:
+        return str(row["zip"])
+    return f"{name} ({row['zip']})"
+
+
+def screen_header(screen: PersonaRank) -> str:
+    persona = screen.persona
+    if screen.household_income_middle is None:
+        return (
+            f"{persona.label}. No ZIP had a published age count, adult population, "
+            "household income, per-person income, listing price, and at least "
+            f"{MIN_ACTIVE_LISTINGS} active listings."
+        )
+    if persona.cash == "working":
+        middles = (
+            f"household income middle {format_money(screen.household_income_middle)}, "
+            f"listing price middle {format_money(screen.listing_price_middle)}"
+        )
+        rule = "Household income and the listing price are both at or above"
+        failed = (
+            "No ZIP has both household income and listing price at or above "
+            "the middle of Los Angeles County ZIPs in this screen"
+        )
+    else:
+        middles = (
+            f"listing price middle {format_money(screen.listing_price_middle)}, "
+            f"per-person income middle {format_money(screen.per_capita_income_middle)}"
+        )
+        rule = "Listing price and per-person income are both at or above"
+        failed = (
+            "No ZIP has both listing price and per-person income at or above "
+            "the middle of Los Angeles County ZIPs in this screen"
+        )
+    if not screen.rows:
+        return f"{persona.label}. {failed} ({middles})."
+    return (
+        f"{persona.label}. {rule} the middle of Los Angeles County ZIPs in this "
+        f"screen ({middles}). Ranked by the share of adults {persona.age_phrase}."
+    )
+
+
+def zip_bullet(screen: PersonaRank, row: dict) -> str:
+    share = format_percent(row["age_share"])
+    if screen.persona.cash == "working":
+        reason = (
+            f"{share} of adults are {screen.persona.age_phrase}. "
+            f"Household income {format_money(Decimal(row['median_household_income']))} "
+            f"and listing price {format_money(row['median_listing_price'])} "
+            "are at or above those middles."
+        )
+    else:
+        reason = (
+            f"{share} of adults are {screen.persona.age_phrase}. "
+            f"Listing price {format_money(row['median_listing_price'])} and "
+            f"per-person income {format_money(Decimal(row['per_capita_income']))} "
+            "are at or above those middles."
+        )
+    if row.get("female_share") is not None:
+        reason += f" Women are {format_percent(row['female_share'])} of residents."
+    return f"{row['rank']}. {place_name(row)}: {reason}"
+
+
+def render_screen(screen: PersonaRank) -> str:
+    lines = [screen_header(screen)]
+    for row in screen.rows:
+        lines.append(f"- {zip_bullet(screen, row)}")
+    return "\n".join(lines)
+
+
+def marketing_bullets(procedure: str, screens: list[PersonaRank]) -> str:
+    """Bullet text for one procedure's persona lists. Shared lists repeat."""
+    labels = PROCEDURE_PERSONAS.get(procedure)
+    if not labels:
+        return f"- {procedure} has no cash-pay persona list."
+    by_label = {screen.persona.label: screen for screen in screens}
+    return "\n".join(render_screen(by_label[label]) for label in labels)
+
+
+def bullets_by_procedure(
+    procedures_in_year: list[str], screens: list[PersonaRank]
+) -> dict[str, str]:
+    cache: dict[tuple[str, ...], str] = {}
+    bullets: dict[str, str] = {}
+    for name in procedures_in_year:
+        labels = PROCEDURE_PERSONAS.get(name)
+        if labels is None:
+            bullets[name] = marketing_bullets(name, screens)
+            continue
+        if labels not in cache:
+            cache[labels] = marketing_bullets(name, screens)
+        bullets[name] = cache[labels]
+    return bullets
+
+
+def flatten(screens: list[PersonaRank]) -> list[dict]:
+    rows: list[dict] = []
+    for screen in screens:
+        rows.extend(screen.rows)
+    return rows
+
+
+def csv_cell(column: str, value: object) -> object:
+    if value is None:
+        return ""
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    return value
+
+
+def write_rank_csv(rows: list[dict], path: Path | None = None) -> None:
+    path = OUTPUT_CSV if path is None else path
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with tmp.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=RANK_COLUMNS,
+                lineterminator="\n",
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(
+                    {column: csv_cell(column, row.get(column)) for column in RANK_COLUMNS}
+                )
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def schema_sql() -> str:
+    lines = []
+    for name in RANK_COLUMNS:
+        ident = quote_ident(name)
+        null_sql = " NOT NULL" if name in NOT_NULL_COLUMNS else ""
+        lines.append(f"    {ident} {COLUMN_TYPES[name]}{null_sql}")
+    lines.append(f"    {quote_ident(dataset_stamp.COLUMN)} {dataset_stamp.SQL_TYPE}")
+    body = ",\n".join(lines)
+    return (
+        f"CREATE TABLE IF NOT EXISTS {RANK_TABLE} (\n"
+        f"{body},\n"
+        "    PRIMARY KEY (persona, zip)\n"
+        ");\n"
+    )
+
+
+def ensure_rank_columns(cur) -> None:
+    cur.execute(schema_sql())
+    for name in RANK_COLUMNS:
+        cur.execute(
+            f"ALTER TABLE {RANK_TABLE} ADD COLUMN IF NOT EXISTS "
+            f"{quote_ident(name)} {COLUMN_TYPES[name]}"
+        )
+    cur.execute(
+        f"ALTER TABLE {RANK_TABLE} ADD COLUMN IF NOT EXISTS "
+        f"{quote_ident(dataset_stamp.COLUMN)} {dataset_stamp.SQL_TYPE}"
+    )
+
+
+def rank_db_value(column: str, row: dict):
+    value = row.get(column)
+    if column in INTEGER_RANK_COLUMNS:
+        if value is None or value == "":
+            return None
+        return int(value)
+    if COLUMN_TYPES[column] == "numeric":
+        if value is None or value == "":
+            return None
+        return value if isinstance(value, Decimal) else Decimal(str(value))
+    if value is None:
+        return ""
+    return str(value)
+
+
+def table_exists(cur, table_name: str) -> bool:
+    cur.execute(
+        """
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = %s
+          AND table_type = 'BASE TABLE'
+        """,
+        (table_name,),
+    )
+    return cur.fetchone() is not None
+
+
+def fetch_procedure_rows(cur) -> list[tuple[int, str]]:
+    if not table_exists(cur, procedures.TABLE_NAME):
+        raise SystemExit(f"{procedures.TABLE} is missing.")
+    cur.execute(
+        f"SELECT report_year, procedure FROM {procedures.TABLE} "
+        "ORDER BY report_year, procedure"
+    )
+    found = [(int(year), str(name)) for year, name in cur.fetchall()]
+    if not found:
+        raise SystemExit(f"{procedures.TABLE} has no rows.")
+    return found
+
+
+def apply_marketing_bullets(cur, screens: list[PersonaRank], procedure_rows: list[tuple[int, str]]) -> tuple[int, int]:
+    """Write bullet text on the latest report year and blank every older year."""
+    procedures.ensure_marketing_bullets(cur)
+    latest = max(year for year, _name in procedure_rows)
+    cur.execute(
+        f"UPDATE {procedures.TABLE} SET {procedures.MARKETING_BULLETS} = NULL "
+        "WHERE report_year <> %s",
+        (latest,),
+    )
+    names = [name for year, name in procedure_rows if year == latest]
+    bullets = bullets_by_procedure(names, screens)
+    updates = [(bullets[name], latest, name) for name in names]
+    if updates:
+        cur.executemany(
+            f"UPDATE {procedures.TABLE} SET {procedures.MARKETING_BULLETS} = %s "
+            "WHERE report_year = %s AND procedure = %s",
+            updates,
+        )
+    return latest, len(updates)
+
+
+def save_rank(
+    conn, screens: list[PersonaRank], updated_at: datetime | None = None
+) -> tuple[int, int, int]:
+    """Replace the rank snapshot and write procedure bullets. Do not drop tables."""
+    if "redfin_real_estate_value" in DELETE_RANK_SQL:
+        raise SystemExit("The rank refresh must not delete Redfin rows.")
+    updated_at = dataset_stamp.stamp(updated_at)
+    rows = flatten(screens)
+    stored = RANK_COLUMNS + (dataset_stamp.COLUMN,)
+    column_list = ", ".join(quote_ident(name) for name in stored)
+    placeholders = ", ".join(["%s"] * len(stored))
+    insert_sql = f"INSERT INTO {RANK_TABLE} ({column_list}) VALUES ({placeholders})"
+    _updated_at, stamped = dataset_stamp.stamp_rows(
+        [tuple(rank_db_value(name, row) for name in RANK_COLUMNS) for row in rows],
+        updated_at,
+    )
+    with conn.transaction():
+        with conn.cursor() as cur:
+            ensure_rank_columns(cur)
+            cur.execute(DELETE_RANK_SQL)
+            if stamped:
+                cur.executemany(insert_sql, stamped)
+            procedure_rows = fetch_procedure_rows(cur)
+            year, bullet_count = apply_marketing_bullets(cur, screens, procedure_rows)
+            cur.execute(f"SELECT COUNT(*) FROM {RANK_TABLE}")
+            count = cur.fetchone()[0]
+    if count != len(rows):
+        raise SystemExit(f"{RANK_TABLE} has {count} rows after loading {len(rows)}.")
+    return count, year, bullet_count
+
+
+def database_url() -> str:
+    return os.environ.get(DATABASE_URL_ENV, "").strip()
+
+
+def public_error(exc: BaseException) -> str:
+    text = str(exc)
+    lowered = text.lower()
+    if "://" in text or "postgres" in lowered or "key=" in lowered or "password" in lowered:
+        return "Could not rank cash-pay ZIPs."
+    if text:
+        return text
+    return "Could not rank cash-pay ZIPs."
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if len(args) != 1:
+        raise SystemExit("Usage: python rank_cash_pay_zips.py JOIN_CSV")
+    screens = rank_personas(read_join_csv(Path(args[0])))
+    rows = flatten(screens)
+    write_rank_csv(rows)
+    summary = ", ".join(f"{len(screen.rows)} for {screen.persona.label}" for screen in screens)
+    print(f"Ranked cash-pay ZIPs: {summary}. Wrote {len(rows)} rows to {OUTPUT_CSV_NAME}.")
+    if not database_url():
+        print(
+            f"{DATABASE_URL_ENV} is not set. "
+            f"Left {RANK_TABLE} and {procedures.TABLE} unchanged."
+        )
+        return 0
+    updated_at = dataset_stamp.stamp()
+    print(f"dataset_updated_at: {updated_at.isoformat()}")
+    try:
+        with load_california.connect() as conn:
+            count, year, bullet_count = save_rank(conn, screens, updated_at)
+    except SystemExit as exc:
+        print(public_error(exc), file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(public_error(exc), file=sys.stderr)
+        return 1
+    print(
+        f"Replaced {RANK_TABLE} with {count} rows. "
+        f"Wrote {procedures.MARKETING_BULLETS} on {bullet_count} rows "
+        f"for report_year {year}. Older report years are blank in that column. "
+        f"{load_california.TABLE} was not modified."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

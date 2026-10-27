@@ -3,7 +3,8 @@ name: Load California ZIP inventory
 # Scheduled and manual runs replace public.redfin_real_estate_value with every
 # month in the Realtor history file. A successful Pull Census ZIP population
 # run on main starts the census-year job. That job loads only the Census
-# acs_year, does not delete older months, and uploads the join CSV.
+# acs_year, does not delete older months, uploads the join CSV, and then
+# ranks cash-pay ZIPs from that join.
 on:
   schedule:
     # 16:00 UTC on January 1 and July 1 only (every six months).
@@ -134,5 +135,18 @@ jobs:
         with:
           name: zip-census-redfin-join
           path: zip_census_redfin_join.csv
+          retention-days: 90
+          if-no-files-found: error
+      - name: Rank cash-pay ZIP personas
+        if: success()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python rank_cash_pay_zips.py zip_census_redfin_join.csv
+      - name: Upload cash-pay ZIP rank CSV
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cash-pay-zip-rank
+          path: cash_pay_zip_rank.csv
           retention-days: 90
           if-no-files-found: error

@@ -120,10 +120,18 @@ class DatasetStampTests(unittest.TestCase):
     def test_procedure_upsert_stamps_without_deleting_other_years(self):
         schema = procedures.schema_sql()
         self.assertIn("dataset_updated_at timestamptz", schema)
+        self.assertIn("marketing_bullets text", schema)
+        self.assertNotIn("DROP", schema.upper())
         source = inspect.getsource(procedures.upsert_rows)
         self.assertIn("dataset_stamp.COLUMN", source)
+        self.assertIn("ensure_marketing_bullets(cur)", source)
         self.assertIn("ON CONFLICT (procedure, report_year) DO UPDATE SET {updates}", source)
         self.assertNotIn("DELETE", source.upper())
+        self.assertNotIn("MARKETING_BULLETS", source)
+        column_sql = inspect.getsource(procedures.ensure_marketing_bullets)
+        self.assertEqual(procedures.MARKETING_BULLETS, "marketing_bullets")
+        self.assertIn("ADD COLUMN IF NOT EXISTS {MARKETING_BULLETS} text", column_sql)
+        self.assertNotIn("DROP", column_sql.upper())
 
         class Cursor:
             def __init__(self):
@@ -169,7 +177,14 @@ class DatasetStampTests(unittest.TestCase):
         procedures.upsert_rows(conn, [first, second], moment)
         sql = " ".join(conn.cursor_obj.statements)
         self.assertIn("dataset_updated_at = EXCLUDED.dataset_updated_at", sql)
+        self.assertIn("ADD COLUMN IF NOT EXISTS marketing_bullets text", sql)
         self.assertNotIn("DELETE", sql.upper())
+        update_sql = next(
+            statement
+            for statement in conn.cursor_obj.statements
+            if "DO UPDATE" in statement
+        )
+        self.assertNotIn("marketing_bullets", update_sql)
         self.assertEqual(
             conn.cursor_obj.rows,
             [first + (moment,), second + (moment,)],
