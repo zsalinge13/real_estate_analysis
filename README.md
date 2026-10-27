@@ -5,9 +5,11 @@ analyze california roi and risk
 
 `load_california.py` reads the Zip row of Monthly Housing Inventory on [Realtor.com Research](https://www.realtor.com/research/data/) and downloads the Historical Data CSV (not the current-month file). A ZIP is kept when the Census [2020 ZCTA-to-county relationship file](https://www2.census.gov/geo/docs/maps-data/data/rel2020/zcta520/tab20_zcta520_county20_natl.txt) says Los Angeles County, FIPS `06037`, has strictly more land area in that ZCTA than any other county. Water area breaks a land-area tie. A tie on both is left out. The place name is not used.
 
-Each run replaces `public.redfin_real_estate_value`. The script deletes every existing row in that table, then inserts the current extract. A ZIP or month that is no longer in the file does not remain. Rows are not appended. No other table is dropped or altered.
+A scheduled run, and a run started by hand, replaces `public.redfin_real_estate_value`. The script deletes every existing row in that table, then inserts the current extract. A ZIP or month that is no longer in the file does not remain. Rows are not appended. No other table is dropped or altered.
 
-The same extract is written to `california_zip_inventory.csv` in the repository root. Every run overwrites that file. The filename stays `california_zip_inventory.csv`. The extract from the 2026-10-23 pull is committed at that path.
+A run started after Census ZIP population succeeds does not do that replace. It loads only the calendar year of the Census `acs_year`, inserts or updates those months, and does not delete months already stored. That run's `california_zip_inventory.csv` contains that year only. Older months remain in `public.redfin_real_estate_value`.
+
+Each run overwrites `california_zip_inventory.csv` in the repository root. The filename stays `california_zip_inventory.csv`. A scheduled or manual run writes every loaded month. The chained run writes the Census year only. The extract from the 2026-10-23 pull is committed at that path.
 
 This is regional ZIP inventory, not individual homes. Single-family and condo/townhome listings are pooled. There is no building type, bedroom count, bathroom count, lot acreage, or single-home price. Price per square foot is the ZIP's median, not one building's area. Source: Realtor.com Economic Research.
 
@@ -56,11 +58,15 @@ In that data source:
 3. `pip install -r requirements.txt`
 4. `python load_california.py`
 
-The command replaces the table and overwrites `california_zip_inventory.csv`.
+`python load_california.py` replaces the table and overwrites `california_zip_inventory.csv`. `python load_california.py --census-year YYYY` loads only that calendar year and does not delete other months. The chained workflow passes the Census `acs_year` there.
 
 ### Scheduled refresh
 
-`.github/workflows/load-california.yml` runs at 16:00 UTC on January 1 and July 1 only (`0 16 1 1,7 *`), and when you start it by hand (`workflow_dispatch`). No other months are scheduled. Add a repository secret named `DATABASE_URL` with the same session-pooler URL. The workflow writes `california_zip_inventory.csv` in the job workspace. It does not commit a newer extract on its own. After that load succeeds, the job uploads `california_zip_inventory.csv` as the `redfin-real-estate-value` artifact and keeps it for 90 days. If the load step fails, the job exports the current `public.redfin_real_estate_value` rows to that same CSV and uploads the same artifact. An empty or missing table fails the backup and does not invent rows.
+`.github/workflows/load-california.yml` runs at 16:00 UTC on January 1 and July 1 only (`0 16 1 1,7 *`), and when you start it by hand (`workflow_dispatch`). No other months are scheduled. Those runs replace the whole price table. An in-progress run is not cancelled.
+
+A successful Pull Census ZIP population run on `main` starts this workflow through `workflow_run`. That run loads one Redfin year and writes the join described under Census and Redfin join. It does not cancel an in-progress load.
+
+Add a repository secret named `DATABASE_URL` with the same session-pooler URL. The workflow writes `california_zip_inventory.csv` in the job workspace. It does not commit a newer extract on its own. After that load succeeds, the job uploads `california_zip_inventory.csv` as the `redfin-real-estate-value` artifact and keeps it for 90 days. The scheduled and manual artifact is every loaded month. The chained artifact is the Census year only. If the load step fails, the job exports the current `public.redfin_real_estate_value` rows to that same CSV and uploads the same artifact. An empty or missing table fails the backup and does not invent rows. That failure export still includes older months that were kept in the table.
 
 ## Natural hazards
 
@@ -90,7 +96,19 @@ Columns are `acs_year`, `zip`, `median_household_income` (`B19013_001E`), `per_c
 
 ACS 5-year ZIP queries request zip code tabulation areas directly and do not send `in=state`. That geography is not nested in a state. Census answers `in=state:06` with an unsupported-hierarchy error, and that error is not a missing ZIP. California is applied by requesting the California ZCTAs and then keeping California and Los Angeles rows in the dataframe. When `CENSUS_API_KEY` is set, the script sends it on the first request and does not print it.
 
-`.github/workflows/pull-census-zip-population.yml` runs at 16:00 UTC on January 1 and July 1 (`0 16 1 1,7 *`) and on `workflow_dispatch`. After a successful load it uploads `census_zip_population.csv` as the `census-zip-population` artifact and keeps it for 90 days. If the load step fails, the job exports the current `public.census_zip_population` rows and uploads the same artifact. The job passes `DATABASE_URL`, `CENSUS_API_KEY`, and the refresh-review webhook secrets.
+`.github/workflows/pull-census-zip-population.yml` runs at 16:00 UTC on January 1 and July 1 (`0 16 1 1,7 *`) and on `workflow_dispatch`. After a successful load it uploads `census_zip_population.csv` as the `census-zip-population` artifact and keeps it for 90 days. If the load step fails, the job exports the current `public.census_zip_population` rows and uploads the same artifact. The job passes `DATABASE_URL`, `CENSUS_API_KEY`, and the refresh-review webhook secrets. A successful run on `main` starts the California workflow. This workflow does not cancel that run.
+
+## Census and Redfin join
+
+The chained California job reads `acs_year` from the `census-zip-population` artifact. Realtor.com still publishes one history file. This run keeps months in that census calendar year and does not stage the other years. Those months are inserted or updated in `public.redfin_real_estate_value`. The load does not delete rows, so a month already stored outside this run stays.
+
+The join uses the latest `month_date_yyyymm` in that year. The Actions log prints that month. It is the maximum month in the file just pulled whose year equals the Census `acs_year`. It is not a fixed month in the code. Earlier months in that year are stored by the pull and are not copied into the join.
+
+A ZIP is kept only when that month's `postal_code` equals the Census `zip`. The grain is one row per ZIP. Census values and prices are copied from those two rows. A blank price stays blank. A ZIP missing on either side is left out.
+
+The file is `zip_census_redfin_join.csv`. Columns are the Census columns, then the Redfin columns, including `acs_year`, `zip`, `postal_code`, and `month_date_yyyymm`. The workflow uploads it as the artifact `zip-census-redfin-join` on the California run that Census started, kept for 90 days. Download it from that run's summary. When `DATABASE_URL` is set, the same rows replace `public.zip_census_redfin_join`. Replacing the join table does not delete `public.redfin_real_estate_value`.
+
+The scheduled and manual California runs do not write this join. They still replace the whole price table.
 
 ## National procedure counts and surgeon fees
 

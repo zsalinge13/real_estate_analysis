@@ -1,5 +1,8 @@
 name: Pull Census ZIP population
 
+# A successful run on main starts Load California ZIP inventory.
+# The chain is a workflow_run trigger on that workflow. This file does not cancel it.
+
 on:
   schedule:
     # 16:00 UTC on January 1 and July 1 only (every six months).

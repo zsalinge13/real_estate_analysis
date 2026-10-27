@@ -1,10 +1,20 @@
 name: Load California ZIP inventory
 
+# Scheduled and manual runs replace public.redfin_real_estate_value with every
+# month in the Realtor history file. A successful Pull Census ZIP population
+# run on main starts the census-year job. That job loads only the Census
+# acs_year, does not delete older months, and uploads the join CSV.
 on:
   schedule:
     # 16:00 UTC on January 1 and July 1 only (every six months).
     - cron: "0 16 1 1,7 *"
   workflow_dispatch:
+  workflow_run:
+    workflows: ["Pull Census ZIP population"]
+    types:
+      - completed
+    branches:
+      - main
 
 permissions:
   actions: write
@@ -16,6 +26,8 @@ concurrency:
 
 jobs:
   load:
+    name: Load full California ZIP inventory
+    if: ${{ github.event_name != 'workflow_run' }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -52,5 +64,75 @@ jobs:
         with:
           name: redfin-real-estate-value
           path: california_zip_inventory.csv
+          retention-days: 90
+          if-no-files-found: error
+
+  load_census_year:
+    name: Load Census-year Redfin and join
+    if: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Download Census ZIP population artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: census-zip-population
+          path: census_artifact
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+      - name: Read the Census acs_year
+        id: census_year
+        run: |
+          set -euo pipefail
+          year="$(python join_census_redfin.py --print-acs-year census_artifact/census_zip_population.csv)"
+          [[ "$year" =~ ^[0-9]{4}$ ]]
+          echo "acs_year=${year}" >> "$GITHUB_OUTPUT"
+          echo "Census acs_year: ${year}"
+      - name: Load Redfin months for the Census year
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          REFRESH_REVIEW_WEBHOOK_URL: ${{ secrets.REFRESH_REVIEW_WEBHOOK_URL }}
+          REFRESH_REVIEW_WEBHOOK_KEY: ${{ secrets.REFRESH_REVIEW_WEBHOOK_KEY }}
+        run: python load_california.py --census-year "${{ steps.census_year.outputs.acs_year }}"
+      - name: Upload Redfin real estate value CSV
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: redfin-real-estate-value
+          path: california_zip_inventory.csv
+          retention-days: 90
+          if-no-files-found: error
+      - name: Export Supabase backup CSV
+        id: backup
+        if: failure()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python export_supabase_backup.py redfin_real_estate_value
+      - name: Upload Supabase backup CSV
+        if: failure() && steps.backup.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: redfin-real-estate-value
+          path: california_zip_inventory.csv
+          retention-days: 90
+          if-no-files-found: error
+      - name: Join Census ZIPs to the latest Redfin month
+        if: success()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python join_census_redfin.py census_artifact/census_zip_population.csv california_zip_inventory.csv
+      - name: Upload Census-Redfin join CSV
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zip-census-redfin-join
+          path: zip_census_redfin_join.csv
           retention-days: 90
           if-no-files-found: error
