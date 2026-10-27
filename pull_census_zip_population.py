@@ -14,12 +14,14 @@ the home-value extract and whose majority land area is Los Angeles County
 office, dermatology, or NPI locations.
 
 A run fetches only the latest published ACS 5-year vintage. Income, age,
-sex, and age bands are separate requests, about 30 ZIP codes at a time, one
-batch after another. A failure retries that piece. Each finished batch is
-saved before the next batch starts. A dropped connection or a read timeout
-is retried after a short pause. The read timeout is 45 minutes. Older years
-stay in public.census_zip_population. A ZIP already stored for that year is
-not inserted again. The CSV is still written when DATABASE_URL is unset.
+sex, and age bands are separate requests, about 10 ZIP codes at a time.
+The script waits a couple of seconds between calls. A failure retries that
+piece. Each finished batch is saved before the next batch starts. A closed
+connection, a dropped connection, or a read timeout is retried more than
+once, and each retry waits longer than the one before it. The read timeout
+is 45 minutes. Older years stay in public.census_zip_population. A ZIP
+already stored for that year is not inserted again. The CSV is still
+written when DATABASE_URL is unset.
 
 When CENSUS_API_KEY is set, it is sent on the first request and is never printed.
 The request URL is not printed.
@@ -52,10 +54,15 @@ TABLE = "public.census_zip_population"
 OUTPUT_CSV_NAME = "census_zip_population.csv"
 OUTPUT_CSV = Path(__file__).resolve().parent / OUTPUT_CSV_NAME
 USER_AGENT = load_california.USER_AGENT
-# One ACS call asks for about 20 to 40 California ZCTAs, then the next batch.
-BATCH_SIZE = 30
+# One ACS call asks for about 10 California ZCTAs.
+BATCH_SIZE = 10
+# Wait a couple of seconds between Census calls.
+CALL_PAUSE_SECONDS = 2
 VARIABLE_CHUNK = 20
-CONNECT_ATTEMPTS = 4
+# A closed connection is retried more than the previous four tries.
+CONNECT_ATTEMPTS = 8
+# Each later retry waits longer. The first wait is longer than the old 2 seconds.
+RETRY_PAUSE_SECONDS = 10
 GEO_COLUMN = "zip code tabulation area"
 KEY_REQUIRED = (
     "The Census American Community Survey API requires a key. "
@@ -457,8 +464,16 @@ def open_census(url: str) -> tuple[int, dict[str, str], bytes]:
     return status, headers, body
 
 
+def retry_pause_seconds(attempt: int) -> int:
+    """Seconds to wait after failed try `attempt` (0 for the first failure).
+
+    Each later retry waits longer than the previous one.
+    """
+    return RETRY_PAUSE_SECONDS * (attempt + 1)
+
+
 def retry_notice(exc: BaseException) -> str:
-    """Same retry line for a dropped connection and a read timeout."""
+    """Retry line for a closed connection, a dropped connection, or a read timeout."""
     reason = getattr(exc, "reason", None)
     text = str(exc).lower()
     timed_out = (
@@ -468,13 +483,21 @@ def retry_notice(exc: BaseException) -> str:
     )
     if timed_out:
         return "The Census request timed out. Retrying."
+    closed = (
+        isinstance(exc, ConnectionError)
+        or isinstance(reason, ConnectionError)
+        or "closed connection" in text
+        or "remote end closed" in text
+    )
+    if closed:
+        return "The Census connection closed. Retrying."
     return "The Census request could not connect. Retrying."
 
 
 def request_bytes(url: str) -> tuple[int, dict[str, str], bytes]:
-    """GET a Census URL. Retry a dropped connection or a read timeout.
+    """GET a Census URL. Retry a closed connection, a drop, or a read timeout.
 
-    Do not retry an HTTP status. The pause between tries is short.
+    Do not retry an HTTP status. Each retry waits longer than the one before it.
     The URL is not printed: it can contain CENSUS_API_KEY.
     """
     error: Exception | None = None
@@ -483,15 +506,16 @@ def request_bytes(url: str) -> tuple[int, dict[str, str], bytes]:
             return open_census(url)
         except urllib.error.HTTPError:
             raise
-        except (urllib.error.URLError, TimeoutError) as exc:
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
             # HTTPError is a URLError, and open_census already turned it into
-            # a status. urlopen wraps a connect timeout as URLError. A timeout
-            # while reading the body is TimeoutError from response.read().
+            # a status. urlopen wraps a connect failure as URLError. A closed
+            # connection or a timeout while reading the body is raised by
+            # response.read().
             error = exc
             if attempt + 1 == CONNECT_ATTEMPTS:
                 break
             print(retry_notice(exc), flush=True)
-            time.sleep(2 * (attempt + 1))
+            time.sleep(retry_pause_seconds(attempt))
     if error is None:
         raise urllib.error.URLError("The Census request did not run.")
     raise error
@@ -767,7 +791,7 @@ def recover_query(
     if problem in {"unknown", "ambiguous"} and len(zips) > 1:
         middle = len(zips) // 2
         left = fetch_query(year, zips[:middle], variables)
-        time.sleep(0.05)
+        time.sleep(CALL_PAUSE_SECONDS)
         right = fetch_query(year, zips[middle:], variables)
         return left + right
     if problem == "unknown" and len(zips) == 1:
@@ -777,13 +801,13 @@ def recover_query(
     if len(variables) > 1:
         middle = len(variables) // 2
         left = fetch_query(year, zips, variables[:middle])
-        time.sleep(0.05)
+        time.sleep(CALL_PAUSE_SECONDS)
         right = fetch_query(year, zips, variables[middle:])
         return merge_records(left, right)
     if len(zips) > 1:
         middle = len(zips) // 2
         left = fetch_query(year, zips[:middle], variables)
-        time.sleep(0.05)
+        time.sleep(CALL_PAUSE_SECONDS)
         right = fetch_query(year, zips[middle:], variables)
         return left + right
     raise SystemExit(message)
@@ -809,7 +833,7 @@ def fetch_zip_batch(year: int, zips: list[str]) -> list[dict[str, str]]:
     for index, (_name, variables) in enumerate(groups):
         records.extend(fetch_field_piece(year, list(zips), variables))
         if index + 1 != len(groups):
-            time.sleep(0.1)
+            time.sleep(CALL_PAUSE_SECONDS)
     return merge_records(records)
 
 
@@ -854,7 +878,7 @@ def rows_for_vintage(
     total = len(california_zips)
     for index, batch in enumerate(chunks(list(california_zips), BATCH_SIZE)):
         if index:
-            time.sleep(0.1)
+            time.sleep(CALL_PAUSE_SECONDS)
         print(
             f"ACS {year}: downloading {len(batch)} California ZIPs "
             f"({index * BATCH_SIZE + len(batch)} of {total}).",
