@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import io
 import os
 import tempfile
@@ -580,7 +581,8 @@ class CensusTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body, b"[]")
         self.assertEqual(calls["n"], 2)
-        slept.assert_called_once_with(2)
+        slept.assert_called_once_with(census.retry_pause_seconds(0))
+        self.assertGreater(census.retry_pause_seconds(0), 2)
         shown = stdout.getvalue()
         self.assertIn("could not connect", shown)
         self.assertNotIn("example-key", shown)
@@ -602,8 +604,16 @@ class CensusTests(unittest.TestCase):
         ):
             with self.assertRaises(urllib.error.URLError) as caught:
                 census.request_bytes(url)
+        self.assertGreater(census.CONNECT_ATTEMPTS, 4)
         self.assertEqual(calls["n"], census.CONNECT_ATTEMPTS)
         self.assertEqual(slept.call_count, census.CONNECT_ATTEMPTS - 1)
+        pauses = [call.args[0] for call in slept.call_args_list]
+        self.assertEqual(
+            pauses,
+            [census.retry_pause_seconds(index) for index in range(census.CONNECT_ATTEMPTS - 1)],
+        )
+        self.assertGreater(pauses[0], 2)
+        self.assertTrue(all(later > earlier for earlier, later in zip(pauses, pauses[1:])))
         self.assertIn("Network is unreachable", str(caught.exception))
         self.assertNotIn("example-key", str(caught.exception))
         shown = stdout.getvalue()
@@ -649,8 +659,8 @@ class CensusTests(unittest.TestCase):
         self.assertIn("B01001_007E", groups["age_bands"])
         self.assertNotIn("B19013_001E", groups["age_bands"])
         self.assertTrue(all(1 <= len(codes) <= 50 for codes in groups.values()))
-        self.assertGreaterEqual(census.BATCH_SIZE, 20)
-        self.assertLessEqual(census.BATCH_SIZE, 40)
+        self.assertEqual(census.BATCH_SIZE, 10)
+        self.assertGreaterEqual(census.CALL_PAUSE_SECONDS, 2)
 
         calls: list[str] = []
 
@@ -798,10 +808,69 @@ class CensusTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body, b"[]")
         self.assertEqual(calls["n"], 2)
-        slept.assert_called_once_with(2)
+        slept.assert_called_once_with(census.retry_pause_seconds(0))
+        self.assertGreater(census.retry_pause_seconds(0), 2)
         shown = stdout.getvalue()
         self.assertIn("timed out", shown)
         self.assertIn("Retrying.", shown)
+
+    def test_closed_connection_is_retried_with_a_longer_pause(self):
+        class Response:
+            def __init__(self, body: bytes | None):
+                self.status = 200
+                self.headers = {}
+                self._body = body
+
+            def read(self):
+                if self._body is None:
+                    raise http.client.RemoteDisconnected(
+                        "Remote end closed connection without response"
+                    )
+                return self._body
+
+            def close(self):
+                return None
+
+        calls = {"n": 0}
+
+        def fake_urlopen(_request, timeout=0):
+            calls["n"] += 1
+            self.assertEqual(timeout, 2700)
+            if calls["n"] == 1:
+                return Response(None)
+            return Response(b"[]")
+
+        stdout = io.StringIO()
+        with (
+            patch.object(census.urllib.request, "urlopen", fake_urlopen),
+            patch.object(census.time, "sleep") as slept,
+            patch("sys.stdout", stdout),
+        ):
+            status, _headers, body = census.request_bytes(
+                "https://api.census.gov/data/2024/acs/acs5?get=NAME"
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"[]")
+        self.assertEqual(calls["n"], 2)
+        slept.assert_called_once_with(census.retry_pause_seconds(0))
+        shown = stdout.getvalue()
+        self.assertIn("connection closed", shown)
+        self.assertIn("Retrying.", shown)
+        self.assertNotIn("state:06", shown)
+
+    def test_field_calls_wait_a_couple_of_seconds(self):
+        def fake(_year: int, _zips: list[str], _variables: tuple[str, ...]):
+            return []
+
+        with (
+            patch.object(census, "fetch_field_piece", fake),
+            patch.object(census.time, "sleep") as slept,
+        ):
+            census.fetch_zip_batch(2024, ["90001"] * census.BATCH_SIZE)
+        pauses = [call.args[0] for call in slept.call_args_list]
+        self.assertEqual(pauses, [census.CALL_PAUSE_SECONDS] * 3)
+        self.assertGreaterEqual(census.CALL_PAUSE_SECONDS, 2)
+        self.assertEqual(len(["90001"] * census.BATCH_SIZE), 10)
 
 
 if __name__ == "__main__":
