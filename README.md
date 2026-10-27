@@ -30,8 +30,11 @@ Columns, in this order:
 | `median_listing_price_per_square_foot_mm` | numeric | Ratio from the file. |
 | `median_listing_price_per_square_foot_yy` | numeric | Ratio from the file. |
 | `date_pulled_yyyymmdd` | text | `yyyy_mm_dd`. Example `2026_10_23`. |
+| `dataset_updated_at` | timestamptz | UTC time of the load that wrote the row. Every row in that load has the same value. |
 
 `date_pulled_yyyymmdd` is not in the source CSV. Every row in a pull gets the same value: the calendar date of the run in America/Los_Angeles, with underscores. The January 1 and July 1 runs start at 16:00 UTC, which is morning in Los Angeles, so those pulls store that same calendar date (`2026_01_01` and `2026_07_01` for the 2026 runs). Blank measure cells are stored as null. The primary key is (`postal_code`, `month_date_yyyymm`).
+
+`dataset_updated_at` is not in the source CSV. A full replace writes it on every inserted row. A census-year upsert writes it on the months it inserts or updates and leaves other months, including this timestamp, unchanged.
 
 The four change columns stay on the file's ratio scale. They are not divided or multiplied by 100. Tableau's percentage format displays `0.0318` as 3.18 percent.
 
@@ -92,11 +95,11 @@ The connection string is the `DATABASE_URL` environment variable, the same as th
 
 Each run fetches only the latest published ACS 5-year vintage. Income, age, sex, and age bands are separate requests of about 10 ZIP codes, with a couple of seconds between calls. A failure retries that field group. A closed connection, a dropped connection, or a read timeout is retried several times, and each retry waits longer than the one before it. The read timeout is 45 minutes. Each finished batch is written to `census_zip_population.csv` before the next batch starts. When `DATABASE_URL` is set, that batch is inserted before the next request. A ZIP and year already stored are not inserted again, so rows saved before a timeout stay in the table and a later run fills ZIPs that are still missing. Older years are not deleted. When `DATABASE_URL` is unset, the script still writes the CSV and leaves the table unchanged. That CSV is the one vintage from the run. It is not committed. The estimates request is the step that needs a Census key; without one, no CSV is written. A rejected key stops the run. It is not treated as an unpublished year.
 
-Columns are `acs_year`, `zip`, `median_household_income` (`B19013_001E`), `per_capita_income` (`B19301_001E`), `median_age` (`B01002_001E`), `male_population` and `female_population` from `B01001`, `adult_population` (age 18 and older, summed from the `B01001` age bands), and `population_18_34`, `population_35_44`, `population_45_54`, `population_55_64`, and `population_65_plus`. Census sentinel values are stored as null. The primary key is (`zip`, `acs_year`).
+Columns are `acs_year`, `zip`, `median_household_income` (`B19013_001E`), `per_capita_income` (`B19301_001E`), `median_age` (`B01002_001E`), `male_population` and `female_population` from `B01001`, `adult_population` (age 18 and older, summed from the `B01001` age bands), and `population_18_34`, `population_35_44`, `population_45_54`, `population_55_64`, and `population_65_plus`. Census sentinel values are stored as null. The primary key is (`zip`, `acs_year`). Each newly inserted row also stores `dataset_updated_at`, the same timestamptz for every new row in that run. A ZIP already stored for that year is not rewritten, so its timestamp stays as it was.
 
 ACS 5-year ZIP queries request zip code tabulation areas directly and do not send `in=state`. That geography is not nested in a state. Census answers `in=state:06` with an unsupported-hierarchy error, and that error is not a missing ZIP. California is applied by requesting the California ZCTAs and then keeping California and Los Angeles rows in the dataframe. When `CENSUS_API_KEY` is set, the script sends it on the first request and does not print it.
 
-`.github/workflows/pull-census-zip-population.yml` runs at 16:00 UTC on January 1 and July 1 (`0 16 1 1,7 *`) and on `workflow_dispatch`. After a successful load it uploads `census_zip_population.csv` as the `census-zip-population` artifact and keeps it for 90 days. If the load step fails, the job exports the current `public.census_zip_population` rows and uploads the same artifact. The job passes `DATABASE_URL`, `CENSUS_API_KEY`, and the refresh-review webhook secrets. A successful run on `main` starts the California workflow. This workflow does not cancel that run.
+`.github/workflows/pull-census-zip-population.yml` runs once a day at 17:00 UTC (`0 17 * * *`). GitHub cron is UTC and does not follow daylight saving, so that is 10:00 AM Pacific Daylight Time and 9:00 AM Pacific Standard Time. It also runs on `workflow_dispatch`. After a successful load it uploads `census_zip_population.csv` as the `census-zip-population` artifact and keeps it for 90 days. If the load step fails, the job exports the current `public.census_zip_population` rows and uploads the same artifact. The job passes `DATABASE_URL`, `CENSUS_API_KEY`, and the refresh-review webhook secrets. A successful run on `main` starts the California workflow. This workflow does not cancel that run.
 
 ## Census and Redfin join
 
@@ -106,7 +109,7 @@ The join uses the latest `month_date_yyyymm` in that year. The Actions log print
 
 A ZIP is kept only when that month's `postal_code` equals the Census `zip`. The grain is one row per ZIP. Census values and prices are copied from those two rows. A blank price stays blank. A ZIP missing on either side is left out.
 
-The file is `zip_census_redfin_join.csv`. Columns are the Census columns, then the Redfin columns, including `acs_year`, `zip`, `postal_code`, and `month_date_yyyymm`. The workflow uploads it as the artifact `zip-census-redfin-join` on the California run that Census started, kept for 90 days. Download it from that run's summary. When `DATABASE_URL` is set, the same rows replace `public.zip_census_redfin_join`. Replacing the join table does not delete `public.redfin_real_estate_value`.
+The file is `zip_census_redfin_join.csv`. Columns are the Census columns, then the Redfin columns, including `acs_year`, `zip`, `postal_code`, and `month_date_yyyymm`. The workflow uploads it as the artifact `zip-census-redfin-join` on the California run that Census started, kept for 90 days. Download it from that run's summary. When `DATABASE_URL` is set, the same rows replace `public.zip_census_redfin_join`. That replace writes the same `dataset_updated_at` on every row. Replacing the join table does not delete `public.redfin_real_estate_value`.
 
 The scheduled and manual California runs do not write this join. They still replace the whole price table.
 
@@ -118,7 +121,7 @@ Each run tries the official PDF for the current year back through 2024:
 
 `https://www.plasticsurgery.org/documents/news/statistics/{year}/plastic-surgery-statistics-report-{year}.pdf`
 
-It upserts the years it can read and does not delete other years in `public.procedure_surgeon_fees`. The primary key is (`procedure`, `report_year`). A checked-in seed is used only when that year's official PDF cannot be fetched. The 2024 URL currently returns 404, so `seeds/procedure_surgeon_fees_2024.csv` supplies the 2024 counts and fee ranges read from that report. When the URL works again, the PDF replaces the seed. The 2025 report publishes counts and does not publish surgeon fees, so 2025 fee columns stay null. 2024 fees are not copied onto 2025.
+It upserts the years it can read and does not delete other years in `public.procedure_surgeon_fees`. Each row upserted in a run gets the same `dataset_updated_at`. A year this run does not write keeps the timestamp it already had. The primary key is (`procedure`, `report_year`). A checked-in seed is used only when that year's official PDF cannot be fetched. The 2024 URL currently returns 404, so `seeds/procedure_surgeon_fees_2024.csv` supplies the 2024 counts and fee ranges read from that report. When the URL works again, the PDF replaces the seed. The 2025 report publishes counts and does not publish surgeon fees, so 2025 fee columns stay null. 2024 fees are not copied onto 2025.
 
 2024 publishes separate upper and lower blepharoplasty fee ranges. Those two ranges are not combined into one eyelid-surgery fee, so `eyelid surgery` keeps its published count and null fee columns.
 

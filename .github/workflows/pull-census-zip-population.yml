@@ -5,8 +5,9 @@ name: Pull Census ZIP population
 
 on:
   schedule:
-    # 16:00 UTC on January 1 and July 1 only (every six months).
-    - cron: "0 16 1 1,7 *"
+    # GitHub cron is UTC and does not follow daylight saving.
+    # 0 17 * * * is 10:00 AM Pacific Daylight Time and 9:00 AM Pacific Standard Time.
+    - cron: "0 17 * * *"
   workflow_dispatch:
 
 permissions:
