@@ -10,7 +10,8 @@ blank. This script does not fill a price from an earlier month.
 
 The CSV is `zip_census_redfin_join.csv`. When DATABASE_URL is set, those
 rows replace `public.zip_census_redfin_join`. That replace does not delete
-`public.redfin_real_estate_value`.
+`public.redfin_real_estate_value`. Every row in that replace gets the same
+dataset_updated_at.
 """
 
 from __future__ import annotations
@@ -18,9 +19,11 @@ from __future__ import annotations
 import csv
 import os
 import sys
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+import dataset_stamp
 import load_california
 import pull_census_zip_population as census
 
@@ -241,6 +244,7 @@ def schema_sql() -> str:
         ident = quote_ident(name)
         null_sql = " NOT NULL" if name in NOT_NULL_JOIN_COLUMNS else ""
         lines.append(f"    {ident} {column_sql_type(name)}{null_sql}")
+    lines.append(f"    {quote_ident(dataset_stamp.COLUMN)} {dataset_stamp.SQL_TYPE}")
     body = ",\n".join(lines)
     return (
         f"CREATE TABLE IF NOT EXISTS {TABLE} (\n"
@@ -250,20 +254,31 @@ def schema_sql() -> str:
     )
 
 
-def replace_join_table(conn, records: list[dict[str, str]]) -> int:
+def replace_join_table(
+    conn, records: list[dict[str, str]], updated_at: datetime | None = None
+) -> int:
     """Replace the join snapshot. Do not delete Redfin months."""
     if "redfin_real_estate_value" in DELETE_JOIN_SQL:
         raise SystemExit("The join refresh must not delete Redfin rows.")
-    column_list = ", ".join(quote_ident(name) for name in JOIN_COLUMNS)
-    placeholders = ", ".join(["%s"] * len(JOIN_COLUMNS))
+    updated_at = dataset_stamp.stamp(updated_at)
+    stored = JOIN_COLUMNS + (dataset_stamp.COLUMN,)
+    column_list = ", ".join(quote_ident(name) for name in stored)
+    placeholders = ", ".join(["%s"] * len(stored))
     insert_sql = f"INSERT INTO {TABLE} ({column_list}) VALUES ({placeholders})"
-    rows = [
-        tuple(db_value(name, record[name]) for name in JOIN_COLUMNS)
-        for record in records
-    ]
+    _updated_at, rows = dataset_stamp.stamp_rows(
+        [
+            tuple(db_value(name, record[name]) for name in JOIN_COLUMNS)
+            for record in records
+        ],
+        updated_at,
+    )
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(schema_sql())
+            cur.execute(
+                f"ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS "
+                f"{quote_ident(dataset_stamp.COLUMN)} {dataset_stamp.SQL_TYPE}"
+            )
             cur.execute(DELETE_JOIN_SQL)
             cur.executemany(insert_sql, rows)
             cur.execute(f"SELECT COUNT(*) FROM {TABLE}")
@@ -299,8 +314,10 @@ def main(argv: list[str] | None = None) -> int:
     if not database_url():
         print(f"{load_california.DATABASE_URL_ENV} is not set. Left {TABLE} unchanged.")
         return 0
+    updated_at = dataset_stamp.stamp()
+    print(f"dataset_updated_at: {updated_at.isoformat()}")
     with load_california.connect() as conn:
-        count = replace_join_table(conn, joined)
+        count = replace_join_table(conn, joined, updated_at)
     print(
         f"Replaced {TABLE} with {count} rows. "
         f"{load_california.TABLE} was not modified."

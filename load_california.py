@@ -21,6 +21,9 @@ python load_california.py --census-year YYYY keeps only months in that
 calendar year. Those rows are inserted or updated. Months already stored
 are not deleted. The CSV from that run contains that year only. The chained
 Census workflow uses this so older Redfin months stay in Supabase.
+
+Every row this run inserts or updates gets the same dataset_updated_at.
+Months the census-year load does not write keep the timestamp they had.
 """
 
 from __future__ import annotations
@@ -38,6 +41,8 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import dataset_stamp
 
 RESEARCH_PAGE = "https://www.realtor.com/research/data/"
 DATABASE_URL_ENV = "DATABASE_URL"
@@ -76,7 +81,9 @@ KEPT_COLUMNS = (
 )
 MEASURE_COLUMNS = KEPT_COLUMNS[3:]
 LOAD_COLUMNS = KEPT_COLUMNS + ("date_pulled_yyyymmdd",)
-STAGING_COLUMNS = LOAD_COLUMNS + ("load_seq",)
+# Stored with each load. Not part of the Realtor CSV or the join's source columns.
+STORED_COLUMNS = LOAD_COLUMNS + (dataset_stamp.COLUMN,)
+STAGING_COLUMNS = STORED_COLUMNS + ("load_seq",)
 IDENT_RE = re.compile(r"[a-z_][a-z0-9_]*")
 
 COLUMN_TYPES = {
@@ -91,6 +98,7 @@ COLUMN_TYPES = {
     "median_listing_price_per_square_foot_mm": "numeric",
     "median_listing_price_per_square_foot_yy": "numeric",
     "date_pulled_yyyymmdd": "text",
+    dataset_stamp.COLUMN: dataset_stamp.SQL_TYPE,
 }
 NOT_NULL_COLUMNS = {
     "month_date_yyyymm",
@@ -98,7 +106,12 @@ NOT_NULL_COLUMNS = {
     "zip_name",
     "date_pulled_yyyymmdd",
 }
-UDT_FOR_NEW = {"text": "text", "integer": "int4", "numeric": "numeric"}
+UDT_FOR_NEW = {
+    "text": "text",
+    "integer": "int4",
+    "numeric": "numeric",
+    "timestamptz": "timestamptz",
+}
 INTEGER_UDT = {"int2", "int4", "int8"}
 REAL_UDT = {"numeric", "float4", "float8", "int2", "int4", "int8"}
 
@@ -237,10 +250,10 @@ def census_year_month_pattern(year: int) -> str:
 
 def census_year_upsert_sql() -> str:
     """Insert or update staged rows. The statement does not delete anything."""
-    columns = ", ".join(LOAD_COLUMNS)
+    columns = ", ".join(STORED_COLUMNS)
     assignments = ", ".join(
         f"{name} = EXCLUDED.{name}"
-        for name in LOAD_COLUMNS
+        for name in STORED_COLUMNS
         if name not in {"postal_code", "month_date_yyyymm"}
     )
     sql = (
@@ -403,7 +416,7 @@ def open_csv(url: str):
 
 def schema_sql() -> str:
     lines = []
-    for name in LOAD_COLUMNS:
+    for name in STORED_COLUMNS:
         null_sql = " NOT NULL" if name in NOT_NULL_COLUMNS else ""
         lines.append(f"    {name} {COLUMN_TYPES[name]}{null_sql}")
     body = ",\n".join(lines)
@@ -513,6 +526,15 @@ def migrate_numeric(cur, column: str, udt: str) -> None:
     alter_type(cur, column, "numeric", using)
 
 
+def migrate_timestamptz(cur, column: str, udt: str) -> None:
+    if udt == "timestamptz":
+        return
+    if udt == "timestamp":
+        alter_type(cur, column, "timestamptz", f"{column} AT TIME ZONE 'UTC'")
+        return
+    raise SystemExit(f"Cannot convert {column} from {udt} to timestamptz.")
+
+
 def migrate_text_column(cur, column: str, udt: str) -> None:
     if udt == "text":
         return
@@ -548,13 +570,13 @@ def ensure_schema(conn) -> None:
         )
         found = {name: udt for name, udt in cur.fetchall()}
         for name in list(found):
-            if name in LOAD_COLUMNS:
+            if name in STORED_COLUMNS:
                 continue
             if IDENT_RE.fullmatch(name) is None:
                 raise SystemExit(f"Refusing to drop unexpected column {name!r}.")
             cur.execute(f"ALTER TABLE {TABLE} DROP COLUMN {name}")
             del found[name]
-        for name in LOAD_COLUMNS:
+        for name in STORED_COLUMNS:
             if name in found:
                 continue
             cur.execute(
@@ -568,11 +590,12 @@ def ensure_schema(conn) -> None:
                 migrate_numeric(cur, name, found[name])
         for name in ("postal_code", "zip_name", "date_pulled_yyyymmdd"):
             migrate_text_column(cur, name, found[name])
+        migrate_timestamptz(cur, dataset_stamp.COLUMN, found[dataset_stamp.COLUMN])
 
 
 def prepare_staging(conn) -> None:
     typed = ",\n".join(
-        f"    {name} {COLUMN_TYPES[name]}" for name in LOAD_COLUMNS
+        f"    {name} {COLUMN_TYPES[name]}" for name in STORED_COLUMNS
     )
     with conn.transaction():
         with conn.cursor() as cur:
@@ -600,6 +623,7 @@ def copy_batch(conn, rows: list[tuple]) -> None:
 def replace_table(conn) -> int:
     """Delete every current row, insert the staged extract, and overwrite the CSV."""
     tmp = OUTPUT_CSV.with_name(OUTPUT_CSV.name + ".tmp")
+    stored = ", ".join(STORED_COLUMNS)
     columns = ", ".join(LOAD_COLUMNS)
     try:
         with conn.transaction():
@@ -607,9 +631,9 @@ def replace_table(conn) -> int:
                 cur.execute(f"DELETE FROM {TABLE}")
                 cur.execute(
                     f"""
-                    INSERT INTO {TABLE} ({columns})
+                    INSERT INTO {TABLE} ({stored})
                     SELECT DISTINCT ON (postal_code, month_date_yyyymm)
-                        {columns}
+                        {stored}
                     FROM staging_redfin_real_estate_value
                     ORDER BY postal_code, month_date_yyyymm, load_seq DESC
                     """
@@ -725,8 +749,13 @@ def upsert_census_year(conn, year: int) -> int:
 
 
 def load_history(
-    conn, url: str, pull_date: str, census_year: int | None = None
+    conn,
+    url: str,
+    pull_date: str,
+    census_year: int | None = None,
+    updated_at: datetime | None = None,
 ) -> int:
+    updated_at = dataset_stamp.stamp(updated_at)
     postal_codes = los_angeles_postal_codes()
     print(
         f"Majority Los Angeles County ZIPs in {CROSSWALK_URL}: {len(postal_codes)}"
@@ -746,7 +775,7 @@ def load_history(
             reader, pull_date, postal_codes, census_year
         ):
             seq += 1
-            batch.append((*row, seq))
+            batch.append((*row, updated_at, seq))
             if len(batch) >= BATCH_ROWS:
                 copy_batch(conn, batch)
                 staged += len(batch)
@@ -818,9 +847,11 @@ def notify_refresh_review(table: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     census_year = census_year_arg(list(sys.argv if argv is None else argv))
     pull_date = pull_date_text()
+    updated_at = dataset_stamp.stamp()
     url = discover_history_url()
     print(f"ZIP history CSV: {url}")
     print(f"date_pulled_yyyymmdd: {pull_date}")
+    print(f"dataset_updated_at: {updated_at.isoformat()}")
     if census_year is None:
         print(f"Replacing {TABLE} with every Los Angeles County month in the file.")
     else:
@@ -831,7 +862,7 @@ def main(argv: list[str] | None = None) -> int:
     with connect() as conn:
         with conn.transaction():
             ensure_schema(conn)
-        count = load_history(conn, url, pull_date, census_year)
+        count = load_history(conn, url, pull_date, census_year, updated_at)
     if count == 0:
         if census_year is None:
             print("No Los Angeles County ZIP rows were loaded.", file=sys.stderr)

@@ -76,7 +76,15 @@ class CensusYearLoadTests(unittest.TestCase):
         sql = load_california.census_year_upsert_sql()
         self.assertNotIn("DELETE", sql.upper())
         self.assertIn("ON CONFLICT (postal_code, month_date_yyyymm) DO UPDATE", sql)
+        self.assertIn("dataset_updated_at = EXCLUDED.dataset_updated_at", sql)
         self.assertIn(load_california.TABLE, sql)
+        self.assertNotIn("DELETE", sql.upper())
+        schema = load_california.schema_sql()
+        self.assertIn("dataset_updated_at timestamptz", schema)
+        self.assertNotIn("dataset_updated_at timestamptz NOT NULL", schema)
+        ensured = inspect.getsource(load_california.ensure_schema)
+        self.assertIn("STORED_COLUMNS", ensured)
+        self.assertNotIn("if name in LOAD_COLUMNS", ensured)
         upsert = inspect.getsource(load_california.upsert_census_year)
         self.assertNotIn("DELETE FROM", upsert)
 
@@ -227,6 +235,7 @@ class JoinTests(unittest.TestCase):
         schema = join.schema_sql()
         self.assertIn("CREATE TABLE IF NOT EXISTS public.zip_census_redfin_join", schema)
         self.assertIn("PRIMARY KEY (zip)", schema)
+        self.assertIn("dataset_updated_at timestamptz", schema)
         self.assertNotIn("DELETE", schema.upper())
         self.assertNotIn("redfin_real_estate_value", schema)
         self.assertEqual(join.column_sql_type("median_listing_price"), "numeric")
@@ -268,6 +277,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("zip%20code%20tabulation%20area:90001,90002", url)
         self.assertNotIn("in=", url)
         self.assertNotIn("state", url)
+        self.assertIn('cron: "0 17 * * *"', workflow)
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("GitHub cron is UTC and does not follow daylight saving.", workflow)
+        self.assertIn("10:00 AM Pacific Daylight Time", workflow)
+        self.assertIn("9:00 AM Pacific Standard Time", workflow)
+        self.assertNotIn("0 16 1 1,7 *", workflow)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,10 @@ written when DATABASE_URL is unset.
 
 When CENSUS_API_KEY is set, it is sent on the first request and is never printed.
 The request URL is not printed.
+
+A newly inserted ZIP records dataset_updated_at. Every new row in the run
+gets that same timestamptz. A ZIP already stored for that year is not
+rewritten, so its timestamp stays as it was.
 """
 
 from __future__ import annotations
@@ -45,6 +49,7 @@ from pathlib import Path
 
 import pandas as pd
 
+import dataset_stamp
 import load_california
 
 DATABASE_URL_ENV = "DATABASE_URL"
@@ -954,6 +959,7 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     population_45_54 integer,
     population_55_64 integer,
     population_65_plus integer,
+    {dataset_stamp.COLUMN} {dataset_stamp.SQL_TYPE},
     PRIMARY KEY (zip, acs_year)
 );
 """
@@ -970,12 +976,16 @@ def stored_pairs(cur, years: list[int]) -> set[tuple[int, str]]:
     return {(int(year), str(zip_code)) for year, zip_code in cur.fetchall()}
 
 
-def insert_new_years(conn, rows: list[tuple]) -> tuple[int, int]:
+def insert_new_years(
+    conn, rows: list[tuple], updated_at: datetime | None = None
+) -> tuple[int, int]:
     """Insert ZIP rows that are not already stored. Do not delete older years."""
     if not rows:
         return 0, 0
-    column_list = ", ".join(COLUMNS)
-    placeholders = ", ".join(["%s"] * len(COLUMNS))
+    updated_at = dataset_stamp.stamp(updated_at)
+    stored = COLUMNS + (dataset_stamp.COLUMN,)
+    column_list = ", ".join(stored)
+    placeholders = ", ".join(["%s"] * len(stored))
     sql = (
         f"INSERT INTO {TABLE} ({column_list}) VALUES ({placeholders}) "
         f"ON CONFLICT (zip, acs_year) DO NOTHING"
@@ -983,6 +993,10 @@ def insert_new_years(conn, rows: list[tuple]) -> tuple[int, int]:
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(schema_sql())
+            cur.execute(
+                f"ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS "
+                f"{dataset_stamp.COLUMN} {dataset_stamp.SQL_TYPE}"
+            )
             years = sorted({int(row[0]) for row in rows})
             already = stored_pairs(cur, years)
             pending = [
@@ -990,11 +1004,12 @@ def insert_new_years(conn, rows: list[tuple]) -> tuple[int, int]:
                 for row in rows
                 if (int(row[0]), str(row[1])) not in already
             ]
-            if pending:
-                cur.executemany(sql, pending)
+            _updated_at, stamped = dataset_stamp.stamp_rows(pending, updated_at)
+            if stamped:
+                cur.executemany(sql, stamped)
             cur.execute(f"SELECT COUNT(*) FROM {TABLE}")
             total = cur.fetchone()[0]
-    return len(pending), total
+    return len(stamped), total
 
 
 def checkpoint_download(holder: dict, rows_so_far: list[tuple], new_rows: list[tuple]) -> None:
@@ -1009,7 +1024,7 @@ def checkpoint_download(holder: dict, rows_so_far: list[tuple], new_rows: list[t
         return
     if holder.get("conn") is None:
         holder["conn"] = connect()
-    added, total = insert_new_years(holder["conn"], new_rows)
+    added, total = insert_new_years(holder["conn"], new_rows, holder.get("updated_at"))
     holder["inserted"] = holder.get("inserted", 0) + added
     holder["total"] = total
 
@@ -1050,7 +1065,14 @@ def notify_refresh_review(table: str) -> int:
 
 
 def main() -> int:
-    holder: dict = {"conn": None, "inserted": 0, "total": None}
+    updated_at = dataset_stamp.stamp()
+    holder: dict = {
+        "conn": None,
+        "inserted": 0,
+        "total": None,
+        "updated_at": updated_at,
+    }
+    print(f"dataset_updated_at: {updated_at.isoformat()}")
     rows: list[tuple] | None = None
     try:
         california = california_zctas()

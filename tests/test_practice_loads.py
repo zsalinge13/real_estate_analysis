@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import http.client
+import inspect
 import io
 import os
 import tempfile
@@ -14,6 +15,7 @@ from email.message import Message
 from pathlib import Path
 from unittest.mock import patch
 
+import dataset_stamp
 import pull_census_zip_population as census
 import pull_procedure_surgeon_fees as procedures
 
@@ -103,6 +105,76 @@ class ProcedureTests(unittest.TestCase):
     def test_candidate_years_include_2024_through_the_run_year(self):
         years = procedures.candidate_years(datetime(2026, 10, 26, tzinfo=timezone.utc))
         self.assertEqual(years, [2026, 2025, 2024])
+
+
+class DatasetStampTests(unittest.TestCase):
+    def test_one_timestamp_is_appended_to_every_row(self):
+        moment = datetime(2026, 10, 27, 17, 0, tzinfo=timezone.utc)
+        used, rows = dataset_stamp.stamp_rows([(1, "a"), (2, "b")], moment)
+        self.assertEqual(used, moment)
+        self.assertEqual(rows, [(1, "a", moment), (2, "b", moment)])
+        self.assertIs(rows[0][-1], rows[1][-1])
+        self.assertEqual(dataset_stamp.COLUMN, "dataset_updated_at")
+        self.assertEqual(dataset_stamp.SQL_TYPE, "timestamptz")
+
+    def test_procedure_upsert_stamps_without_deleting_other_years(self):
+        schema = procedures.schema_sql()
+        self.assertIn("dataset_updated_at timestamptz", schema)
+        source = inspect.getsource(procedures.upsert_rows)
+        self.assertIn("dataset_stamp.COLUMN", source)
+        self.assertIn("ON CONFLICT (procedure, report_year) DO UPDATE SET {updates}", source)
+        self.assertNotIn("DELETE", source.upper())
+
+        class Cursor:
+            def __init__(self):
+                self.statements: list[str] = []
+                self.rows: list[tuple] = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def execute(self, sql, _params=None):
+                self.statements.append(" ".join(sql.split()))
+
+            def executemany(self, sql, rows):
+                self.statements.append(" ".join(sql.split()))
+                self.rows.extend(rows)
+
+            def fetchone(self):
+                return (4,)
+
+        class Connection:
+            def __init__(self):
+                self.cursor_obj = Cursor()
+
+            def transaction(self):
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def cursor(self):
+                return self.cursor_obj
+
+        moment = datetime(2026, 10, 27, 17, 0, tzinfo=timezone.utc)
+        conn = Connection()
+        first = (2024, "eyelid surgery", 1, None, None, "basis", "https://example.test")
+        second = (2025, "facelift", 2, 10, 20, "basis", "https://example.test")
+        procedures.upsert_rows(conn, [first, second], moment)
+        sql = " ".join(conn.cursor_obj.statements)
+        self.assertIn("dataset_updated_at = EXCLUDED.dataset_updated_at", sql)
+        self.assertNotIn("DELETE", sql.upper())
+        self.assertEqual(
+            conn.cursor_obj.rows,
+            [first + (moment,), second + (moment,)],
+        )
+        self.assertIs(conn.cursor_obj.rows[0][-1], conn.cursor_obj.rows[1][-1])
 
 
 class CensusTests(unittest.TestCase):
@@ -217,26 +289,38 @@ class CensusTests(unittest.TestCase):
             def cursor(self):
                 return self.cursor_obj
 
+        stamp = datetime(2026, 10, 27, 17, 0, tzinfo=timezone.utc)
         stored = Connection({(2023, "90001"), (2024, "90001")})
-        inserted, total = census.insert_new_years(stored, [(2024, "90001")])
+        inserted, total = census.insert_new_years(stored, [(2024, "90001")], stamp)
         self.assertEqual(inserted, 0)
         self.assertEqual(total, 2)
         self.assertEqual(stored.cursor_obj.inserted, [])
-        self.assertNotIn("delete", " ".join(stored.cursor_obj.statements).lower())
+        stored_sql = " ".join(stored.cursor_obj.statements)
+        self.assertNotIn("delete", stored_sql.lower())
+        self.assertIn("dataset_updated_at timestamptz", stored_sql)
+        self.assertNotIn("DO UPDATE", stored_sql)
 
         missing = Connection({(2023, "90001")})
         row = (2024, "90001")
-        inserted, total = census.insert_new_years(missing, [row])
-        self.assertEqual(inserted, 1)
-        self.assertEqual(total, 2)
-        self.assertEqual(missing.cursor_obj.inserted, [row])
-        self.assertNotIn("delete", " ".join(missing.cursor_obj.statements).lower())
+        other = (2024, "90211")
+        inserted, total = census.insert_new_years(missing, [row, other], stamp)
+        self.assertEqual(inserted, 2)
+        self.assertEqual(total, 3)
+        self.assertEqual(
+            missing.cursor_obj.inserted,
+            [row + (stamp,), other + (stamp,)],
+        )
+        self.assertIs(missing.cursor_obj.inserted[0][-1], missing.cursor_obj.inserted[1][-1])
+        missing_sql = " ".join(missing.cursor_obj.statements)
+        self.assertNotIn("delete", missing_sql.lower())
+        self.assertIn("ON CONFLICT (zip, acs_year) DO NOTHING", missing_sql)
+        self.assertNotIn("DO UPDATE", missing_sql)
 
         partial = Connection({(2024, "90001")})
         added = (2024, "90210")
-        inserted, total = census.insert_new_years(partial, [added])
+        inserted, total = census.insert_new_years(partial, [added], stamp)
         self.assertEqual(inserted, 1)
-        self.assertEqual(partial.cursor_obj.inserted, [added])
+        self.assertEqual(partial.cursor_obj.inserted, [added + (stamp,)])
         self.assertNotIn("delete", " ".join(partial.cursor_obj.statements).lower())
 
     def test_age_bands_sum_adults_and_drop_sentinels(self):

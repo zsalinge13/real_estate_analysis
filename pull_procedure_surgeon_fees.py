@@ -10,6 +10,9 @@ Surgeon fees are the published national range for the surgeon's fee only.
 Anesthesia and facility fees are not included. A year with counts and no
 published fee keeps the fee columns null. Fee ranges are not copied from
 one report year onto another.
+
+Every row upserted in a run gets the same dataset_updated_at. A report
+year this run does not write keeps the timestamp it already had.
 """
 
 from __future__ import annotations
@@ -27,6 +30,8 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+import dataset_stamp
 
 DATABASE_URL_ENV = "DATABASE_URL"
 TABLE_NAME = "procedure_surgeon_fees"
@@ -455,27 +460,34 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     surgeon_fee_high integer,
     fee_basis text NOT NULL,
     source_url text NOT NULL,
+    {dataset_stamp.COLUMN} {dataset_stamp.SQL_TYPE},
     PRIMARY KEY (procedure, report_year)
 );
 """
 
 
-def upsert_rows(conn, rows: list[tuple]) -> int:
-    placeholders = ", ".join(["%s"] * len(COLUMNS))
-    column_list = ", ".join(COLUMNS)
+def upsert_rows(conn, rows: list[tuple], updated_at: datetime | None = None) -> int:
+    stored = COLUMNS + (dataset_stamp.COLUMN,)
+    placeholders = ", ".join(["%s"] * len(stored))
+    column_list = ", ".join(stored)
     updates = ", ".join(
         f"{name} = EXCLUDED.{name}"
-        for name in COLUMNS
+        for name in stored
         if name not in {"procedure", "report_year"}
     )
     sql = (
         f"INSERT INTO {TABLE} ({column_list}) VALUES ({placeholders}) "
         f"ON CONFLICT (procedure, report_year) DO UPDATE SET {updates}"
     )
+    _updated_at, stamped = dataset_stamp.stamp_rows(rows, updated_at)
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(schema_sql())
-            cur.executemany(sql, rows)
+            cur.execute(
+                f"ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS "
+                f"{dataset_stamp.COLUMN} {dataset_stamp.SQL_TYPE}"
+            )
+            cur.executemany(sql, stamped)
             cur.execute(f"SELECT COUNT(*) FROM {TABLE}")
             return cur.fetchone()[0]
 
@@ -552,9 +564,11 @@ def main() -> int:
     if not database_url():
         print(f"{DATABASE_URL_ENV} is not set. Left {TABLE} unchanged.")
         return 0
+    updated_at = dataset_stamp.stamp()
+    print(f"dataset_updated_at: {updated_at.isoformat()}")
     try:
         with connect() as conn:
-            count = upsert_rows(conn, rows)
+            count = upsert_rows(conn, rows, updated_at)
     except SystemExit as exc:
         print(public_error(exc), file=sys.stderr)
         return 1
