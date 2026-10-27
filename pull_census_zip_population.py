@@ -314,7 +314,7 @@ def open_census(url: str) -> tuple[int, dict[str, str], bytes]:
         headers={"User-Agent": USER_AGENT, "Accept": "application/json,*/*"},
     )
     try:
-        response = urllib.request.urlopen(request, timeout=180)
+        response = urllib.request.urlopen(request, timeout=2700)
     except urllib.error.HTTPError as exc:
         try:
             body = exc.read()
