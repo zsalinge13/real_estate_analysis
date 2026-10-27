@@ -10,9 +10,11 @@ That vintage is inserted only when it is not already stored. Older years
 stay in public.census_zip_population. The CSV is still written when
 DATABASE_URL is unset.
 
-Los Angeles County ACS data queries always include California (in=state:06).
-A query sent without a state is retried with California when Census reports
-ambiguous geography or HTTP 500 ("error while running your query").
+ACS 5-year ZCTA queries do not include a state. That geography is not nested
+in a state, and in=state is an unsupported hierarchy. Census reports that as
+"unknown/unsupported geography hierarchy" (sometimes spelled "heirarchy").
+That is not a missing ZIP. A query that included a state is retried without
+it. Ambiguous geography is retried with California.
 
 When CENSUS_API_KEY is set, it is sent on the first request and is never printed.
 A dropped connection is retried. The request URL is not printed.
@@ -215,14 +217,15 @@ def census_data_url(
     variables: tuple[str, ...],
     zips: list[str],
     key: str = "",
-    state: str = CALIFORNIA_STATE,
+    state: str = "",
 ) -> str:
     fields = {
         "get": ",".join(variables),
         "for": GEO_COLUMN + ":" + ",".join(zips),
     }
-    # These ZIPs are Los Angeles County. Census resolves a ZCTA list only when
-    # the query names California; omitting the state often returns HTTP 500.
+    # ACS 5-year ZCTAs are summary level 860 and have no state parent. The
+    # published examples omit in=state. Sending a state is an unsupported
+    # hierarchy, not a way to limit the list to California.
     if state:
         fields["in"] = f"state:{state}"
     query = urllib.parse.urlencode(fields, quote_via=quote_census)
@@ -248,14 +251,12 @@ def census_message(status: int, body: bytes) -> str:
     return f"The Census API returned HTTP {status}."
 
 
-def query_server_error(message: str) -> bool:
-    """True when Census failed the query instead of naming a geography problem."""
-    lowered = message.lower()
-    return "http 500" in lowered or "error while running your query" in lowered
-
-
 def geography_problem(message: str) -> str | None:
     lowered = message.lower()
+    # Check this before "unknown geography". The hierarchy error contains
+    # that phrase, and Census sometimes spells it "heirarchy".
+    if "geography hierarchy" in lowered or "geography heirarchy" in lowered:
+        return "hierarchy"
     if "ambiguous geography" in lowered or "qualify it with state" in lowered:
         return "ambiguous"
     if (
@@ -582,7 +583,8 @@ def fetch_query(
     year: int,
     zips: list[str],
     variables: tuple[str, ...],
-    state: str = CALIFORNIA_STATE,
+    state: str = "",
+    adjusted: bool = False,
 ) -> list[dict[str, str]]:
     """Download one ACS table. Split a query Census rejects, and keep the API text."""
     if not zips or not variables:
@@ -593,11 +595,13 @@ def fetch_query(
     except SystemExit as exc:
         if key_failure(exc):
             raise
-        return recover_query(year, zips, variables, state, exit_text(exc))
+        return recover_query(year, zips, variables, state, exit_text(exc), adjusted)
     try:
         return parse_table(body)
     except SystemExit:
-        return recover_query(year, zips, variables, state, census_message(200, body))
+        return recover_query(
+            year, zips, variables, state, census_message(200, body), adjusted
+        )
 
 
 def recover_query(
@@ -606,23 +610,39 @@ def recover_query(
     variables: tuple[str, ...],
     state: str,
     message: str,
+    adjusted: bool = False,
 ) -> list[dict[str, str]]:
     problem = geography_problem(message)
-    if not state and (problem == "ambiguous" or query_server_error(message)):
-        return fetch_query(year, zips, variables, state=CALIFORNIA_STATE)
+    # One geography adjustment. Flipping again would loop: a state query is an
+    # unsupported ZCTA hierarchy, and a stateless query can be ambiguous.
+    if problem == "hierarchy" and state and not adjusted:
+        print("The Census ZCTA query does not use a state. Retrying.", flush=True)
+        return fetch_query(year, zips, variables, state="", adjusted=True)
+    if problem == "ambiguous" and not state and not adjusted:
+        return fetch_query(
+            year, zips, variables, state=CALIFORNIA_STATE, adjusted=True
+        )
+    if problem == "hierarchy":
+        raise SystemExit(message)
     if problem == "unknown" and len(zips) == 1:
         return []
+    if problem == "unknown" and len(zips) > 1:
+        middle = len(zips) // 2
+        left = fetch_query(year, zips[:middle], variables, state, adjusted)
+        time.sleep(0.05)
+        right = fetch_query(year, zips[middle:], variables, state, adjusted)
+        return left + right
     if len(variables) > 1:
         middle = len(variables) // 2
-        left = fetch_query(year, zips, variables[:middle], state)
+        left = fetch_query(year, zips, variables[:middle], state, adjusted)
         time.sleep(0.05)
-        right = fetch_query(year, zips, variables[middle:], state)
+        right = fetch_query(year, zips, variables[middle:], state, adjusted)
         return merge_records(left, right)
     if len(zips) > 1:
         middle = len(zips) // 2
-        left = fetch_query(year, zips[:middle], variables, state)
+        left = fetch_query(year, zips[:middle], variables, state, adjusted)
         time.sleep(0.05)
-        right = fetch_query(year, zips[middle:], variables, state)
+        right = fetch_query(year, zips[middle:], variables, state, adjusted)
         return left + right
     raise SystemExit(message)
 
@@ -631,7 +651,7 @@ def fetch_year(year: int, zips: list[str], variables: tuple[str, ...]) -> list[d
     records: list[dict[str, str]] = []
     for group in variable_chunks(variables):
         for batch in chunks(zips, BATCH_SIZE):
-            records.extend(fetch_query(year, list(batch), group, state=CALIFORNIA_STATE))
+            records.extend(fetch_query(year, list(batch), group))
             time.sleep(0.1)
     return merge_records(records)
 
