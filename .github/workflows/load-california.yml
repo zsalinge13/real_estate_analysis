@@ -4,7 +4,9 @@ name: Load California ZIP inventory
 # month in the Realtor history file. A successful Pull Census ZIP population
 # run on main starts the census-year job. That job loads only the Census
 # acs_year, does not delete older months, uploads the join CSV, and then
-# ranks cash-pay ZIPs from that join.
+# ranks cash-pay ZIPs from that join. That rank writes
+# procedure_surgeon_fees.csv, including marketing_bullets for every report
+# year, and this job uploads it.
 on:
   schedule:
     # 16:00 UTC on January 1 and July 1 only (every six months).
@@ -148,5 +150,13 @@ jobs:
         with:
           name: cash-pay-zip-rank
           path: cash_pay_zip_rank.csv
+          retention-days: 90
+          if-no-files-found: error
+      - name: Upload procedure surgeon fees CSV
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: procedure-surgeon-fees
+          path: procedure_surgeon_fees.csv
           retention-days: 90
           if-no-files-found: error
