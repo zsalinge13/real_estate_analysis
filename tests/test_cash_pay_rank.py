@@ -11,6 +11,7 @@ from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 import rank_cash_pay_zips as rank
 
@@ -515,6 +516,183 @@ class MainTests(unittest.TestCase):
         self.assertEqual(rows[0]["persona"], "18 to 34")
         self.assertEqual(rows[0]["rank"], "1")
         self.assertEqual(rows[0]["zip_name"], "Pasadena")
+
+    def test_main_exports_fees_after_the_rank_is_saved(self):
+        calls = []
+
+        def save_rank(conn, screens, updated_at=None):
+            calls.append("save")
+            return (1, 2025, 2)
+
+        def export_procedure_fees(conn, path=None):
+            calls.append("export")
+            return 9
+
+        class Connection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "zip_census_redfin_join.csv"
+            output = Path(tmp) / "cash_pay_zip_rank.csv"
+            with source.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=list(rank.JOIN_FIELDS), lineterminator="\n"
+                )
+                writer.writeheader()
+                writer.writerow(
+                    join_row(
+                        "90012",
+                        zip_name="Pasadena",
+                        population_18_34="40",
+                        adult_population="100",
+                    )
+                )
+            previous = os.environ.get(rank.DATABASE_URL_ENV)
+            os.environ[rank.DATABASE_URL_ENV] = "postgres://example.test/db"
+            rank.OUTPUT_CSV = output
+            stdout = io.StringIO()
+            try:
+                with (
+                    patch.object(rank.load_california, "connect", lambda: Connection()),
+                    patch.object(rank, "save_rank", save_rank),
+                    patch.object(rank, "export_procedure_fees", export_procedure_fees),
+                    redirect_stdout(stdout),
+                ):
+                    code = rank.main([str(source)])
+            finally:
+                rank.OUTPUT_CSV = Path(__file__).resolve().parents[1] / rank.OUTPUT_CSV_NAME
+                if previous is None:
+                    os.environ.pop(rank.DATABASE_URL_ENV, None)
+                else:
+                    os.environ[rank.DATABASE_URL_ENV] = previous
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, ["save", "export"])
+        self.assertIn("Wrote 9 rows to procedure_surgeon_fees.csv.", stdout.getvalue())
+
+
+class ProcedureFeeExportTests(unittest.TestCase):
+    def _connection(self, columns, table_rows):
+        class Cursor:
+            def __init__(self):
+                self.statements = []
+                self._fetchall = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def execute(self, sql, params=None):
+                text = " ".join(sql.split())
+                self.statements.append((text, params))
+                if "information_schema.columns" in text:
+                    self._fetchall = [(name,) for name in columns]
+                elif text.startswith("SELECT"):
+                    self._fetchall = list(table_rows)
+                else:
+                    self._fetchall = []
+
+            def fetchall(self):
+                return list(self._fetchall)
+
+        class Connection:
+            def __init__(self):
+                self.cursor_obj = Cursor()
+
+            def transaction(self):
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def cursor(self):
+                return self.cursor_obj
+
+        return Connection()
+
+    def test_export_includes_every_column_and_both_report_years(self):
+        columns = [
+            "report_year",
+            "procedure",
+            "procedure_count",
+            "surgeon_fee_low",
+            "surgeon_fee_high",
+            "fee_basis",
+            "source_url",
+            "dataset_updated_at",
+            "marketing_bullets",
+            "source_note",
+        ]
+        moment = datetime(2026, 10, 27, 17, 0, tzinfo=timezone.utc)
+        bullet = "18 to 34. Ranked.\n- 1. Pasadena (90012): cash."
+        table_rows = [
+            (2024, "facelift", 10, 1000, 2000, "national", "https://example.test/2024", moment, None, "older"),
+            (2024, "rhinoplasty", 11, 1100, 2100, "national", "https://example.test/2024", moment, None, "older"),
+            (2025, "facelift", 12, None, None, "national", "https://example.test/2025", moment, "older personas", "latest"),
+            (2025, "rhinoplasty", 13, None, None, "national", "https://example.test/2025", moment, bullet, "latest"),
+        ]
+        conn = self._connection(columns, table_rows)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "procedure_surgeon_fees.csv"
+            count = rank.export_procedure_fees(conn, path)
+            with path.open(newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                self.assertEqual(list(reader.fieldnames), columns)
+                written = list(reader)
+        self.assertEqual(count, 4)
+        self.assertEqual(
+            [row["report_year"] for row in written],
+            ["2024", "2024", "2025", "2025"],
+        )
+        self.assertEqual(
+            [row["procedure"] for row in written],
+            ["facelift", "rhinoplasty", "facelift", "rhinoplasty"],
+        )
+        self.assertEqual(written[0]["marketing_bullets"], "")
+        self.assertEqual(written[1]["marketing_bullets"], "")
+        self.assertEqual(written[2]["marketing_bullets"], "older personas")
+        self.assertEqual(written[3]["marketing_bullets"], bullet)
+        self.assertEqual(written[0]["source_note"], "older")
+        self.assertEqual(written[3]["source_note"], "latest")
+        self.assertEqual(written[0]["dataset_updated_at"], moment.isoformat())
+        self.assertEqual(written[2]["surgeon_fee_low"], "")
+        self.assertEqual(written[0]["surgeon_fee_low"], "1000")
+        sqls = [sql for sql, _params in conn.cursor_obj.statements]
+        joined = "\n".join(sqls)
+        self.assertNotIn("DROP", joined.upper())
+        self.assertNotIn("DELETE", joined.upper())
+        self.assertIn("SET TRANSACTION READ ONLY", joined)
+        select = next(sql for sql in sqls if "FROM public.procedure_surgeon_fees" in sql)
+        self.assertTrue(select.startswith("SELECT "))
+        self.assertNotIn("WHERE", select.upper())
+        self.assertIn("marketing_bullets", select)
+        self.assertIn("source_note", select)
+        self.assertIn("dataset_updated_at", select)
+        self.assertIn("ORDER BY report_year, procedure", select)
+        columns_sql = next(sql for sql in sqls if "information_schema.columns" in sql)
+        self.assertIn("ORDER BY ordinal_position", columns_sql)
+        self.assertEqual(columns_sql.count("procedure_surgeon_fees"), 0)
+        self.assertEqual(
+            next(params for sql, params in conn.cursor_obj.statements if params),
+            ("procedure_surgeon_fees",),
+        )
+
+    def test_export_refuses_a_table_without_marketing_bullets(self):
+        conn = self._connection(["report_year", "procedure"], [])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "procedure_surgeon_fees.csv"
+            with self.assertRaises(SystemExit) as caught:
+                rank.export_procedure_fees(conn, path)
+            self.assertIn("marketing_bullets", str(caught.exception))
+            self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":

@@ -5,6 +5,9 @@ that join and does not delete Redfin months. Each persona keeps the top 25
 ZIPs that pass its cash screen. The same run writes marketing_bullets on
 the latest procedure_surgeon_fees report year. Older report years are left
 blank in that column. The fee load owns the column and does not fill it.
+After that write succeeds, the same run exports every column of
+procedure_surgeon_fees, including marketing_bullets, for the latest report
+year and every older report year.
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ import csv
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
@@ -658,6 +661,94 @@ def save_rank(
     return count, year, bullet_count
 
 
+def procedure_csv_cell(value: object) -> object:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
+    return load_california.csv_value(value)
+
+
+def procedure_fee_columns(cur) -> list[str]:
+    """Every column on the fee table after the rank write, in table order."""
+    cur.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = %s
+        ORDER BY ordinal_position
+        """,
+        (procedures.TABLE_NAME,),
+    )
+    columns: list[str] = []
+    for (name,) in cur.fetchall():
+        column = str(name)
+        quote_ident(column)
+        columns.append(column)
+    if procedures.MARKETING_BULLETS not in columns:
+        raise SystemExit(
+            f"{procedures.TABLE} is missing {procedures.MARKETING_BULLETS}."
+        )
+    return columns
+
+
+def fetch_procedure_fee_rows(cur, columns: list[str]) -> list[tuple]:
+    """Read every report year. Do not drop or change the fee table."""
+    quoted = ", ".join(quote_ident(name) for name in columns)
+    order = [
+        quote_ident(name)
+        for name in ("report_year", "procedure")
+        if name in columns
+    ]
+    sql = f"SELECT {quoted} FROM {procedures.TABLE}"
+    if order:
+        sql += " ORDER BY " + ", ".join(order)
+    collapsed = " ".join(sql.split()).upper()
+    if not collapsed.startswith("SELECT ") or any(
+        f" {word} " in f" {collapsed} "
+        for word in ("DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "TRUNCATE")
+    ):
+        raise SystemExit("The procedure fee export must not change the table.")
+    cur.execute(sql)
+    rows = [tuple(row) for row in cur.fetchall()]
+    if not rows:
+        raise SystemExit(f"{procedures.TABLE} has no rows.")
+    return rows
+
+
+def write_procedure_fee_csv(
+    columns: list[str], rows: list[tuple], path: Path | None = None
+) -> None:
+    path = procedures.OUTPUT_CSV if path is None else path
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with tmp.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle, lineterminator="\n")
+            writer.writerow(columns)
+            for row in rows:
+                if len(row) != len(columns):
+                    raise SystemExit(
+                        f"{procedures.OUTPUT_CSV_NAME} row does not match its columns."
+                    )
+                writer.writerow([procedure_csv_cell(value) for value in row])
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def export_procedure_fees(conn, path: Path | None = None) -> int:
+    """Write procedure_surgeon_fees.csv from the table the rank just updated."""
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION READ ONLY")
+            columns = procedure_fee_columns(cur)
+            rows = fetch_procedure_fee_rows(cur, columns)
+            write_procedure_fee_csv(columns, rows, path)
+    return len(rows)
+
+
 def database_url() -> str:
     return os.environ.get(DATABASE_URL_ENV, "").strip()
 
@@ -692,6 +783,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with load_california.connect() as conn:
             count, year, bullet_count = save_rank(conn, screens, updated_at)
+            fee_count = export_procedure_fees(conn)
     except SystemExit as exc:
         print(public_error(exc), file=sys.stderr)
         return 1
@@ -702,6 +794,7 @@ def main(argv: list[str] | None = None) -> int:
         f"Replaced {RANK_TABLE} with {count} rows. "
         f"Wrote {procedures.MARKETING_BULLETS} on {bullet_count} rows "
         f"for report_year {year}. Older report years are blank in that column. "
+        f"Wrote {fee_count} rows to {procedures.OUTPUT_CSV_NAME}. "
         f"{load_california.TABLE} was not modified."
     )
     return 0

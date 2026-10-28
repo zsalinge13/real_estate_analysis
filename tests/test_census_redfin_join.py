@@ -263,6 +263,23 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(join_at, rank_at)
         self.assertIn("name: cash-pay-zip-rank", text)
         self.assertLess(rank_at, text.index("name: cash-pay-zip-rank"))
+        jobs = text.split("jobs:", 1)[1]
+        load_job, census_job = jobs.split("  load_census_year:", 1)
+        self.assertNotIn("procedure-surgeon-fees", load_job)
+        self.assertNotIn("procedure_surgeon_fees.csv", load_job)
+        self.assertLess(
+            census_job.index("python rank_cash_pay_zips.py zip_census_redfin_join.csv"),
+            census_job.index("name: procedure-surgeon-fees"),
+        )
+        step = census_job[census_job.rindex("- name: Upload procedure surgeon fees CSV") :]
+        self.assertIn("uses: actions/upload-artifact@v4", step)
+        self.assertLess(
+            step.index("uses: actions/upload-artifact@v4"),
+            step.index("name: procedure-surgeon-fees"),
+        )
+        self.assertIn("path: procedure_surgeon_fees.csv", step)
+        self.assertIn("retention-days: 90", step)
+        self.assertIn("if-no-files-found: error", step)
 
     def test_procedure_workflow_is_not_part_of_the_chain(self):
         text = (ROOT / ".github/workflows/pull-procedure-surgeon-fees.yml").read_text()

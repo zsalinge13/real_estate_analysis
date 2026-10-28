@@ -125,6 +125,8 @@ The file is `cash_pay_zip_rank.csv`. The workflow uploads it as the artifact `ca
 
 The same run writes `marketing_bullets` on `public.procedure_surgeon_fees`. That text column is not part of the primary key. Every row of the latest `report_year` gets bullet text for the personas that procedure uses: the ranked ZIP names and why they passed. Procedures that use the same personas get the same text. Older report years are set blank in that column. The January fee load does not write this text.
 
+After that write succeeds, the same run reads `public.procedure_surgeon_fees` and writes `procedure_surgeon_fees.csv`. The file has every column on the table after the rank, including `marketing_bullets`, for the latest report year and for older report years. The census-year job uploads that file as the artifact `procedure-surgeon-fees` and keeps it for 90 days. The January fee workflow is not part of this upload.
+
 ## National procedure counts and surgeon fees
 
 `pull_procedure_surgeon_fees.py` loads national aesthetic procedure counts and surgeon fee ranges from the American Society of Plastic Surgeons procedural statistics reports. The table is national. It is not a Los Angeles fee. `fee_basis` says: national surgeon fee only, excludes anesthesia and facility, not Los Angeles. There are no office locations.
@@ -137,4 +139,4 @@ It upserts the years it can read and does not delete other years in `public.proc
 
 2024 publishes separate upper and lower blepharoplasty fee ranges. Those two ranges are not combined into one eyelid-surgery fee, so `eyelid surgery` keeps its published count and null fee columns.
 
-The CSV `procedure_surgeon_fees.csv` is written even when `DATABASE_URL` is unset. It is not committed. `.github/workflows/pull-procedure-surgeon-fees.yml` runs at 16:00 UTC on January 1 and on `workflow_dispatch`. The job installs `poppler-utils` for `pdftotext`. After success it uploads `procedure_surgeon_fees.csv` as the `procedure-surgeon-fees` artifact for 90 days. If the load fails, it exports the current table to that same CSV and uploads the same artifact. The job passes `DATABASE_URL` and the refresh-review webhook secrets.
+The CSV `procedure_surgeon_fees.csv` is written even when `DATABASE_URL` is unset. It is not committed. That file from this load does not include `marketing_bullets`. `.github/workflows/pull-procedure-surgeon-fees.yml` runs at 16:00 UTC on January 1 and on `workflow_dispatch`. The job installs `poppler-utils` for `pdftotext`. After success it uploads `procedure_surgeon_fees.csv` as the `procedure-surgeon-fees` artifact for 90 days. If the load fails, it exports the current table to that same CSV and uploads the same artifact. The job passes `DATABASE_URL` and the refresh-review webhook secrets. The census-year rank writes a separate `procedure_surgeon_fees.csv` that does include `marketing_bullets`, and uploads it on that job only.
