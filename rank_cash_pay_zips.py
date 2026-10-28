@@ -3,11 +3,17 @@
 The input is the join that just succeeded. This script does not rebuild
 that join and does not delete Redfin months. Each persona keeps the top 25
 ZIPs that pass its cash screen. The same run writes marketing_bullets on
-the latest procedure_surgeon_fees report year. Older report years are left
-blank in that column. The fee load owns the column and does not fill it.
+one procedure_surgeon_fees report year. The preferred year is acs_year on
+zip_census_redfin_join. A year qualifies when surgeon_fee_low and
+surgeon_fee_high are both non-null on more than half of that year's
+procedure rows. When the join year qualifies, bullets are written only
+there. Otherwise they are written only on the most recent report year that
+qualifies. Every other report year is left blank in that column. Fees are
+not copied from another year. The fee load owns the column and does not
+fill it.
 After that write succeeds, the same run exports every column of
-procedure_surgeon_fees, including marketing_bullets, for the latest report
-year and every older report year.
+procedure_surgeon_fees, including marketing_bullets, for the chosen report
+year and every other report year.
 """
 
 from __future__ import annotations
@@ -596,42 +602,107 @@ def table_exists(cur, table_name: str) -> bool:
     return cur.fetchone() is not None
 
 
-def fetch_procedure_rows(cur) -> list[tuple[int, str]]:
+def fetch_procedure_rows(cur) -> list[tuple[int, str, object, object]]:
     if not table_exists(cur, procedures.TABLE_NAME):
         raise SystemExit(f"{procedures.TABLE} is missing.")
     cur.execute(
-        f"SELECT report_year, procedure FROM {procedures.TABLE} "
+        f"SELECT report_year, procedure, surgeon_fee_low, surgeon_fee_high "
+        f"FROM {procedures.TABLE} "
         "ORDER BY report_year, procedure"
     )
-    found = [(int(year), str(name)) for year, name in cur.fetchall()]
+    found = [
+        (int(year), str(name), low, high)
+        for year, name, low, high in cur.fetchall()
+    ]
     if not found:
         raise SystemExit(f"{procedures.TABLE} has no rows.")
     return found
 
 
-def apply_marketing_bullets(cur, screens: list[PersonaRank], procedure_rows: list[tuple[int, str]]) -> tuple[int, int]:
-    """Write bullet text on the latest report year and blank every older year."""
+def join_acs_year(rows: list[dict[str, str]]) -> int:
+    """Read acs_year on zip_census_redfin_join. That is the preferred report year."""
+    if not rows:
+        raise SystemExit("The join has no rows.")
+    years: set[int] = set()
+    for row in rows:
+        year = as_int(row.get("acs_year"), "acs_year")
+        if year is None:
+            raise SystemExit("The join is missing acs_year.")
+        years.add(year)
+    if len(years) != 1:
+        listed = ", ".join(str(year) for year in sorted(years))
+        raise SystemExit(f"The join has more than one acs_year: {listed}.")
+    return years.pop()
+
+
+def fees_are_present(low: object, high: object) -> bool:
+    return low is not None and high is not None
+
+
+def report_year_qualifies(fee_pairs: list[tuple[object, object]]) -> bool:
+    """Both fee columns are non-null on more than half of the procedure rows."""
+    if not fee_pairs:
+        return False
+    filled = sum(1 for low, high in fee_pairs if fees_are_present(low, high))
+    return filled * 2 > len(fee_pairs)
+
+
+def select_bullet_report_year(
+    preferred_year: int,
+    procedure_rows: list[tuple[int, str, object, object]],
+) -> int:
+    """Use the join year when it qualifies. Otherwise the newest year that does."""
+    grouped: dict[int, list[tuple[object, object]]] = {}
+    for year, _name, low, high in procedure_rows:
+        grouped.setdefault(int(year), []).append((low, high))
+    if report_year_qualifies(grouped.get(preferred_year, [])):
+        return preferred_year
+    qualifying = [
+        year for year, pairs in grouped.items() if report_year_qualifies(pairs)
+    ]
+    if not qualifying:
+        raise SystemExit(
+            "No procedure report_year has surgeon_fee_low and surgeon_fee_high "
+            "on more than half of its rows."
+        )
+    return max(qualifying)
+
+
+def apply_marketing_bullets(
+    cur,
+    screens: list[PersonaRank],
+    procedure_rows: list[tuple[int, str, object, object]],
+    preferred_year: int,
+) -> tuple[int, int]:
+    """Write bullet text on one qualifying report year and blank every other year.
+
+    Surgeon fee columns are not updated. A blank fee stays blank.
+    """
     procedures.ensure_marketing_bullets(cur)
-    latest = max(year for year, _name in procedure_rows)
+    chosen = select_bullet_report_year(preferred_year, procedure_rows)
     cur.execute(
         f"UPDATE {procedures.TABLE} SET {procedures.MARKETING_BULLETS} = NULL "
         "WHERE report_year <> %s",
-        (latest,),
+        (chosen,),
     )
-    names = [name for year, name in procedure_rows if year == latest]
+    names = [name for year, name, _low, _high in procedure_rows if year == chosen]
     bullets = bullets_by_procedure(names, screens)
-    updates = [(bullets[name], latest, name) for name in names]
+    updates = [(bullets[name], chosen, name) for name in names]
     if updates:
         cur.executemany(
             f"UPDATE {procedures.TABLE} SET {procedures.MARKETING_BULLETS} = %s "
             "WHERE report_year = %s AND procedure = %s",
             updates,
         )
-    return latest, len(updates)
+    return chosen, len(updates)
 
 
 def save_rank(
-    conn, screens: list[PersonaRank], updated_at: datetime | None = None
+    conn,
+    screens: list[PersonaRank],
+    updated_at: datetime | None = None,
+    *,
+    preferred_year: int,
 ) -> tuple[int, int, int]:
     """Replace the rank snapshot and write procedure bullets. Do not drop tables."""
     if "redfin_real_estate_value" in DELETE_RANK_SQL:
@@ -653,7 +724,9 @@ def save_rank(
             if stamped:
                 cur.executemany(insert_sql, stamped)
             procedure_rows = fetch_procedure_rows(cur)
-            year, bullet_count = apply_marketing_bullets(cur, screens, procedure_rows)
+            year, bullet_count = apply_marketing_bullets(
+                cur, screens, procedure_rows, preferred_year
+            )
             cur.execute(f"SELECT COUNT(*) FROM {RANK_TABLE}")
             count = cur.fetchone()[0]
     if count != len(rows):
@@ -767,7 +840,9 @@ def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) != 1:
         raise SystemExit("Usage: python rank_cash_pay_zips.py JOIN_CSV")
-    screens = rank_personas(read_join_csv(Path(args[0])))
+    join_rows = read_join_csv(Path(args[0]))
+    preferred_year = join_acs_year(join_rows)
+    screens = rank_personas(join_rows)
     rows = flatten(screens)
     write_rank_csv(rows)
     summary = ", ".join(f"{len(screen.rows)} for {screen.persona.label}" for screen in screens)
@@ -782,7 +857,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"dataset_updated_at: {updated_at.isoformat()}")
     try:
         with load_california.connect() as conn:
-            count, year, bullet_count = save_rank(conn, screens, updated_at)
+            count, year, bullet_count = save_rank(
+                conn, screens, updated_at, preferred_year=preferred_year
+            )
             fee_count = export_procedure_fees(conn)
     except SystemExit as exc:
         print(public_error(exc), file=sys.stderr)
@@ -793,7 +870,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"Replaced {RANK_TABLE} with {count} rows. "
         f"Wrote {procedures.MARKETING_BULLETS} on {bullet_count} rows "
-        f"for report_year {year}. Older report years are blank in that column. "
+        f"for report_year {year}. Other report years are blank in that column. "
         f"Wrote {fee_count} rows to {procedures.OUTPUT_CSV_NAME}. "
         f"{load_california.TABLE} was not modified."
     )
