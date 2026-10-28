@@ -394,6 +394,44 @@ class BulletTests(unittest.TestCase):
         self.assertIn("$800", older)
         self.assertTrue(older.splitlines()[1].startswith("- 1. "))
 
+    def test_tableau_file_writes_one_row_per_bullet(self):
+        text = rank.marketing_bullets("facelift", self.screens)
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        zip_lines = [line for line in lines if line.startswith("- ")]
+        self.assertGreaterEqual(len(zip_lines), 1)
+        self.assertIn("\n", text)
+        columns = ["report_year", "procedure", "surgeon_fee_low", "marketing_bullets"]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "procedure_surgeon_fees.csv"
+            count = rank.write_procedure_fee_csv(
+                columns,
+                [
+                    (2024, "facelift", 8000, text),
+                    (2025, "facelift", None, None),
+                ],
+                path,
+            )
+            raw = path.read_text(encoding="utf-8")
+            with path.open(newline="", encoding="utf-8") as handle:
+                written = list(csv.DictReader(handle))
+        self.assertEqual(count, len(lines) + 1)
+        self.assertEqual(len(raw.splitlines()), len(written) + 1)
+        bullet_rows = written[: len(lines)]
+        self.assertEqual([row["marketing_bullets"] for row in bullet_rows], lines)
+        self.assertEqual(
+            [row["marketing_bullets"] for row in bullet_rows if row["marketing_bullets"].startswith("- ")],
+            zip_lines,
+        )
+        self.assertTrue(
+            all(row["report_year"] == "2024" and row["procedure"] == "facelift" for row in bullet_rows)
+        )
+        self.assertTrue(all("\n" not in row["marketing_bullets"] and "\r" not in row["marketing_bullets"] for row in written))
+        self.assertEqual(written[-1]["report_year"], "2025")
+        self.assertEqual(written[-1]["procedure"], "facelift")
+        self.assertEqual(written[-1]["marketing_bullets"], "")
+        self.assertEqual(written[-1]["surgeon_fee_low"], "")
+        self.assertEqual(bullet_rows[0]["surgeon_fee_low"], "8000")
+
     def test_shared_persona_lists_repeat_the_same_text(self):
         names = ["breast augmentation", "rhinoplasty", "facelift", "eyelid surgery"]
         bullets = rank.bullets_by_procedure(names, self.screens)
@@ -819,21 +857,25 @@ class ProcedureFeeExportTests(unittest.TestCase):
                 reader = csv.DictReader(handle)
                 self.assertEqual(list(reader.fieldnames), columns)
                 written = list(reader)
-        self.assertEqual(count, 4)
+        self.assertEqual(count, 5)
         self.assertEqual(
             [row["report_year"] for row in written],
-            ["2024", "2024", "2025", "2025"],
+            ["2024", "2024", "2025", "2025", "2025"],
         )
         self.assertEqual(
             [row["procedure"] for row in written],
-            ["facelift", "rhinoplasty", "facelift", "rhinoplasty"],
+            ["facelift", "rhinoplasty", "facelift", "rhinoplasty", "rhinoplasty"],
         )
         self.assertEqual(written[0]["marketing_bullets"], "")
         self.assertEqual(written[1]["marketing_bullets"], "")
         self.assertEqual(written[2]["marketing_bullets"], "older personas")
-        self.assertEqual(written[3]["marketing_bullets"], bullet)
+        self.assertEqual(written[3]["marketing_bullets"], "18 to 34. Ranked.")
+        self.assertEqual(written[4]["marketing_bullets"], "- 1. Pasadena (90012): cash.")
+        self.assertNotIn("\n", written[3]["marketing_bullets"])
+        self.assertNotIn("\n", written[4]["marketing_bullets"])
         self.assertEqual(written[0]["source_note"], "older")
         self.assertEqual(written[3]["source_note"], "latest")
+        self.assertEqual(written[4]["source_note"], "latest")
         self.assertEqual(written[0]["dataset_updated_at"], moment.isoformat())
         self.assertEqual(written[2]["surgeon_fee_low"], "")
         self.assertEqual(written[0]["surgeon_fee_low"], "1000")

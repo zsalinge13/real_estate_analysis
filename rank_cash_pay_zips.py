@@ -13,7 +13,9 @@ not copied from another year. The fee load owns the column and does not
 fill it.
 After that write succeeds, the same run exports every column of
 procedure_surgeon_fees, including marketing_bullets, for the chosen report
-year and every other report year.
+year and every other report year. The file has one row per bullet line.
+report_year and procedure repeat on each of those rows, and the bullet
+text has no line break inside the cell.
 """
 
 from __future__ import annotations
@@ -747,6 +749,45 @@ def procedure_csv_cell(value: object) -> object:
     return load_california.csv_value(value)
 
 
+def marketing_bullet_cells(value: object) -> list[str]:
+    """One cell per stored line. A cell does not contain a line break.
+
+    Blank text stays one empty cell. Header lines stay, in order, and each
+    ZIP bullet stays on its own cell in that same rank order.
+    """
+    if value is None:
+        return [""]
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    if text.strip() == "":
+        return [""]
+    cells = [line.strip() for line in text.split("\n") if line.strip()]
+    if not cells:
+        return [""]
+    if any("\n" in cell or "\r" in cell for cell in cells):
+        raise SystemExit("A marketing bullet still contains a line break.")
+    return cells
+
+
+def expand_marketing_bullet_rows(columns: list[str], rows: list[tuple]) -> list[tuple]:
+    """Repeat report_year and procedure once per bullet line."""
+    if procedures.MARKETING_BULLETS not in columns:
+        raise SystemExit(
+            f"{procedures.TABLE} is missing {procedures.MARKETING_BULLETS}."
+        )
+    index = columns.index(procedures.MARKETING_BULLETS)
+    expanded: list[tuple] = []
+    for row in rows:
+        if len(row) != len(columns):
+            raise SystemExit(
+                f"{procedures.OUTPUT_CSV_NAME} row does not match its columns."
+            )
+        for cell in marketing_bullet_cells(row[index]):
+            copied = list(row)
+            copied[index] = cell
+            expanded.append(tuple(copied))
+    return expanded
+
+
 def procedure_fee_columns(cur) -> list[str]:
     """Every column on the fee table after the rank write, in table order."""
     cur.execute(
@@ -797,23 +838,22 @@ def fetch_procedure_fee_rows(cur, columns: list[str]) -> list[tuple]:
 
 def write_procedure_fee_csv(
     columns: list[str], rows: list[tuple], path: Path | None = None
-) -> None:
+) -> int:
+    """Write one CSV row per marketing bullet. Cells have no line breaks."""
     path = procedures.OUTPUT_CSV if path is None else path
+    expanded = expand_marketing_bullet_rows(columns, rows)
     tmp = path.with_name(path.name + ".tmp")
     try:
         with tmp.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle, lineterminator="\n")
             writer.writerow(columns)
-            for row in rows:
-                if len(row) != len(columns):
-                    raise SystemExit(
-                        f"{procedures.OUTPUT_CSV_NAME} row does not match its columns."
-                    )
+            for row in expanded:
                 writer.writerow([procedure_csv_cell(value) for value in row])
         os.replace(tmp, path)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
+    return len(expanded)
 
 
 def export_procedure_fees(conn, path: Path | None = None) -> int:
@@ -823,8 +863,7 @@ def export_procedure_fees(conn, path: Path | None = None) -> int:
             cur.execute("SET TRANSACTION READ ONLY")
             columns = procedure_fee_columns(cur)
             rows = fetch_procedure_fee_rows(cur, columns)
-            write_procedure_fee_csv(columns, rows, path)
-    return len(rows)
+            return write_procedure_fee_csv(columns, rows, path)
 
 
 def database_url() -> str:
