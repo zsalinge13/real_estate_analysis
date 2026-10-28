@@ -13,7 +13,9 @@ not copied from another year. The fee load owns the column and does not
 fill it.
 After that write succeeds, the same run exports every column of
 procedure_surgeon_fees, including marketing_bullets, for the chosen report
-year and every other report year.
+year and every other report year. The file has one row per bullet line.
+report_year and procedure repeat on each of those rows, and the bullet
+text has no line break inside the cell.
 """
 
 from __future__ import annotations
@@ -40,8 +42,9 @@ TOP_N = 25
 DATABASE_URL_ENV = load_california.DATABASE_URL_ENV
 
 # Equal age shares are the close case. The higher cash signal ranks first.
-# Household income is that signal for working-age personas. Listing price is
-# that signal for ages 55 and older. The female share is not a rank key.
+# Household income is that signal for working-age personas. Listing price
+# per square foot is that signal for ages 55 and older. The female share
+# is not a rank key.
 
 
 @dataclass(frozen=True)
@@ -135,7 +138,7 @@ NOT_NULL_COLUMNS = {
     "age_share",
     "median_household_income",
     "per_capita_income",
-    "median_listing_price",
+    "median_listing_price_per_square_foot",
     "active_listing_count",
     "household_income_middle",
     "per_capita_income_middle",
@@ -288,7 +291,7 @@ def screen_row(row: dict[str, str], persona: Persona) -> dict | None:
     adults = as_int(row.get("adult_population"), "adult_population")
     household = as_int(row.get("median_household_income"), "median_household_income")
     per_capita = as_int(row.get("per_capita_income"), "per_capita_income")
-    price = as_decimal(row.get("median_listing_price"))
+    price = as_decimal(row.get("median_listing_price_per_square_foot"))
     listings = as_int(row.get("active_listing_count"), "active_listing_count")
     if (
         counted is None
@@ -320,15 +323,13 @@ def screen_row(row: dict[str, str], persona: Persona) -> dict | None:
         "age_share": Decimal(counted) / Decimal(adults),
         "median_household_income": household,
         "per_capita_income": per_capita,
-        "median_listing_price": price,
+        "median_listing_price": as_decimal(row.get("median_listing_price")),
         "active_listing_count": listings,
         "male_population": as_int(row.get("male_population"), "male_population"),
         "female_population": as_int(row.get("female_population"), "female_population"),
         "female_share": female_share(row),
         "median_age": as_decimal(row.get("median_age")),
-        "median_listing_price_per_square_foot": as_decimal(
-            row.get("median_listing_price_per_square_foot")
-        ),
+        "median_listing_price_per_square_foot": price,
         "acs_year": year,
         "month_date_yyyymm": month,
         "date_pulled_yyyymmdd": pulled,
@@ -339,11 +340,11 @@ def passes_cash(row: dict, persona: Persona, income_middle, per_capita_middle, p
     if persona.cash == "working":
         return (
             Decimal(row["median_household_income"]) >= income_middle
-            and row["median_listing_price"] >= price_middle
+            and row["median_listing_price_per_square_foot"] >= price_middle
         )
     if persona.cash == "older":
         return (
-            row["median_listing_price"] >= price_middle
+            row["median_listing_price_per_square_foot"] >= price_middle
             and Decimal(row["per_capita_income"]) >= per_capita_middle
         )
     raise SystemExit(f"Unknown cash test {persona.cash!r}.")
@@ -352,7 +353,7 @@ def passes_cash(row: dict, persona: Persona, income_middle, per_capita_middle, p
 def cash_signal(row: dict, persona: Persona) -> Decimal:
     if persona.cash == "working":
         return Decimal(row["median_household_income"])
-    return row["median_listing_price"]
+    return row["median_listing_price_per_square_foot"]
 
 
 def rank_persona(rows: list[dict[str, str]], persona: Persona) -> PersonaRank:
@@ -372,7 +373,9 @@ def rank_persona(rows: list[dict[str, str]], persona: Persona) -> PersonaRank:
         [Decimal(row["median_household_income"]) for row in prepared]
     )
     per_capita_middle = middle([Decimal(row["per_capita_income"]) for row in prepared])
-    price_middle = middle([row["median_listing_price"] for row in prepared])
+    price_middle = middle(
+        [row["median_listing_price_per_square_foot"] for row in prepared]
+    )
     kept = [
         row
         for row in prepared
@@ -423,27 +426,27 @@ def screen_header(screen: PersonaRank) -> str:
     if screen.household_income_middle is None:
         return (
             f"{persona.label}. No ZIP had a published age count, adult population, "
-            "household income, per-person income, listing price, and at least "
+            "household income, per-person income, listing price per square foot, and at least "
             f"{MIN_ACTIVE_LISTINGS} active listings."
         )
     if persona.cash == "working":
         middles = (
             f"household income middle {format_money(screen.household_income_middle)}, "
-            f"listing price middle {format_money(screen.listing_price_middle)}"
+            f"listing price per square foot middle {format_money(screen.listing_price_middle)}"
         )
-        rule = "Household income and the listing price are both at or above"
+        rule = "Household income and the listing price per square foot are both at or above"
         failed = (
-            "No ZIP has both household income and listing price at or above "
+            "No ZIP has both household income and listing price per square foot at or above "
             "the middle of Los Angeles County ZIPs in this screen"
         )
     else:
         middles = (
-            f"listing price middle {format_money(screen.listing_price_middle)}, "
+            f"listing price per square foot middle {format_money(screen.listing_price_middle)}, "
             f"per-person income middle {format_money(screen.per_capita_income_middle)}"
         )
-        rule = "Listing price and per-person income are both at or above"
+        rule = "Listing price per square foot and per-person income are both at or above"
         failed = (
-            "No ZIP has both listing price and per-person income at or above "
+            "No ZIP has both listing price per square foot and per-person income at or above "
             "the middle of Los Angeles County ZIPs in this screen"
         )
     if not screen.rows:
@@ -460,13 +463,13 @@ def zip_bullet(screen: PersonaRank, row: dict) -> str:
         reason = (
             f"{share} of adults are {screen.persona.age_phrase}. "
             f"Household income {format_money(Decimal(row['median_household_income']))} "
-            f"and listing price {format_money(row['median_listing_price'])} "
+            f"and listing price per square foot {format_money(row['median_listing_price_per_square_foot'])} "
             "are at or above those middles."
         )
     else:
         reason = (
             f"{share} of adults are {screen.persona.age_phrase}. "
-            f"Listing price {format_money(row['median_listing_price'])} and "
+            f"Listing price per square foot {format_money(row['median_listing_price_per_square_foot'])} and "
             f"per-person income {format_money(Decimal(row['per_capita_income']))} "
             "are at or above those middles."
         )
@@ -570,6 +573,10 @@ def ensure_rank_columns(cur) -> None:
     cur.execute(
         f"ALTER TABLE {RANK_TABLE} ADD COLUMN IF NOT EXISTS "
         f"{quote_ident(dataset_stamp.COLUMN)} {dataset_stamp.SQL_TYPE}"
+    )
+    cur.execute(
+        f"ALTER TABLE {RANK_TABLE} ALTER COLUMN "
+        f"{quote_ident('median_listing_price')} DROP NOT NULL"
     )
 
 
@@ -742,6 +749,45 @@ def procedure_csv_cell(value: object) -> object:
     return load_california.csv_value(value)
 
 
+def marketing_bullet_cells(value: object) -> list[str]:
+    """One cell per stored line. A cell does not contain a line break.
+
+    Blank text stays one empty cell. Header lines stay, in order, and each
+    ZIP bullet stays on its own cell in that same rank order.
+    """
+    if value is None:
+        return [""]
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    if text.strip() == "":
+        return [""]
+    cells = [line.strip() for line in text.split("\n") if line.strip()]
+    if not cells:
+        return [""]
+    if any("\n" in cell or "\r" in cell for cell in cells):
+        raise SystemExit("A marketing bullet still contains a line break.")
+    return cells
+
+
+def expand_marketing_bullet_rows(columns: list[str], rows: list[tuple]) -> list[tuple]:
+    """Repeat report_year and procedure once per bullet line."""
+    if procedures.MARKETING_BULLETS not in columns:
+        raise SystemExit(
+            f"{procedures.TABLE} is missing {procedures.MARKETING_BULLETS}."
+        )
+    index = columns.index(procedures.MARKETING_BULLETS)
+    expanded: list[tuple] = []
+    for row in rows:
+        if len(row) != len(columns):
+            raise SystemExit(
+                f"{procedures.OUTPUT_CSV_NAME} row does not match its columns."
+            )
+        for cell in marketing_bullet_cells(row[index]):
+            copied = list(row)
+            copied[index] = cell
+            expanded.append(tuple(copied))
+    return expanded
+
+
 def procedure_fee_columns(cur) -> list[str]:
     """Every column on the fee table after the rank write, in table order."""
     cur.execute(
@@ -792,23 +838,22 @@ def fetch_procedure_fee_rows(cur, columns: list[str]) -> list[tuple]:
 
 def write_procedure_fee_csv(
     columns: list[str], rows: list[tuple], path: Path | None = None
-) -> None:
+) -> int:
+    """Write one CSV row per marketing bullet. Cells have no line breaks."""
     path = procedures.OUTPUT_CSV if path is None else path
+    expanded = expand_marketing_bullet_rows(columns, rows)
     tmp = path.with_name(path.name + ".tmp")
     try:
         with tmp.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle, lineterminator="\n")
             writer.writerow(columns)
-            for row in rows:
-                if len(row) != len(columns):
-                    raise SystemExit(
-                        f"{procedures.OUTPUT_CSV_NAME} row does not match its columns."
-                    )
+            for row in expanded:
                 writer.writerow([procedure_csv_cell(value) for value in row])
         os.replace(tmp, path)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
+    return len(expanded)
 
 
 def export_procedure_fees(conn, path: Path | None = None) -> int:
@@ -818,8 +863,7 @@ def export_procedure_fees(conn, path: Path | None = None) -> int:
             cur.execute("SET TRANSACTION READ ONLY")
             columns = procedure_fee_columns(cur)
             rows = fetch_procedure_fee_rows(cur, columns)
-            write_procedure_fee_csv(columns, rows, path)
-    return len(rows)
+            return write_procedure_fee_csv(columns, rows, path)
 
 
 def database_url() -> str:

@@ -33,7 +33,7 @@ def join_row(zip_code: str, **overrides) -> dict[str, str]:
         "population_55_64": "",
         "population_65_plus": "",
         "median_listing_price": "1000000",
-        "median_listing_price_per_square_foot": "",
+        "median_listing_price_per_square_foot": "500",
         "active_listing_count": "20",
         "acs_year": "2024",
         "month_date_yyyymm": "2024_09",
@@ -57,7 +57,7 @@ class RankRuleTests(unittest.TestCase):
         self.assertEqual(rank.middle([Decimal(100), Decimal(300)]), Decimal(200))
         self.assertEqual(rank.middle([Decimal(100), Decimal(200), Decimal(1000)]), Decimal(200))
 
-    def test_working_age_uses_household_income_and_listing_price(self):
+    def test_working_age_uses_household_income_and_price_per_square_foot(self):
         screens = rank.rank_personas(
             [
                 join_row(
@@ -65,35 +65,36 @@ class RankRuleTests(unittest.TestCase):
                     zip_name="High female share",
                     median_household_income="300",
                     per_capita_income="500",
-                    median_listing_price="400",
+                    median_listing_price="10",
                     population_18_34="40",
                     adult_population="100",
                     active_listing_count="10",
                     female_population="950",
                     male_population="50",
                     median_age="18",
-                    median_listing_price_per_square_foot="999",
+                    median_listing_price_per_square_foot="400",
                 ),
                 join_row(
                     "90030",
                     zip_name="",
                     median_household_income="500",
                     per_capita_income="10",
-                    median_listing_price="400",
+                    median_listing_price="10",
                     population_18_34="40",
                     adult_population="100",
                     active_listing_count="10",
                     female_population="50",
                     male_population="950",
                     median_age="70",
-                    median_listing_price_per_square_foot="100",
+                    median_listing_price_per_square_foot="400",
                 ),
                 join_row(
                     "90001",
                     zip_name="Beverly Hills",
                     median_household_income="100",
                     per_capita_income="900",
-                    median_listing_price="100",
+                    median_listing_price="999999",
+                    median_listing_price_per_square_foot="100",
                     population_18_34="90",
                     adult_population="100",
                     active_listing_count="40",
@@ -125,6 +126,16 @@ class RankRuleTests(unittest.TestCase):
                     adult_population="0",
                     active_listing_count="40",
                 ),
+                join_row(
+                    "90006",
+                    zip_name="Blank price per square foot",
+                    median_household_income="900",
+                    median_listing_price="900",
+                    median_listing_price_per_square_foot="",
+                    population_18_34="99",
+                    adult_population="100",
+                    active_listing_count="40",
+                ),
             ]
         )
         listed = persona(screens, "18 to 34")
@@ -133,12 +144,15 @@ class RankRuleTests(unittest.TestCase):
         self.assertEqual(listed.rows[0]["zip_name"], "")
         self.assertEqual(listed.household_income_middle, Decimal(300))
         self.assertEqual(listed.listing_price_middle, Decimal(400))
+        self.assertEqual(listed.rows[0]["median_listing_price"], Decimal(10))
+        self.assertEqual(listed.rows[0]["median_listing_price_per_square_foot"], Decimal(400))
         self.assertEqual(listed.rows[0]["per_capita_income"], 10)
+        self.assertNotIn("90006", [row["zip"] for row in listed.rows])
         self.assertGreater(listed.rows[1]["female_share"], listed.rows[0]["female_share"])
         self.assertIsNone(persona(screens, "35 to 44").household_income_middle)
         self.assertEqual(persona(screens, "35 to 44").rows, [])
 
-    def test_older_persona_uses_listing_price_and_per_person_income(self):
+    def test_older_persona_uses_price_per_square_foot_and_per_person_income(self):
         screens = rank.rank_personas(
             [
                 join_row(
@@ -146,7 +160,8 @@ class RankRuleTests(unittest.TestCase):
                     zip_name="Expensive",
                     median_household_income="50",
                     per_capita_income="80",
-                    median_listing_price="500",
+                    median_listing_price="100",
+                    median_listing_price_per_square_foot="500",
                     population_55_64="20",
                     population_65_plus="20",
                     adult_population="100",
@@ -157,7 +172,8 @@ class RankRuleTests(unittest.TestCase):
                     zip_name="High household",
                     median_household_income="500",
                     per_capita_income="80",
-                    median_listing_price="300",
+                    median_listing_price="900",
+                    median_listing_price_per_square_foot="300",
                     population_55_64="20",
                     population_65_plus="20",
                     adult_population="100",
@@ -169,6 +185,7 @@ class RankRuleTests(unittest.TestCase):
                     median_household_income="900",
                     per_capita_income="10",
                     median_listing_price="100",
+                    median_listing_price_per_square_foot="100",
                     population_55_64="40",
                     population_65_plus="40",
                     adult_population="100",
@@ -192,10 +209,31 @@ class RankRuleTests(unittest.TestCase):
         self.assertEqual([row["zip"] for row in older.rows], ["90030", "90010"])
         self.assertEqual(older.rows[0]["age_share"], Decimal("0.4"))
         self.assertEqual(older.rows[0]["median_household_income"], 50)
+        self.assertEqual(older.rows[0]["median_listing_price"], Decimal(100))
+        self.assertEqual(older.rows[0]["median_listing_price_per_square_foot"], Decimal(500))
         self.assertEqual(older.listing_price_middle, Decimal(300))
         self.assertEqual(older.per_capita_income_middle, Decimal(80))
         self.assertEqual([row["zip"] for row in persona(screens, "45 to 54").rows], ["90002"])
         self.assertEqual(persona(screens, "18 to 34").rows, [])
+
+    def test_blank_home_price_still_ranks_on_price_per_square_foot(self):
+        screens = rank.rank_personas(
+            [
+                join_row(
+                    "90001",
+                    median_listing_price="",
+                    median_listing_price_per_square_foot="400",
+                    median_household_income="300",
+                    population_18_34="40",
+                    adult_population="100",
+                    active_listing_count="10",
+                )
+            ]
+        )
+        listed = persona(screens, "18 to 34")
+        self.assertEqual([row["zip"] for row in listed.rows], ["90001"])
+        self.assertIsNone(listed.rows[0]["median_listing_price"])
+        self.assertEqual(listed.rows[0]["median_listing_price_per_square_foot"], Decimal(400))
 
     def test_middles_are_recalculated_for_each_persona(self):
         screens = rank.rank_personas(
@@ -273,6 +311,7 @@ class BulletTests(unittest.TestCase):
                     median_household_income="300",
                     per_capita_income="20",
                     median_listing_price="300",
+                    median_listing_price_per_square_foot="640",
                     population_18_34="40",
                     population_35_44="25",
                     adult_population="100",
@@ -286,6 +325,7 @@ class BulletTests(unittest.TestCase):
                     median_household_income="100",
                     per_capita_income="90",
                     median_listing_price="100",
+                    median_listing_price_per_square_foot="50",
                     population_18_34="80",
                     population_35_44="10",
                     adult_population="100",
@@ -299,6 +339,7 @@ class BulletTests(unittest.TestCase):
                     median_household_income="50",
                     per_capita_income="200",
                     median_listing_price="400",
+                    median_listing_price_per_square_foot="800",
                     population_45_54="30",
                     population_55_64="30",
                     population_65_plus="30",
@@ -338,7 +379,8 @@ class BulletTests(unittest.TestCase):
         self.assertNotIn("Older Hills", young)
         self.assertNotIn("Compton", young)
         self.assertIn("Household income", young)
-        self.assertIn("listing price", young)
+        self.assertIn("listing price per square foot", young)
+        self.assertIn("$640", young)
         self.assertIn("at or above", young)
         self.assertIn("Women are 75.0% of residents.", young)
         self.assertNotIn("per-person income", young)
@@ -348,8 +390,47 @@ class BulletTests(unittest.TestCase):
         self.assertNotIn("18 to 34", older)
         self.assertNotIn("Pasadena", older)
         self.assertIn("per-person income", older)
-        self.assertIn("listing price", older)
+        self.assertIn("listing price per square foot", older)
+        self.assertIn("$800", older)
         self.assertTrue(older.splitlines()[1].startswith("- 1. "))
+
+    def test_tableau_file_writes_one_row_per_bullet(self):
+        text = rank.marketing_bullets("facelift", self.screens)
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        zip_lines = [line for line in lines if line.startswith("- ")]
+        self.assertGreaterEqual(len(zip_lines), 1)
+        self.assertIn("\n", text)
+        columns = ["report_year", "procedure", "surgeon_fee_low", "marketing_bullets"]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "procedure_surgeon_fees.csv"
+            count = rank.write_procedure_fee_csv(
+                columns,
+                [
+                    (2024, "facelift", 8000, text),
+                    (2025, "facelift", None, None),
+                ],
+                path,
+            )
+            raw = path.read_text(encoding="utf-8")
+            with path.open(newline="", encoding="utf-8") as handle:
+                written = list(csv.DictReader(handle))
+        self.assertEqual(count, len(lines) + 1)
+        self.assertEqual(len(raw.splitlines()), len(written) + 1)
+        bullet_rows = written[: len(lines)]
+        self.assertEqual([row["marketing_bullets"] for row in bullet_rows], lines)
+        self.assertEqual(
+            [row["marketing_bullets"] for row in bullet_rows if row["marketing_bullets"].startswith("- ")],
+            zip_lines,
+        )
+        self.assertTrue(
+            all(row["report_year"] == "2024" and row["procedure"] == "facelift" for row in bullet_rows)
+        )
+        self.assertTrue(all("\n" not in row["marketing_bullets"] and "\r" not in row["marketing_bullets"] for row in written))
+        self.assertEqual(written[-1]["report_year"], "2025")
+        self.assertEqual(written[-1]["procedure"], "facelift")
+        self.assertEqual(written[-1]["marketing_bullets"], "")
+        self.assertEqual(written[-1]["surgeon_fee_low"], "")
+        self.assertEqual(bullet_rows[0]["surgeon_fee_low"], "8000")
 
     def test_shared_persona_lists_repeat_the_same_text(self):
         names = ["breast augmentation", "rhinoplasty", "facelift", "eyelid surgery"]
@@ -776,21 +857,25 @@ class ProcedureFeeExportTests(unittest.TestCase):
                 reader = csv.DictReader(handle)
                 self.assertEqual(list(reader.fieldnames), columns)
                 written = list(reader)
-        self.assertEqual(count, 4)
+        self.assertEqual(count, 5)
         self.assertEqual(
             [row["report_year"] for row in written],
-            ["2024", "2024", "2025", "2025"],
+            ["2024", "2024", "2025", "2025", "2025"],
         )
         self.assertEqual(
             [row["procedure"] for row in written],
-            ["facelift", "rhinoplasty", "facelift", "rhinoplasty"],
+            ["facelift", "rhinoplasty", "facelift", "rhinoplasty", "rhinoplasty"],
         )
         self.assertEqual(written[0]["marketing_bullets"], "")
         self.assertEqual(written[1]["marketing_bullets"], "")
         self.assertEqual(written[2]["marketing_bullets"], "older personas")
-        self.assertEqual(written[3]["marketing_bullets"], bullet)
+        self.assertEqual(written[3]["marketing_bullets"], "18 to 34. Ranked.")
+        self.assertEqual(written[4]["marketing_bullets"], "- 1. Pasadena (90012): cash.")
+        self.assertNotIn("\n", written[3]["marketing_bullets"])
+        self.assertNotIn("\n", written[4]["marketing_bullets"])
         self.assertEqual(written[0]["source_note"], "older")
         self.assertEqual(written[3]["source_note"], "latest")
+        self.assertEqual(written[4]["source_note"], "latest")
         self.assertEqual(written[0]["dataset_updated_at"], moment.isoformat())
         self.assertEqual(written[2]["surgeon_fee_low"], "")
         self.assertEqual(written[0]["surgeon_fee_low"], "1000")
