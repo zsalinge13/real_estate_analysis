@@ -359,8 +359,121 @@ class BulletTests(unittest.TestCase):
         self.assertNotEqual(bullets["breast augmentation"], bullets["facelift"])
 
 
+class BulletYearTests(unittest.TestCase):
+    def test_join_acs_year_is_the_preferred_report_year(self):
+        self.assertEqual(
+            rank.join_acs_year([join_row("90001"), join_row("90002", acs_year="2024")]),
+            2024,
+        )
+        with self.assertRaises(SystemExit):
+            rank.join_acs_year(
+                [join_row("90001", acs_year="2024"), join_row("90002", acs_year="2025")]
+            )
+        with self.assertRaises(SystemExit):
+            rank.join_acs_year([join_row("90001", acs_year="")])
+
+    def test_half_of_the_rows_does_not_qualify(self):
+        self.assertFalse(rank.report_year_qualifies([(1, 2), (None, None)]))
+        self.assertFalse(rank.report_year_qualifies([(1, None), (None, 2)]))
+        self.assertFalse(rank.report_year_qualifies([]))
+        self.assertTrue(rank.report_year_qualifies([(1, 2), (3, 4), (None, None)]))
+
+    def test_join_year_with_fees_is_used_when_a_later_year_is_blank(self):
+        rows = [
+            (2024, "facelift", 8000, 12000),
+            (2024, "rhinoplasty", 7000, 11000),
+            (2025, "facelift", None, None),
+            (2025, "rhinoplasty", None, None),
+        ]
+        self.assertEqual(rank.select_bullet_report_year(2024, rows), 2024)
+
+    def test_blank_join_year_uses_the_newest_year_that_qualifies(self):
+        rows = [
+            (2023, "facelift", 1000, 2000),
+            (2023, "rhinoplasty", 1000, 2000),
+            (2024, "facelift", 1000, 2000),
+            (2024, "rhinoplasty", None, None),
+            (2025, "facelift", None, None),
+            (2025, "rhinoplasty", None, 9000),
+        ]
+        self.assertEqual(rank.select_bullet_report_year(2025, rows), 2023)
+
+    def test_qualifying_join_year_wins_over_an_older_fee_year(self):
+        rows = [
+            (2023, "facelift", 1000, 2000),
+            (2024, "facelift", 3000, 4000),
+            (2024, "rhinoplasty", 5000, 6000),
+        ]
+        self.assertEqual(rank.select_bullet_report_year(2024, rows), 2024)
+
+    def test_missing_join_year_falls_back_to_the_newest_fee_year(self):
+        rows = [
+            (2024, "facelift", 1000, 2000),
+            (2024, "rhinoplasty", 1000, 2000),
+        ]
+        self.assertEqual(rank.select_bullet_report_year(2026, rows), 2024)
+
+    def test_no_qualifying_year_is_refused(self):
+        rows = [
+            (2024, "facelift", None, None),
+            (2025, "facelift", 1000, None),
+        ]
+        with self.assertRaises(SystemExit) as caught:
+            rank.select_bullet_report_year(2025, rows)
+        self.assertIn("surgeon_fee_low", str(caught.exception))
+
+    def test_blank_join_year_writes_bullets_only_on_the_newest_fee_year(self):
+        screens = rank.rank_personas(
+            [
+                join_row(
+                    "90012",
+                    zip_name="Pasadena",
+                    acs_year="2025",
+                    median_household_income="300",
+                    median_listing_price="300",
+                    population_18_34="40",
+                    adult_population="100",
+                )
+            ]
+        )
+        procedure_rows = [
+            (2024, "rhinoplasty", 7000, 12000),
+            (2025, "rhinoplasty", None, None),
+            (2025, "facelift", None, None),
+        ]
+
+        class Cursor:
+            def __init__(self):
+                self.statements: list[tuple[str, object]] = []
+
+            def execute(self, sql, params=None):
+                self.statements.append((" ".join(sql.split()), params))
+
+            def executemany(self, sql, batch):
+                self.statements.append((" ".join(sql.split()), list(batch)))
+
+        cursor = Cursor()
+        year, count = rank.apply_marketing_bullets(cursor, screens, procedure_rows, 2025)
+        self.assertEqual(year, 2024)
+        self.assertEqual(count, 1)
+        clear = next(
+            params for sql, params in cursor.statements if "marketing_bullets = NULL" in sql
+        )
+        self.assertEqual(clear, (2024,))
+        updates = next(
+            batch
+            for _sql, batch in cursor.statements
+            if isinstance(batch, list) and batch
+        )
+        self.assertEqual(updates, [(updates[0][0], 2024, "rhinoplasty")])
+        self.assertIn("Pasadena (90012)", updates[0][0])
+        for sql, _params in cursor.statements:
+            self.assertNotIn("surgeon_fee_low", sql)
+            self.assertNotIn("surgeon_fee_high", sql)
+
+
 class SaveTests(unittest.TestCase):
-    def test_save_replaces_the_rank_and_writes_the_latest_year_only(self):
+    def test_save_replaces_the_rank_and_writes_the_join_year_when_it_has_fees(self):
         screens = rank.rank_personas(
             [
                 join_row(
@@ -397,11 +510,12 @@ class SaveTests(unittest.TestCase):
                 elif "SELECT report_year, procedure" in text:
                     self._fetchone = None
                     self._fetchall = [
-                        (2024, "facelift"),
-                        (2024, "rhinoplasty"),
-                        (2025, "facelift"),
-                        (2025, "rhinoplasty"),
-                        (2025, "custom procedure"),
+                        (2024, "custom procedure", 1200, 2200),
+                        (2024, "facelift", 8000, 15000),
+                        (2024, "rhinoplasty", 7000, 12000),
+                        (2025, "custom procedure", None, None),
+                        (2025, "facelift", None, None),
+                        (2025, "rhinoplasty", None, None),
                     ]
                 elif "SELECT COUNT(*)" in text:
                     self._fetchone = (self.count,)
@@ -438,9 +552,11 @@ class SaveTests(unittest.TestCase):
                 return self.cursor_obj
 
         conn = Connection()
-        count, year, bullet_count = rank.save_rank(conn, screens, moment)
+        count, year, bullet_count = rank.save_rank(
+            conn, screens, moment, preferred_year=2024
+        )
         self.assertEqual(count, 1)
-        self.assertEqual(year, 2025)
+        self.assertEqual(year, 2024)
         self.assertEqual(bullet_count, 3)
         statements = conn.cursor_obj.statements
         joined = " ".join(sql for sql, _params in statements)
@@ -452,7 +568,7 @@ class SaveTests(unittest.TestCase):
         self.assertNotIn("redfin_real_estate_value", joined)
         self.assertIn("ADD COLUMN IF NOT EXISTS marketing_bullets text", joined)
         clear = next(params for sql, params in statements if "marketing_bullets = NULL" in sql)
-        self.assertEqual(clear, (2025,))
+        self.assertEqual(clear, (2024,))
         updates = next(
             rows
             for sql, rows in statements
@@ -460,7 +576,7 @@ class SaveTests(unittest.TestCase):
         )
         by_name = {procedure: text for text, report_year, procedure in updates}
         self.assertEqual(set(by_name), {"facelift", "rhinoplasty", "custom procedure"})
-        self.assertTrue(all(report_year == 2025 for _text, report_year, _name in updates))
+        self.assertTrue(all(report_year == 2024 for _text, report_year, _name in updates))
         self.assertIn("Pasadena (90012)", by_name["rhinoplasty"])
         self.assertNotIn("Pasadena", by_name["facelift"])
         self.assertIn("no cash-pay persona list", by_name["custom procedure"])
@@ -468,6 +584,15 @@ class SaveTests(unittest.TestCase):
         self.assertIs(insert[0][-1], moment)
         update_sql = next(sql for sql, rows in statements if isinstance(rows, list) and "marketing_bullets = %s" in sql)
         self.assertNotIn("dataset_updated_at", update_sql)
+        self.assertNotIn("surgeon_fee_low", update_sql)
+        self.assertNotIn("surgeon_fee_high", update_sql)
+        fee_select = next(sql for sql, _params in statements if "SELECT report_year, procedure" in sql)
+        self.assertIn("surgeon_fee_low", fee_select)
+        self.assertIn("surgeon_fee_high", fee_select)
+        for sql, _params in statements:
+            if sql.upper().startswith("UPDATE"):
+                self.assertNotIn("surgeon_fee_low", sql)
+                self.assertNotIn("surgeon_fee_high", sql)
 
     def test_schema_adds_the_rank_table_without_dropping(self):
         schema = rank.schema_sql()
@@ -520,9 +645,12 @@ class MainTests(unittest.TestCase):
     def test_main_exports_fees_after_the_rank_is_saved(self):
         calls = []
 
-        def save_rank(conn, screens, updated_at=None):
+        seen = {}
+
+        def save_rank(conn, screens, updated_at=None, preferred_year=None):
             calls.append("save")
-            return (1, 2025, 2)
+            seen["year"] = preferred_year
+            return (1, preferred_year, 2)
 
         def export_procedure_fees(conn, path=None):
             calls.append("export")
@@ -571,6 +699,7 @@ class MainTests(unittest.TestCase):
                     os.environ[rank.DATABASE_URL_ENV] = previous
         self.assertEqual(code, 0)
         self.assertEqual(calls, ["save", "export"])
+        self.assertEqual(seen["year"], 2024)
         self.assertIn("Wrote 9 rows to procedure_surgeon_fees.csv.", stdout.getvalue())
 
 
