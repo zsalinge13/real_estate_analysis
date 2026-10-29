@@ -1,12 +1,18 @@
 name: Load California ZIP inventory
 
 # Scheduled and manual runs replace public.redfin_real_estate_value with every
-# month in the Realtor history file. A successful Pull Census ZIP population
-# run on main starts the census-year job. That job loads only the Census
-# acs_year, does not delete older months, uploads the join CSV, and then
-# ranks cash-pay ZIPs from that join. That rank writes
-# procedure_surgeon_fees.csv, including marketing_bullets for every report
-# year, and this job uploads it.
+# month in the Realtor history file. A scheduled run uploads only
+# redfin-real-estate-value. A manual run, after that full load succeeds,
+# downloads census-zip-population with actions/download-artifact from the
+# latest successful Pull Census ZIP population run on main, then runs the
+# census-year join and rank. The manual run uploads redfin-real-estate-value,
+# zip-census-redfin-join, cash-pay-zip-rank, and procedure-surgeon-fees.
+# A successful Pull Census ZIP population run on main starts the census-year
+# job. That job loads only the Census acs_year, does not delete older months,
+# uploads the join CSV, and then ranks cash-pay ZIPs from that join. That
+# rank writes procedure_surgeon_fees.csv, including marketing_bullets for
+# every report year, and that job uploads the same four artifacts. An
+# in-progress run is not cancelled. This file does not start another run.
 on:
   schedule:
     # 16:00 UTC on January 1 and July 1 only (every six months).
@@ -67,6 +73,86 @@ jobs:
         with:
           name: redfin-real-estate-value
           path: california_zip_inventory.csv
+          retention-days: 90
+          if-no-files-found: error
+
+  join_rank_manual:
+    name: Join and rank after manual full load
+    needs: load
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.load.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Download the full Redfin inventory from this run
+        uses: actions/download-artifact@v4
+        with:
+          name: redfin-real-estate-value
+          path: .
+      - name: Find the latest successful Pull Census ZIP population run
+        id: census_run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_id="$(gh run list \
+            --workflow pull-census-zip-population.yml \
+            --branch main \
+            --status success \
+            --limit 1 \
+            --json databaseId,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[0].databaseId')"
+          if [[ -z "${run_id}" || "${run_id}" == "null" ]]; then
+            echo "No successful Pull Census ZIP population run on main." >&2
+            exit 1
+          fi
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+          echo "Latest successful Pull Census ZIP population run: ${run_id}"
+      - name: Download Census ZIP population artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: census-zip-population
+          path: census_artifact
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.census_run.outputs.run_id }}
+      - name: Join Census ZIPs to the latest Redfin month
+        if: success()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python join_census_redfin.py census_artifact/census_zip_population.csv california_zip_inventory.csv
+      - name: Upload Census-Redfin join CSV
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zip-census-redfin-join
+          path: zip_census_redfin_join.csv
+          retention-days: 90
+          if-no-files-found: error
+      - name: Rank cash-pay ZIP personas
+        if: success()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python rank_cash_pay_zips.py zip_census_redfin_join.csv
+      - name: Upload cash-pay ZIP rank CSV
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cash-pay-zip-rank
+          path: cash_pay_zip_rank.csv
+          retention-days: 90
+          if-no-files-found: error
+      - name: Upload procedure surgeon fees CSV
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: procedure-surgeon-fees
+          path: procedure_surgeon_fees.csv
           retention-days: 90
           if-no-files-found: error
 
