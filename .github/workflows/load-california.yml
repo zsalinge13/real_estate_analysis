@@ -1,18 +1,19 @@
 name: Load California ZIP inventory
 
 # Scheduled and manual runs replace public.redfin_real_estate_value with every
-# month in the Realtor history file. A scheduled run uploads only
-# redfin-real-estate-value. A manual run, after that full load succeeds,
-# downloads census-zip-population with actions/download-artifact from the
-# latest successful Pull Census ZIP population run on main, then runs the
-# census-year join and rank. The manual run uploads redfin-real-estate-value,
-# zip-census-redfin-join, cash-pay-zip-rank, and procedure-surgeon-fees.
+# month in the Realtor history file. Those runs are not started by Census.
+# After the full load succeeds, they download census-zip-population with
+# actions/download-artifact from the latest successful Pull Census ZIP
+# population run on main, then run the census-year join and rank. Each of
+# those runs uploads redfin-real-estate-value, zip-census-redfin-join,
+# cash-pay-zip-rank, and procedure-surgeon-fees.
 # A successful Pull Census ZIP population run on main starts the census-year
 # job. That job loads only the Census acs_year, does not delete older months,
-# uploads the join CSV, and then ranks cash-pay ZIPs from that join. That
-# rank writes procedure_surgeon_fees.csv, including marketing_bullets for
-# every report year, and that job uploads the same four artifacts. An
-# in-progress run is not cancelled. This file does not start another run.
+# and uses the census-zip-population artifact from the run that started it.
+# It uploads the join CSV, then ranks cash-pay ZIPs from that join. That rank
+# writes procedure_surgeon_fees.csv, including marketing_bullets for every
+# report year, and that job uploads the same four artifacts. An in-progress
+# run is not cancelled. This file does not start another run.
 on:
   schedule:
     # 16:00 UTC on January 1 and July 1 only (every six months).
@@ -76,10 +77,10 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-  join_rank_manual:
-    name: Join and rank after manual full load
+  join_rank_full:
+    name: Join and rank after the full load
     needs: load
-    if: ${{ github.event_name == 'workflow_dispatch' && needs.load.result == 'success' }}
+    if: ${{ github.event_name != 'workflow_run' && needs.load.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:

@@ -264,7 +264,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("name: cash-pay-zip-rank", text)
         self.assertLess(rank_at, text.index("name: cash-pay-zip-rank"))
         jobs = text.split("jobs:", 1)[1]
-        load_job = jobs.split("  join_rank_manual:", 1)[0]
+        load_job = jobs.split("  join_rank_full:", 1)[0]
         census_job = jobs.split("  load_census_year:", 1)[1]
         self.assertNotIn("procedure-surgeon-fees", load_job)
         self.assertNotIn("procedure_surgeon_fees.csv", load_job)
@@ -283,50 +283,52 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("if-no-files-found: error", step)
         self.assertIn("run-id: ${{ github.event.workflow_run.id }}", census_job)
 
-    def test_manual_dispatch_joins_and_ranks_after_the_full_load(self):
+    def test_full_load_joins_and_ranks_from_the_latest_census_artifact(self):
         text = (ROOT / ".github/workflows/load-california.yml").read_text()
+        self.assertIn("schedule:", text)
+        self.assertIn('cron: "0 16 1 1,7 *"', text)
+        self.assertIn("workflow_dispatch:", text)
         jobs = text.split("jobs:", 1)[1]
-        load_job, rest = jobs.split("  join_rank_manual:", 1)
-        manual_job, census_job = rest.split("  load_census_year:", 1)
+        load_job, rest = jobs.split("  join_rank_full:", 1)
+        full_job, census_job = rest.split("  load_census_year:", 1)
         self.assertIn("github.event_name != 'workflow_run'", load_job)
         self.assertIn("name: redfin-real-estate-value", load_job)
         self.assertNotIn("join_census_redfin.py", load_job)
         self.assertNotIn("rank_cash_pay_zips.py", load_job)
-        self.assertIn("needs: load", manual_job)
+        self.assertIn("needs: load", full_job)
         self.assertIn(
-            "github.event_name == 'workflow_dispatch' && needs.load.result == 'success'",
-            manual_job,
+            "github.event_name != 'workflow_run' && needs.load.result == 'success'",
+            full_job,
         )
-        self.assertNotIn("schedule", manual_job)
-        self.assertNotIn("workflow_run", manual_job)
-        self.assertNotIn("load_california.py", manual_job)
-        self.assertNotIn("github.event.workflow_run.id", manual_job)
-        self.assertIn("name: redfin-real-estate-value", manual_job)
-        self.assertIn("pull-census-zip-population.yml", manual_job)
-        self.assertIn("--branch main", manual_job)
-        self.assertIn("--status success", manual_job)
-        self.assertIn("--limit 1", manual_job)
-        self.assertIn("sort_by(.createdAt)", manual_job)
-        self.assertIn("gh run list", manual_job)
-        self.assertIn("actions/download-artifact@v4", manual_job)
-        self.assertIn("name: census-zip-population", manual_job)
-        self.assertIn("run-id: ${{ steps.census_run.outputs.run_id }}", manual_job)
-        join_at = manual_job.index(
+        self.assertNotIn("github.event_name == 'workflow_dispatch'", full_job)
+        self.assertNotIn("load_california.py", full_job)
+        self.assertNotIn("github.event.workflow_run.id", full_job)
+        self.assertIn("name: redfin-real-estate-value", full_job)
+        self.assertIn("pull-census-zip-population.yml", full_job)
+        self.assertIn("--branch main", full_job)
+        self.assertIn("--status success", full_job)
+        self.assertIn("--limit 1", full_job)
+        self.assertIn("sort_by(.createdAt)", full_job)
+        self.assertIn("gh run list", full_job)
+        self.assertIn("actions/download-artifact@v4", full_job)
+        self.assertIn("name: census-zip-population", full_job)
+        self.assertIn("run-id: ${{ steps.census_run.outputs.run_id }}", full_job)
+        join_at = full_job.index(
             "python join_census_redfin.py census_artifact/census_zip_population.csv california_zip_inventory.csv"
         )
-        rank_at = manual_job.index("python rank_cash_pay_zips.py zip_census_redfin_join.csv")
-        join_upload_at = manual_job.index("name: zip-census-redfin-join")
-        rank_upload_at = manual_job.index("name: cash-pay-zip-rank")
-        fees_upload_at = manual_job.index("name: procedure-surgeon-fees")
-        self.assertLess(manual_job.index("name: redfin-real-estate-value"), join_at)
+        rank_at = full_job.index("python rank_cash_pay_zips.py zip_census_redfin_join.csv")
+        join_upload_at = full_job.index("name: zip-census-redfin-join")
+        rank_upload_at = full_job.index("name: cash-pay-zip-rank")
+        fees_upload_at = full_job.index("name: procedure-surgeon-fees")
+        self.assertLess(full_job.index("name: redfin-real-estate-value"), join_at)
         self.assertLess(join_at, join_upload_at)
         self.assertLess(join_upload_at, rank_at)
         self.assertLess(rank_at, rank_upload_at)
         self.assertLess(rank_upload_at, fees_upload_at)
-        self.assertIn("path: zip_census_redfin_join.csv", manual_job)
-        self.assertIn("path: cash_pay_zip_rank.csv", manual_job)
-        self.assertIn("path: procedure_surgeon_fees.csv", manual_job)
-        fees = manual_job[manual_job.rindex("- name: Upload procedure surgeon fees CSV") :]
+        self.assertIn("path: zip_census_redfin_join.csv", full_job)
+        self.assertIn("path: cash_pay_zip_rank.csv", full_job)
+        self.assertIn("path: procedure_surgeon_fees.csv", full_job)
+        fees = full_job[full_job.rindex("- name: Upload procedure surgeon fees CSV") :]
         self.assertLess(fees.index("uses: actions/upload-artifact@v4"), fees.index("name: procedure-surgeon-fees"))
         self.assertIn("path: procedure_surgeon_fees.csv", fees)
         self.assertIn("retention-days: 90", fees)
