@@ -13,6 +13,7 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
+import discretionary
 import pull_census_zip_population as census
 import rank_cash_pay_zips as rank
 
@@ -40,6 +41,9 @@ def join_row(zip_code: str, **overrides) -> dict[str, str]:
         "practice_zip_code": "90210",
         "county": "Los Angeles",
         "distance_from_practice_miles": "8.50",
+        "median_gross_rent": "2000",
+        "median_owner_costs": "",
+        "average_household_size": "2.9",
     }
     row.update({key: "" if value is None else str(value) for key, value in overrides.items()})
     return row
@@ -385,7 +389,10 @@ class BulletTests(unittest.TestCase):
             young[0].insight,
             "Why Pasadena (90012): 40.0% of adults are ages 25 to 44, the highest share in this list. "
             "Median household income is $300 and median listing price per square foot is $640, "
-            "both at or above the median of ZIP codes within 50 miles of the practice. Women are 75.0% of residents.",
+            "both at or above the median of ZIP codes within 50 miles of the practice. "
+            "After an estimated $26 in taxes and $53,014 in essential costs, a typical household headed "
+            "by someone 25–44 here has nothing left of its $300 income for discretionary items. "
+            "Women are 75.0% of residents.",
         )
         self.assertEqual([row.city for row in young], ["pasadena"])
         for row in young + older:
@@ -513,6 +520,9 @@ class BulletTests(unittest.TestCase):
         self.assertNotEqual(bullets["breast augmentation"], bullets["facelift"])
 
 
+LIVING = Decimal(60000)
+
+
 class AffordabilityTests(unittest.TestCase):
     def _screen(self, label: str, incomes: dict[str, int]) -> rank.PersonaRank:
         persona = rank.PERSONA_BY_LABEL[label]
@@ -528,6 +538,8 @@ class AffordabilityTests(unittest.TestCase):
                     "per_capita_income": income,
                     "median_listing_price_per_square_foot": Decimal(700),
                     "female_share": None,
+                    "cost_of_living": LIVING,
+                    **discretionary.household_fields(income, LIVING, persona.householder_band),
                 }
             )
         return rank.PersonaRank(
@@ -539,35 +551,33 @@ class AffordabilityTests(unittest.TestCase):
             passed,
         )
 
-    def test_shares_come_from_the_bls_age_table(self):
-        self.assertEqual(rank.DISCRETIONARY_SOURCE_YEAR, 2025)
-        self.assertIn("bls.gov/cex", rank.DISCRETIONARY_SOURCE_URL)
-        self.assertIn("2025", rank.DISCRETIONARY_SOURCE_URL)
-        rounded = {
-            label: share.quantize(Decimal("0.0001"))
-            for label, share in rank.DISCRETIONARY_SHARE.items()
+    def test_every_persona_uses_its_householder_band_income(self):
+        brackets = {
+            name: "0"
+            for band, _first, _label in census.HOUSEHOLDER_AGE_BANDS
+            for name in census.householder_income_columns(band)
         }
-        self.assertEqual(
-            rounded,
-            {
-                "25–44": Decimal("0.0981"),
-                "45–64": Decimal("0.1084"),
-                "65+": Decimal("0.1239"),
-            },
+        brackets["householder_25_44_households_income_100000_124999"] = "10"
+        brackets["householder_45_64_households_income_150000_199999"] = "10"
+        row = join_row(
+            "90001",
+            population_25_44="40",
+            population_45_64="30",
+            population_65_plus="20",
+            adult_population="100",
+            **brackets,
         )
-        self.assertEqual(
-            rank.DISCRETIONARY_SHARE["65+"], Decimal(8610) / Decimal(69497)
-        )
-        self.assertEqual(rank.PERSONA_BLS_BANDS["25–44"], ("25 to 34", "35 to 44"))
-        self.assertEqual(rank.PERSONA_BLS_BANDS["45–64"], ("45 to 54", "55 to 64"))
-
-    def test_every_persona_uses_median_household_income(self):
-        row = {"median_household_income": 200000, "per_capita_income": 80000}
-        for label in rank.PERSONA_BY_LABEL:
-            self.assertEqual(
-                rank.discretionary_income(row, rank.PERSONA_BY_LABEL[label]),
-                rank.DISCRETIONARY_SHARE[label] * 200000,
-            )
+        found = {
+            label: rank.screen_row(row, persona)["household_income_for_age_range"]
+            for label, persona in rank.PERSONA_BY_LABEL.items()
+        }
+        self.assertEqual(found, {"25–44": 112500, "45–64": 175000, "65+": 200000})
+        top_heavy = [1] * 14 + [2, 100]
+        self.assertEqual(rank.median_from_brackets(top_heavy), Decimal(250001))
+        self.assertEqual(rank.median_from_brackets([0] * 15 + [5]), Decimal(250001))
+        self.assertIsNone(rank.median_from_brackets([0] * 16))
+        self.assertIsNone(rank.median_from_brackets([None] + [1] * 15))
+        self.assertEqual(rank.screen_row(join_row("90002", population_25_44="40"), rank.PERSONAS[0])["household_income_for_age_range"], 200000)
 
     def test_older_affordability_ignores_per_person_income(self):
         screen = self._screen("65+", {"90001": 150000, "90002": 100000})
@@ -577,8 +587,9 @@ class AffordabilityTests(unittest.TestCase):
         self.assertEqual([(row.rank, row.zip_code) for row in kept], [(1, "90001")])
         self.assertIn("per-person income is $40,000, both at or above the median of ZIP codes within 50 miles of the practice.", kept[0].insight)
         self.assertIn(
-            "With median household income of $150,000, about $18,584 a year in discretionary "
-            "spending covers the $15,500 fee.",
+            "After an estimated $21,736 in taxes and $60,000 in essential costs, a typical household "
+            "headed by someone 65 or older here has about $68,264 left of its $150,000 income and "
+            "spends about 33.3% of that, roughly $22,748 a year, on discretionary items.",
             kept[0].insight,
         )
         self.assertTrue(
@@ -595,23 +606,50 @@ class AffordabilityTests(unittest.TestCase):
         self.assertIsNone(rank.fee_midpoint(8000, None))
 
     def test_unaffordable_zip_is_dropped_and_the_rest_re_ranked(self):
-        share = rank.DISCRETIONARY_SHARE["25–44"]
         price = Decimal(10000)
-        just_enough = int((price / share).to_integral_value(rounding="ROUND_CEILING"))
+        just_enough = discretionary.income_needed(price, LIVING, "25_44")
+        self.assertLess(discretionary.discretionary_income(just_enough - 1, LIVING, "25_44"), price)
         screen = self._screen(
             "25–44", {"90001": 50000, "90002": just_enough, "90003": 300000}
         )
         kept = rank.render_screen("tummy tuck", screen, price)
         self.assertEqual([(row.rank, row.zip_code) for row in kept], [(1, "90002"), (2, "90003")])
+        self.assertEqual([row.income_needed for row in kept], [just_enough, just_enough])
         unscreened = rank.render_screen("tummy tuck", screen, None)
         self.assertEqual([row.rank for row in unscreened], [1, 2, 3])
         self.assertIn(
             "Affordability wasn't checked because this procedure has no published surgeon fee.",
             unscreened[0].header,
         )
-        self.assertNotIn("Source:", unscreened[0].header)
+        self.assertNotIn("Sources:", unscreened[0].header)
         self.assertNotIn("fee.", unscreened[0].insight)
+        self.assertIn(
+            "a typical household headed by someone 25–44 here has nothing left of its $50,000 income "
+            "for discretionary items.",
+            unscreened[0].insight,
+        )
         self.assertIn("the 2nd-highest share in this list.", kept[1].insight)
+
+    def test_join_without_housing_costs_is_refused(self):
+        rows = [
+            join_row("90001", population_25_44="40", median_gross_rent="", median_owner_costs=""),
+            join_row("90002", population_25_44="30", median_gross_rent="", median_owner_costs=""),
+        ]
+        with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            rank.rank_personas(rows)
+        self.assertIn("Run Pull Census ZIP population", str(raised.exception))
+        rows[1]["median_gross_rent"] = "2100"
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(len(rank.rank_personas(rows)), len(rank.PERSONAS))
+
+    def test_blank_cost_of_living_never_passes_the_screen(self):
+        screen = self._screen("25–44", {"90001": 300000})
+        screen.passed[0].update(discretionary.household_fields(300000, None, "25_44"), cost_of_living=None)
+        self.assertEqual(rank.render_screen("tummy tuck", screen, Decimal(1000)), [])
+        unscreened = rank.render_screen("tummy tuck", screen, None)[0]
+        self.assertIsNone(unscreened.discretionary_income)
+        self.assertEqual(unscreened.household_income_for_age_range, 300000)
+        self.assertNotIn("After an estimated", unscreened.insight)
 
     def test_dropped_zips_are_backfilled_past_the_top_25(self):
         incomes = {f"9{index:04d}": 50000 for index in range(rank.TOP_N)}
@@ -622,8 +660,8 @@ class AffordabilityTests(unittest.TestCase):
         self.assertEqual([row.zip_code for row in kept], ["91111", "92222"])
 
     def test_rankings_differ_by_procedure_price(self):
-        screen = self._screen("45–64", {"90001": 60000, "90002": 200000})
-        older = self._screen("65+", {"90001": 60000, "90002": 200000})
+        screen = self._screen("45–64", {"90001": 100000, "90002": 250000})
+        older = self._screen("65+", {"90001": 100000, "90002": 250000})
         screens = [screen, older]
         bullets = rank.bullets_by_procedure(
             ["forehead lift", "facelift"],
@@ -640,16 +678,35 @@ class AffordabilityTests(unittest.TestCase):
         screen = self._screen("25–44", {"90001": 200000})
         row = rank.render_screen("tummy tuck", screen, Decimal(10750))[0]
         self.assertIn(
-            "and a typical household's discretionary spending of about 9.8% of household income "
-            "covers the $10,750 midpoint surgeon fee.",
+            "After estimated taxes, housing, and other essential costs, a typical household headed "
+            "by someone 25–44 in each ZIP code has enough left for discretionary spending to cover "
+            "the $10,750 midpoint surgeon fee.",
             row.header,
         )
-        self.assertTrue(row.header.endswith(" Source: BLS Consumer Expenditure Surveys, 2025."))
-        self.assertIn("About $19,618 a year in discretionary spending covers the $10,750 fee.", row.insight)
+        self.assertTrue(
+            row.header.endswith(
+                " Sources: 2024 federal and California tax rules, ACS housing costs, and the BLS "
+                "Consumer Expenditure Surveys."
+            )
+        )
+        self.assertIn(
+            "After an estimated $55,538 in taxes and $60,000 in essential costs, a typical household "
+            "headed by someone 25–44 here has about $84,462 left of its $200,000 income and spends "
+            "about 17.5% of that, roughly $14,797 a year, on discretionary items.",
+            row.insight,
+        )
+        self.assertEqual(
+            (row.estimated_taxes, row.average_cost_of_living, row.money_left_after_essentials),
+            (55538, 60000, 84462),
+        )
+        self.assertEqual(
+            (row.income_bracket, row.discretionary_share_of_remaining, row.discretionary_income),
+            ("$200,000 and more", Decimal("17.5"), 14797),
+        )
         older = self._screen("65+", {"90001": 100000})
         older_row = rank.render_screen("facelift", older, Decimal(5750))[0]
-        self.assertIn("12.4% of household income", older_row.header)
-        self.assertNotIn("of per-person income", older_row.header)
+        self.assertIn("headed by someone 65 or older in each ZIP code", older_row.header)
+        self.assertNotIn("per-person income", older_row.header.split("Why: ")[1].split(". ", 1)[1])
 
     def test_a_group_with_no_affordable_zip_adds_no_rows(self):
         screen = self._screen("65+", {"90001": 40000})
@@ -661,7 +718,7 @@ class AffordabilityTests(unittest.TestCase):
                 join_row(
                     "90012",
                     zip_name="pasadena, ca",
-                    median_household_income="20000",
+                    median_household_income="100000",
                     population_25_44="40",
                     adult_population="100",
                 )
@@ -724,6 +781,14 @@ def profile_columns(**overrides) -> dict[str, str]:
     return values
 
 
+# Households in the open $200,000-and-over bracket for every householder band,
+# so each band's median household income is about $232,000.
+RICH_BANDS = {
+    f"householder_{band}_households_income_200000_plus": "1600"
+    for band, _first, _label in census.HOUSEHOLDER_AGE_BANDS
+}
+
+
 class ProfileTests(unittest.TestCase):
     def setUp(self):
         self.row = join_row(
@@ -733,8 +798,9 @@ class ProfileTests(unittest.TestCase):
             population_25_44="40",
             population_65_plus="20",
             adult_population="100",
-            **profile_columns(),
+            **profile_columns(**RICH_BANDS),
         )
+        self.living = discretionary.cost_of_living(2000, None, Decimal("0.621"), Decimal("2.9"))
 
     def profile(self, **overrides):
         return {name: rank.as_int(value, name) for name, value in profile_columns(**overrides).items()}
@@ -744,13 +810,18 @@ class ProfileTests(unittest.TestCase):
         price = Decimal(20000)
         for label, band in (("25–44", "25_44"), ("45–64", "45_64"), ("65+", "65_plus")):
             band_persona = rank.PERSONA_BY_LABEL[label]
-            base = rank.zip_metrics({"profile": self.profile()}, band_persona, price)
+            base = rank.zip_metrics({"profile": self.profile(), "cost_of_living": LIVING}, band_persona, price)
             all_households = rank.zip_metrics(
-                {"profile": self.profile(households_income_200000_plus="5000")}, band_persona, price
+                {"profile": self.profile(households_income_200000_plus="5000"), "cost_of_living": LIVING},
+                band_persona,
+                price,
             )
             self.assertEqual(base["affordable_households"], all_households["affordable_households"])
             richer = rank.zip_metrics(
-                {"profile": self.profile(**{f"householder_{band}_households_income_200000_plus": "5000"})},
+                {
+                    "profile": self.profile(**{f"householder_{band}_households_income_200000_plus": "5000"}),
+                    "cost_of_living": LIVING,
+                },
                 band_persona,
                 price,
             )
@@ -790,20 +861,27 @@ class ProfileTests(unittest.TestCase):
         none_on_top = self.profile(households_income_200000_plus="0")
         self.assertEqual(rank.households_at_or_above(none_on_top, Decimal(250000)), Decimal(0))
 
-    def test_income_needed_is_the_fee_over_the_persona_share(self):
+    def test_income_needed_uses_the_zip_cost_of_living(self):
         persona = rank.PERSONA_BY_LABEL["25–44"]
-        share = rank.DISCRETIONARY_SHARE["25–44"]
-        expected = int((Decimal(8250) / share).quantize(Decimal(1), rounding="ROUND_HALF_UP"))
-        self.assertEqual(rank.income_needed(Decimal(8250), persona), expected)
+        cheap = rank.income_needed({"cost_of_living": Decimal(40000)}, Decimal(8250), persona)
+        dear = rank.income_needed({"cost_of_living": LIVING}, Decimal(8250), persona)
+        self.assertEqual(dear, discretionary.income_needed(Decimal(8250), LIVING, "25_44"))
+        self.assertLess(cheap, dear)
+        self.assertIsNone(rank.income_needed({"cost_of_living": None}, Decimal(8250), persona))
 
     def test_row_metrics_and_insight_sentences(self):
         screens = rank.rank_personas([self.row])
         row = rank.bullet_rows("tummy tuck", screens, Decimal(10750))[0]
-        needed = rank.income_needed(Decimal(10750), rank.PERSONA_BY_LABEL["25–44"])
-        affordable = rank.households_at_or_above(self.profile(), Decimal(needed))
+        needed = discretionary.income_needed(Decimal(10750), self.living, "25_44")
+        affordable = rank.households_at_or_above(
+            self.profile(**RICH_BANDS), Decimal(needed), census.householder_income_columns("25_44")
+        )
         self.assertEqual(row.income_needed, needed)
         self.assertEqual(row.affordable_households, int(affordable.quantize(Decimal(1), rounding="ROUND_HALF_UP")))
-        self.assertEqual(row.affordable_households_share, rank.percent_points(affordable / Decimal(1600)))
+        self.assertEqual(row.affordable_households_share, rank.percent_points(affordable / Decimal(3100)))
+        self.assertEqual(row.average_cost_of_living, discretionary.whole_dollars(self.living))
+        self.assertGreater(row.household_income_for_age_range, 200000)
+        self.assertLess(row.household_income_for_age_range, 300000)
         self.assertEqual((row.women_in_age_range, row.men_in_age_range), (52, 48))
         self.assertEqual(row.women_share_of_age_range, Decimal("52.0"))
         self.assertEqual((row.home_ownership, row.owner_occupied_share), ("own", Decimal("62.1")))
@@ -868,7 +946,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual((item.home_ownership, item.owner_occupied_share), ("rent", Decimal("40.0")))
         self.assertIn("Here, 60.0% of households rent their home, and ", item.insight)
 
-    def test_profile_never_changes_a_rank(self):
+    def test_profile_never_changes_the_persona_rank(self):
         rows = []
         for index, share in enumerate(("40", "35", "30")):
             rows.append(
@@ -882,14 +960,13 @@ class ProfileTests(unittest.TestCase):
             )
         counted = set(census.PROFILE_COLUMNS + census.HOUSEHOLDER_AGE_COLUMNS) - set(census.AGE_BAND_GROUPS)
         plain = [{key: value for key, value in row.items() if key not in counted} for row in rows]
-        for procedure in rank.PROCEDURE_PERSONAS:
-            with_profile = rank.bullet_rows(procedure, rank.rank_personas(rows), Decimal(9000))
-            without = rank.bullet_rows(procedure, rank.rank_personas(plain), Decimal(9000))
+        for label in rank.PERSONA_BY_LABEL:
             self.assertEqual(
-                [(item.age_range, item.rank, item.zip_code) for item in with_profile],
-                [(item.age_range, item.rank, item.zip_code) for item in without],
+                [row["zip"] for row in persona(rank.rank_personas(rows), label).rows],
+                [row["zip"] for row in persona(rank.rank_personas(plain), label).rows],
             )
-            self.assertTrue(all(item.affordable_households is None for item in without))
+        screened = rank.bullet_rows("rhinoplasty", rank.rank_personas(rows), Decimal(8000))
+        self.assertEqual([item.zip_code for item in screened], ["90002"])
 
 
 class MeasureColumnTests(unittest.TestCase):
@@ -940,7 +1017,7 @@ class MeasureColumnTests(unittest.TestCase):
                 row.insight,
             )
             self.assertIn(
-                " Race, ethnicity and education describe these ZIP codes and are not used to rank them. Source: ",
+                " Race, ethnicity and education describe these ZIP codes and are not used to rank them. Sources: ",
                 row.header,
             )
             self.assertIn("median listing price per square foot is $858", row.insight.lower())
@@ -1043,6 +1120,13 @@ class MeasureColumnTests(unittest.TestCase):
                 "women_in_age_range",
                 "men_in_age_range",
                 "women_share_of_age_range",
+                "household_income_for_age_range",
+                "estimated_taxes",
+                "average_cost_of_living",
+                "money_left_after_essentials",
+                "income_bracket",
+                "discretionary_share_of_remaining",
+                "discretionary_income",
                 "income_needed",
                 "affordable_households_share",
                 "affordable_households",
@@ -1451,7 +1535,10 @@ class MainTests(unittest.TestCase):
             source = Path(tmp) / "zip_census_redfin_join.csv"
             output = Path(tmp) / "cash_pay_zip_rank.csv"
             with source.open("w", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=list(rank.JOIN_FIELDS), lineterminator="\n")
+                writer = csv.DictWriter(
+                    handle, fieldnames=list(rank.JOIN_FIELDS) + list(census.HOUSING_COST_COLUMNS),
+                    lineterminator="\n", extrasaction="ignore"
+                )
                 writer.writeheader()
                 writer.writerow(
                     join_row(
@@ -1483,6 +1570,12 @@ class MainTests(unittest.TestCase):
         self.assertEqual(rows[0]["persona"], "25–44")
         self.assertEqual(rows[0]["rank"], "1")
         self.assertEqual(rows[0]["zip_name"], "Pasadena")
+        self.assertEqual(list(rank.RANK_COLUMNS[-7:]), list(discretionary.FIELD_TYPES))
+        self.assertEqual(rows[0]["household_income_for_age_range"], "200000")
+        self.assertEqual(rows[0]["average_cost_of_living"], "53014")
+        self.assertEqual(rows[0]["income_bracket"], "$200,000 and more")
+        self.assertEqual(rows[0]["discretionary_share_of_remaining"], "17.5")
+        self.assertTrue(int(rows[0]["discretionary_income"]) > 0)
 
     def test_main_exports_fees_after_the_rank_is_saved(self):
         calls = []
@@ -1510,7 +1603,10 @@ class MainTests(unittest.TestCase):
             output = Path(tmp) / "cash_pay_zip_rank.csv"
             with source.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(
-                    handle, fieldnames=list(rank.JOIN_FIELDS), lineterminator="\n"
+                    handle,
+                    fieldnames=list(rank.JOIN_FIELDS) + list(census.HOUSING_COST_COLUMNS),
+                    lineterminator="\n",
+                    extrasaction="ignore",
                 )
                 writer.writeheader()
                 writer.writerow(

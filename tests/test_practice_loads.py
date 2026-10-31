@@ -410,8 +410,9 @@ class CensusTests(unittest.TestCase):
         race = tuple(range(1, len(census.RACE_EDUCATION_COLUMNS) + 1))
         profile = tuple(range(100, 100 + len(census.PROFILE_COLUMNS)))
         householder = tuple(range(1000, 1000 + len(census.HOUSEHOLDER_AGE_COLUMNS)))
-        stored = (2024, "90001") + base + race + profile + householder
-        already_filled = (2024, "90002") + base + race + profile + householder
+        housing = (2400, 3100, Decimal("2.85"))
+        stored = (2024, "90001") + base + race + profile + householder + housing
+        already_filled = (2024, "90002") + base + race + profile + householder + housing
         blank = (2024, "90003") + base + (None,) * len(census.ADDED_COLUMNS)
         conn = Connection()
         inserted, filled, total = census.insert_new_years(
@@ -421,10 +422,13 @@ class CensusTests(unittest.TestCase):
         self.assertEqual(conn.cursor_obj.inserted, [blank + (stamp,)])
         updates = [(sql, params) for sql, params in conn.cursor_obj.statements if sql.startswith("UPDATE")]
         self.assertEqual(updates[0][1], race + (stamp, 2024, "90001"))
-        self.assertEqual(len(updates), 6)
+        self.assertEqual(len(updates), 8)
         self.assertEqual(updates[1][1], race + (stamp, 2024, "90002"))
         self.assertEqual(updates[2][1], profile + (stamp, 2024, "90001"))
         self.assertEqual(updates[4][1], householder + (stamp, 2024, "90001"))
+        self.assertEqual(updates[6][1], housing + (stamp, 2024, "90001"))
+        for name in census.HOUSING_COST_COLUMNS:
+            self.assertIn(f"{name} IS NULL", updates[6][0])
         for name in census.HOUSEHOLDER_AGE_COLUMNS:
             self.assertIn(f"{name} IS NULL", updates[4][0])
             self.assertNotIn(f"{name} IS NULL", updates[2][0])
@@ -438,6 +442,8 @@ class CensusTests(unittest.TestCase):
             self.assertNotIn(f"{name} =", sql)
         added_sql = " ".join(text for text, _params in conn.cursor_obj.statements)
         self.assertIn("ADD COLUMN IF NOT EXISTS education_bachelors integer", added_sql)
+        self.assertIn("ADD COLUMN IF NOT EXISTS median_gross_rent integer", added_sql)
+        self.assertIn("ADD COLUMN IF NOT EXISTS average_household_size numeric", added_sql)
         self.assertNotIn("delete", added_sql.lower())
 
     def test_profile_set_fills_rows_that_already_have_race_and_education(self):
@@ -494,7 +500,7 @@ class CensusTests(unittest.TestCase):
         conn = Connection()
         stamp = datetime(2026, 10, 31, 17, 0, tzinfo=timezone.utc)
         self.assertEqual(census.insert_new_years(conn, [row], stamp), (0, 1, 1))
-        self.assertEqual(len(conn.cursor_obj.updates), 3)
+        self.assertEqual(len(conn.cursor_obj.updates), 4)
 
     def test_profile_groups_sum_their_codes(self):
         estimates = {code: Decimal(1) for _name, codes in census.field_groups() for code in codes}
@@ -518,7 +524,10 @@ class CensusTests(unittest.TestCase):
         self.assertTrue(all(len(codes) <= 50 for _name, codes in census.field_groups()))
         self.assertEqual(
             census.ADDED_COLUMNS,
-            census.RACE_EDUCATION_COLUMNS + census.PROFILE_COLUMNS + census.HOUSEHOLDER_AGE_COLUMNS,
+            census.RACE_EDUCATION_COLUMNS
+            + census.PROFILE_COLUMNS
+            + census.HOUSEHOLDER_AGE_COLUMNS
+            + census.HOUSING_COST_COLUMNS,
         )
         self.assertEqual(row["population_25_44"], 8)
         self.assertEqual(row["population_45_64"], 10)
@@ -559,10 +568,11 @@ class CensusTests(unittest.TestCase):
         self.assertIsNone(partial["non_hispanic_other_or_multiracial_population"])
         self.assertEqual(partial["education_high_school"], 2)
         self.assertEqual(census.COLUMNS[: len(census.BASE_COLUMNS)], census.BASE_COLUMNS)
-        self.assertTrue(set(census.ADDED_COLUMNS) <= census.INTEGER_COLUMNS)
+        self.assertEqual(set(census.ADDED_COLUMNS) - census.INTEGER_COLUMNS, {"average_household_size"})
         schema = census.schema_sql()
         for name in census.ADDED_COLUMNS:
-            self.assertIn(f"{name} integer,", schema)
+            expected = "numeric" if name == "average_household_size" else "integer"
+            self.assertIn(f"{name} {expected},", schema)
 
     def test_age_bands_sum_adults_and_drop_sentinels(self):
         self.assertIsNone(census.parse_estimate("-666666666"))
@@ -993,8 +1003,10 @@ class CensusTests(unittest.TestCase):
                 "tenure",
                 "occupation",
                 "householder_income",
+                "housing_costs",
             ],
         )
+        self.assertEqual(groups["housing_costs"], ("B25064_001E", "B25088_001E", "B25010_001E"))
         self.assertEqual(len(groups["householder_income"]), 48)
         self.assertEqual(groups["householder_income"][0], "B19037_020E")
         self.assertEqual(groups["householder_income"][-1], "B19037_069E")

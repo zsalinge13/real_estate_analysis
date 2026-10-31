@@ -18,9 +18,10 @@ office, dermatology, or NPI locations.
 A run fetches only the latest published ACS 5-year vintage. Income, age,
 sex, age bands, race and ethnicity (B03002), education (B15003), household
 income brackets (B19001), household income by age of householder (B19037),
-mothers and births (B23003 and B13016), tenure (B25003 and B25007), and
-occupation (C24010) are separate requests, about 10 ZIP codes at a time,
-one county at a time. Sex by age reuses the B01001 age-band codes. The
+mothers and births (B23003 and B13016), tenure (B25003 and B25007),
+occupation (C24010), and housing costs (median gross rent B25064, median
+owner costs B25088, and average household size B25010) are separate
+requests, about 10 ZIP codes at a time, one county at a time. Sex by age reuses the B01001 age-band codes. The
 householder-age bands 25–44, 45–64, and 65+ come from B01001 (people),
 B25007 (owners), and B19037 (household income brackets).
 The script waits a couple of seconds between calls. A failure retries that
@@ -393,9 +394,29 @@ HOUSEHOLDER_AGE_COLUMNS = (
     + tuple(TENURE_BY_HOUSEHOLDER_AGE_GROUPS)
     + tuple(HOUSEHOLDER_INCOME_GROUPS)
 )
+# Single ACS values, not sums of counts: (column, variable, label after
+# "Estimate!!"). Average household size has decimals, so it is numeric.
+HOUSING_COST_MEASURES = (
+    ("median_gross_rent", "B25064_001E", "Median gross rent"),
+    (
+        "median_owner_costs",
+        "B25088_001E",
+        "Median selected monthly owner costs (dollars) --!!Total:",
+    ),
+    ("average_household_size", "B25010_001E", "Average household size --!!Total:"),
+)
+HOUSING_COST_COLUMNS = tuple(column for column, _code, _label in HOUSING_COST_MEASURES)
+NUMERIC_ADDED_COLUMNS = frozenset({"average_household_size"})
 # Each set is filled on a stored ZIP only when every column in that set is blank.
-BACKFILL_SETS = (RACE_EDUCATION_COLUMNS, PROFILE_COLUMNS, HOUSEHOLDER_AGE_COLUMNS)
-ADDED_COLUMNS = RACE_EDUCATION_COLUMNS + PROFILE_COLUMNS + HOUSEHOLDER_AGE_COLUMNS
+BACKFILL_SETS = (
+    RACE_EDUCATION_COLUMNS,
+    PROFILE_COLUMNS,
+    HOUSEHOLDER_AGE_COLUMNS,
+    HOUSING_COST_COLUMNS,
+)
+ADDED_COLUMNS = (
+    RACE_EDUCATION_COLUMNS + PROFILE_COLUMNS + HOUSEHOLDER_AGE_COLUMNS + HOUSING_COST_COLUMNS
+)
 BASE_COLUMNS = COLUMNS
 COLUMNS = BASE_COLUMNS + ADDED_COLUMNS
 INTEGER_COLUMNS = {
@@ -410,7 +431,7 @@ INTEGER_COLUMNS = {
     "population_45_54",
     "population_55_64",
     "population_65_plus",
-    *ADDED_COLUMNS,
+    *(column for column in ADDED_COLUMNS if column not in NUMERIC_ADDED_COLUMNS),
 }
 SEX_TOTALS = {
     "male_population": ("B01001_002E", "Estimate!!Total:!!Male:"),
@@ -477,7 +498,9 @@ def field_groups() -> tuple[tuple[str, tuple[str, ...]], ...]:
             ),
         ),
         ("age_bands", tuple(band_variables)),
-    ) + request_groups()
+    ) + request_groups() + (
+        ("housing_costs", tuple(code for _column, code, _label in HOUSING_COST_MEASURES)),
+    )
     for name, variables in groups:
         if not variables or len(variables) > 50:
             raise SystemExit(f"The ACS {name} request has more than 50 variables.")
@@ -935,6 +958,9 @@ def verify_labels(year: int) -> None:
                 expected = f"Estimate!!Total:!!{phrase}" if phrase else "Estimate!!Total:"
                 if table_labels.get(code) != expected:
                     raise SystemExit(f"ACS {year} changed the {table} {column} label.")
+    for column, code, label in HOUSING_COST_MEASURES:
+        if variable_label(year, code) != f"Estimate!!{label}":
+            raise SystemExit(f"ACS {year} changed the {column} label.")
     income = variable_label(year, MEASURES["median_household_income"]).lower()
     per_capita = variable_label(year, MEASURES["per_capita_income"]).lower()
     age = variable_label(year, MEASURES["median_age"]).lower()
@@ -998,6 +1024,9 @@ def row_from_estimates(year: int, zip_code: str, estimates: dict[str, Decimal | 
     counted[POPULATION_25_PLUS] = sum_counts(
         [counted[column] for column in EDUCATION_GROUPS]
     )
+    for column, code, _label in HOUSING_COST_MEASURES:
+        value = estimates.get(code)
+        counted[column] = value if column in NUMERIC_ADDED_COLUMNS else as_int(value, column)
     income = as_int(estimates.get(MEASURES["median_household_income"]), "income")
     per_capita = as_int(estimates.get(MEASURES["per_capita_income"]), "per capita income")
     age = estimates.get(MEASURES["median_age"])
@@ -1285,8 +1314,12 @@ def connect():
     )
 
 
+def added_column_type(name: str) -> str:
+    return "numeric" if name in NUMERIC_ADDED_COLUMNS else "integer"
+
+
 def added_columns_sql() -> str:
-    return "\n".join(f"    {name} integer," for name in ADDED_COLUMNS)
+    return "\n".join(f"    {name} {added_column_type(name)}," for name in ADDED_COLUMNS)
 
 
 def schema_sql() -> str:
@@ -1370,7 +1403,9 @@ def insert_new_years(
                 f"{dataset_stamp.COLUMN} {dataset_stamp.SQL_TYPE}"
             )
             for name in ADDED_COLUMNS:
-                cur.execute(f"ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS {name} integer")
+                cur.execute(
+                    f"ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS {name} {added_column_type(name)}"
+                )
             years = sorted({int(row[0]) for row in rows})
             already = stored_pairs(cur, years)
             pending = [

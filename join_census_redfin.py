@@ -56,7 +56,7 @@ INTEGER_JOIN_COLUMNS = {
     "population_45_54",
     "population_55_64",
     "population_65_plus",
-    *census.ADDED_COLUMNS,
+    *(name for name in census.ADDED_COLUMNS if name not in census.NUMERIC_ADDED_COLUMNS),
     "active_listing_count",
 }
 TEXT_JOIN_COLUMNS = {
