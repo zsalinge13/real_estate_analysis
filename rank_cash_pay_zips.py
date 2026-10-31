@@ -21,7 +21,9 @@ The stored form is one entry per ranked ZIP, in persona-list order:
 marketing_bullets has one line per ZIP holding that ZIP's age-group header
 sentence, and rank, city, state, zip_code, insight, household_income,
 individual_income (ACS per-capita income),
-median_listing_price_per_square_foot, age_range, and sex are same-order lists.
+median_listing_price_per_square_foot, age_range, sex, and the descriptive
+columns after it are same-order lists. Those descriptive columns, including
+the households that can afford the fee, never change a screen or a rank.
 A group with no ranked ZIP adds no entry.
 After that write succeeds, the same run exports every column of
 procedure_surgeon_fees for the chosen report year and every other report
@@ -42,6 +44,7 @@ from pathlib import Path
 
 import dataset_stamp
 import load_california
+import pull_census_zip_population as census
 import pull_procedure_surgeon_fees as procedures
 
 RANK_TABLE_NAME = "cash_pay_zip_rank"
@@ -69,8 +72,23 @@ BULLET_LIST_COLUMNS = (
     ("sex", "text[]"),
     ("race_and_ethnicity", "text[]"),
     ("education_level", "text[]"),
+    ("women_in_age_range", "integer[]"),
+    ("men_in_age_range", "integer[]"),
+    ("women_share_of_age_range", "numeric[]"),
+    ("income_needed", "integer[]"),
+    ("affordable_households_share", "numeric[]"),
+    ("affordable_households", "integer[]"),
+    ("mothers_with_children_under_18", "integer[]"),
+    ("mothers_with_children_under_6", "integer[]"),
+    ("recent_births", "integer[]"),
+    ("home_ownership", "text[]"),
+    ("owner_occupied_share", "numeric[]"),
+    ("owner_occupied_share_age_range", "numeric[]"),
+    ("women_management_professional_share", "numeric[]"),
+    ("women_arts_entertainment_media_share", "numeric[]"),
 )
 BULLET_LIST_NAMES = tuple(name for name, _sql_type in BULLET_LIST_COLUMNS)
+DESCRIPTIVE_LIST_NAMES = BULLET_LIST_NAMES[BULLET_LIST_NAMES.index("women_in_age_range") :]
 BULLET_CSV_COLUMNS = ("marketing_bullets",) + BULLET_LIST_NAMES
 
 # Equal age shares are the close case. The higher cash signal ranks first.
@@ -177,6 +195,16 @@ EDUCATION_LABELS = {
     "education_graduate_or_professional": "Graduate or professional degree",
 }
 BACHELORS_OR_HIGHER = ("education_bachelors", "education_graduate_or_professional")
+# B25007 householder bands closest to each persona band.
+PERSONA_TENURE_BAND = {
+    "18 to 34": "15_34",
+    "35 to 44": "35_44",
+    "45 to 54": "45_54",
+    "55 and older": "55_plus",
+}
+MOTHER_PROCEDURES = frozenset(
+    {"tummy tuck", "breast lift", "breast augmentation", "breast reduction", "liposuction"}
+)
 
 RANK_COLUMNS = (
     "persona",
@@ -475,6 +503,7 @@ def screen_row(row: dict[str, str], persona: Persona) -> dict | None:
         "month_date_yyyymm": month,
         "date_pulled_yyyymmdd": pulled,
         **describe_zip(row),
+        "profile": {name: as_int(row.get(name), name) for name in census.PROFILE_COLUMNS},
     }
 
 
@@ -582,6 +611,20 @@ class BulletRow:
     sex: str | None = None
     race_and_ethnicity: str | None = None
     education_level: str | None = None
+    women_in_age_range: int | None = None
+    men_in_age_range: int | None = None
+    women_share_of_age_range: Decimal | None = None
+    income_needed: int | None = None
+    affordable_households_share: Decimal | None = None
+    affordable_households: int | None = None
+    mothers_with_children_under_18: int | None = None
+    mothers_with_children_under_6: int | None = None
+    recent_births: int | None = None
+    home_ownership: str | None = None
+    owner_occupied_share: Decimal | None = None
+    owner_occupied_share_age_range: Decimal | None = None
+    women_management_professional_share: Decimal | None = None
+    women_arts_entertainment_media_share: Decimal | None = None
 
 
 def split_place(row: dict) -> tuple[str, str]:
@@ -657,14 +700,21 @@ def screen_header(procedure: str, screen: PersonaRank, price: Decimal | None = N
 
 
 def zip_insight(
-    screen: PersonaRank, row: dict, position: int, price: Decimal | None = None
+    screen: PersonaRank,
+    row: dict,
+    position: int,
+    price: Decimal | None = None,
+    metrics: dict | None = None,
+    procedure: str = "",
 ) -> str:
+    metrics = metrics if metrics is not None else zip_metrics(row, screen.persona, price)
     city, _ = split_place(row)
     place = f"{display_city(city)} ({row['zip']})" if city else f"ZIP code {row['zip']}"
     standing = "the highest" if position == 1 else f"the {ordinal(position)}-highest"
+    group = screen.persona.age_phrase
     sentences = [
         f"Why {place}: {format_percent(row['age_share'])} of adults are "
-        f"{screen.persona.age_phrase}, {standing} share in this list."
+        f"{group}, {standing} share in this list."
     ]
     household = format_money(Decimal(row["median_household_income"]))
     listing = format_money(row["median_listing_price_per_square_foot"])
@@ -689,12 +739,164 @@ def zip_insight(
                 f"With median household income of {household}, about {spending} a year in "
                 f"discretionary spending covers the {format_money(price)} fee."
             )
-    if row.get("female_share") is not None:
-        sentences.append(f"Women are {format_percent(row['female_share'])} of residents.")
+        if metrics["affordable_households"] is not None:
+            count = metrics["affordable_households"]
+            noun = "household" if count == 1 else "households"
+            sentences.append(
+                f"About {metrics['affordable_households_share']}% of households here "
+                f"({count:,} {noun}) earn at least {format_money(metrics['income_needed'])}, "
+                f"enough to cover the {format_money(price)} fee."
+            )
+    residents = row.get("female_share")
+    in_band = metrics["women_share_of_age_range"]
+    if residents is not None and in_band is not None:
+        sentences.append(
+            f"Women are {format_percent(residents)} of residents and {in_band}% of adults {group}."
+        )
+    elif residents is not None:
+        sentences.append(f"Women are {format_percent(residents)} of residents.")
+    elif in_band is not None:
+        sentences.append(f"Women are {in_band}% of adults {group}.")
     described = describe_sentence(row)
     if described:
         sentences.append(described)
+    housing = housing_work_sentence(metrics)
+    if housing:
+        sentences.append(housing)
+    if procedure in MOTHER_PROCEDURES and metrics["mothers_with_children_under_18"] is not None:
+        mothers = f"About {metrics['mothers_with_children_under_18']:,} women ages 20 to 64 here are raising children under 18"
+        if metrics["mothers_with_children_under_6"] is not None:
+            mothers += f", including {metrics['mothers_with_children_under_6']:,} with a child under 6"
+        sentences.append(mothers + ".")
     return " ".join(sentences)
+
+
+def housing_work_sentence(metrics: dict) -> str:
+    """Home ownership and women's management and professional jobs. Nothing when both are blank."""
+    clauses = []
+    if metrics["home_ownership"] == "own":
+        clauses.append(f"{metrics['owner_occupied_share']}% of households own their home")
+    elif metrics["home_ownership"] == "rent":
+        clauses.append(f"{metrics['renter_occupied_share']}% of households rent their home")
+    if metrics["women_management_professional_share"] is not None:
+        clauses.append(
+            f"{metrics['women_management_professional_share']}% of employed women work in "
+            "management, business, science, or arts jobs"
+        )
+    if not clauses:
+        return ""
+    return "Here, " + ", and ".join(clauses) + "."
+
+
+def count_sum(profile: dict, columns: list[str]) -> int | None:
+    values = [profile.get(column) for column in columns]
+    if any(value is None for value in values):
+        return None
+    return sum(values)
+
+
+def percent_of(part: int | Decimal | None, total: int | Decimal | None) -> Decimal | None:
+    """Percentage points to one decimal, the number the text shows. Blank without a positive total."""
+    if part is None or total is None or total <= 0:
+        return None
+    return percent_points(Decimal(part) / Decimal(total))
+
+
+def income_needed(price: Decimal, persona: Persona) -> int:
+    """Household income whose discretionary share covers the fee, in whole dollars."""
+    return int((price / DISCRETIONARY_SHARE[persona.label]).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+
+
+def households_at_or_above(profile: dict, threshold: Decimal) -> Decimal | None:
+    """Estimated households with income at or above the threshold, from B19001 brackets.
+
+    Inside a closed bracket the households are spread evenly, so the part at
+    or above the threshold is linear. At or above $200,000 the open bracket
+    uses a Pareto tail fitted to the $150,000 and $200,000 bounds.
+    """
+    counts = [profile.get(column) for column, _code, _phrase, _low in census.HOUSEHOLD_INCOME_BRACKETS]
+    if any(count is None for count in counts):
+        return None
+    lows = [Decimal(low) for _column, _code, _phrase, low in census.HOUSEHOLD_INCOME_BRACKETS]
+    if threshold <= 0:
+        return Decimal(sum(counts))
+    if threshold >= lows[-1]:
+        return pareto_tail(counts[-2] + counts[-1], counts[-1], lows[-2], lows[-1], threshold)
+    for index in range(len(lows) - 1):
+        low, high = lows[index], lows[index + 1]
+        if low <= threshold < high:
+            inside = Decimal(counts[index]) * (high - threshold) / (high - low)
+            return Decimal(sum(counts[index + 1 :])) + inside
+    raise SystemExit("The household income brackets do not cover the threshold.")
+
+
+def pareto_tail(
+    at_or_above_lower: int, at_or_above_top: int, lower: Decimal, top: Decimal, threshold: Decimal
+) -> Decimal | None:
+    """Pareto estimate of households at or above a threshold in the open top bracket.
+
+    The shape comes from the households at or above the two bounds. It is
+    blank when no household falls between those bounds, because the tail
+    cannot be fitted.
+    """
+    if at_or_above_top == 0:
+        return Decimal(0)
+    if at_or_above_lower <= at_or_above_top:
+        return None
+    alpha = (Decimal(at_or_above_lower) / Decimal(at_or_above_top)).ln() / (top / lower).ln()
+    return Decimal(at_or_above_top) * (top / threshold) ** alpha
+
+
+def zip_metrics(row: dict, persona: Persona, price: Decimal | None) -> dict:
+    """Descriptive values for one ZIP row. None of them changes a screen or a rank."""
+    profile = row.get("profile") or {}
+    women = count_sum(profile, [f"female_{column}" for column in persona.age_columns])
+    men = count_sum(profile, [f"male_{column}" for column in persona.age_columns])
+    owners = profile.get("owner_occupied_households")
+    renters = profile.get("renter_occupied_households")
+    occupied = None if owners is None or renters is None else owners + renters
+    owner_share = percent_of(owners, occupied)
+    band = PERSONA_TENURE_BAND[persona.label]
+    band_owners = profile.get(f"owner_occupied_householder_{band}")
+    band_renters = profile.get(f"renter_occupied_householder_{band}")
+    band_total = None if band_owners is None or band_renters is None else band_owners + band_renters
+    employed = profile.get("employed_women")
+    metrics = {
+        "women_in_age_range": women,
+        "men_in_age_range": men,
+        "women_share_of_age_range": percent_of(
+            women, None if women is None or men is None else women + men
+        ),
+        "income_needed": None,
+        "affordable_households_share": None,
+        "affordable_households": None,
+        "mothers_with_children_under_18": profile.get("mothers_with_children_under_18"),
+        "mothers_with_children_under_6": profile.get("mothers_with_children_under_6"),
+        "recent_births": profile.get("recent_births"),
+        "home_ownership": None if owner_share is None else ("own" if owner_share >= 50 else "rent"),
+        "owner_occupied_share": owner_share,
+        "renter_occupied_share": percent_of(renters, occupied),
+        "owner_occupied_share_age_range": percent_of(band_owners, band_total),
+        "women_management_professional_share": percent_of(
+            profile.get("women_management_business_science_arts"), employed
+        ),
+        "women_arts_entertainment_media_share": percent_of(
+            profile.get("women_arts_design_entertainment_sports_media"), employed
+        ),
+    }
+    if price is not None:
+        needed = income_needed(price, persona)
+        metrics["income_needed"] = needed
+        affordable = households_at_or_above(profile, Decimal(needed))
+        brackets = count_sum(
+            profile, [column for column, _code, _phrase, _low in census.HOUSEHOLD_INCOME_BRACKETS]
+        )
+        if affordable is not None and brackets:
+            metrics["affordable_households"] = int(
+                affordable.quantize(Decimal(1), rounding=ROUND_HALF_UP)
+            )
+            metrics["affordable_households_share"] = percent_of(affordable, brackets)
+    return metrics
 
 
 def describe_sentence(row: dict) -> str:
@@ -735,6 +937,7 @@ def render_screen(
     rows: list[BulletRow] = []
     for position, row in enumerate(affordable_rows(screen, price), start=1):
         city, state = split_place(row)
+        metrics = zip_metrics(row, screen.persona, price)
         rows.append(
             BulletRow(
                 header=header,
@@ -742,7 +945,7 @@ def render_screen(
                 city=city,
                 state=state,
                 zip_code=str(row["zip"]),
-                insight=zip_insight(screen, row, position, price),
+                insight=zip_insight(screen, row, position, price, metrics, procedure),
                 household_income=row["median_household_income"],
                 individual_income=row["per_capita_income"],
                 median_listing_price_per_square_foot=row["median_listing_price_per_square_foot"],
@@ -750,6 +953,7 @@ def render_screen(
                 sex=sex_label(row.get("female_share")),
                 race_and_ethnicity=row.get("race_and_ethnicity"),
                 education_level=row.get("education_level"),
+                **{name: metrics[name] for name in DESCRIPTIVE_LIST_NAMES},
             )
         )
     return rows
@@ -996,20 +1200,8 @@ def bullet_update(rows: list[BulletRow]) -> tuple:
     """marketing_bullets holds one header line per ZIP row. No ZIP rows stores null."""
     if not rows:
         return (None,) * (1 + len(BULLET_LIST_COLUMNS))
-    return (
-        "\n".join(row.header for row in rows),
-        [row.rank for row in rows],
-        [row.city for row in rows],
-        [row.state for row in rows],
-        [row.zip_code for row in rows],
-        [row.insight for row in rows],
-        [row.household_income for row in rows],
-        [row.individual_income for row in rows],
-        [row.median_listing_price_per_square_foot for row in rows],
-        [row.age_range for row in rows],
-        [row.sex for row in rows],
-        [row.race_and_ethnicity for row in rows],
-        [row.education_level for row in rows],
+    return ("\n".join(row.header for row in rows),) + tuple(
+        [getattr(row, name) for row in rows] for name in BULLET_LIST_NAMES
     )
 
 

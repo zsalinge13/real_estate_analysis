@@ -1,4 +1,4 @@
-"""Load ACS 5-year income, age, sex, race and ethnicity, and education for Los Angeles County home-value ZIPs.
+"""Load ACS 5-year demographics, income, housing, and occupation for Los Angeles County home-value ZIPs.
 
 The Census download requests California ZCTAs. Those codes come from the
 ZCTA-to-county relationship file (any area in a county whose FIPS starts
@@ -14,25 +14,26 @@ the home-value extract and whose majority land area is Los Angeles County
 office, dermatology, or NPI locations.
 
 A run fetches only the latest published ACS 5-year vintage. Income, age,
-sex, age bands, race and ethnicity (B03002), and education (B15003) are
-separate requests, about 10 ZIP codes at a time.
+sex, age bands, race and ethnicity (B03002), education (B15003), household
+income brackets (B19001), mothers and births (B23003 and B13016), tenure
+(B25003 and B25007), and occupation (C24010) are separate requests, about
+10 ZIP codes at a time. Sex by age reuses the B01001 age-band codes.
 The script waits a couple of seconds between calls. A failure retries that
 piece. Each finished batch is saved before the next batch starts. A closed
 connection, a dropped connection, or a read timeout is retried more than
 once, and each retry waits longer than the one before it. The read timeout
 is 45 minutes. Older years stay in public.census_zip_population. A ZIP
-already stored for that year is not inserted again. When its race,
-ethnicity, and education columns are all blank, only those columns are
-filled in. The CSV is still written when DATABASE_URL is unset.
+already stored for that year is not inserted again. Each set of added
+columns in BACKFILL_SETS is filled on it only when every column in that set
+is blank. The CSV is still written when DATABASE_URL is unset.
 
 When CENSUS_API_KEY is set, it is sent on the first request and is never printed.
 The request URL is not printed.
 
 A newly inserted ZIP records dataset_updated_at. Every new row in the run
 gets that same timestamptz. A ZIP already stored for that year is not
-rewritten, so its timestamp stays as it was, unless its blank race,
-ethnicity, and education columns are filled in. That row gets the run's
-timestamp.
+rewritten, so its timestamp stays as it was, unless a blank set of added
+columns is filled in. That row gets the run's timestamp.
 """
 
 from __future__ import annotations
@@ -93,6 +94,45 @@ COLUMNS = (
     "population_55_64",
     "population_65_plus",
 )
+# Male B01001 age bands, then the matching female row 24 codes later.
+MALE_BANDS = {
+    "population_18_34": (
+        ("B01001_007E", "18 and 19 years"),
+        ("B01001_008E", "20 years"),
+        ("B01001_009E", "21 years"),
+        ("B01001_010E", "22 to 24 years"),
+        ("B01001_011E", "25 to 29 years"),
+        ("B01001_012E", "30 to 34 years"),
+    ),
+    "population_35_44": (
+        ("B01001_013E", "35 to 39 years"),
+        ("B01001_014E", "40 to 44 years"),
+    ),
+    "population_45_54": (
+        ("B01001_015E", "45 to 49 years"),
+        ("B01001_016E", "50 to 54 years"),
+    ),
+    "population_55_64": (
+        ("B01001_017E", "55 to 59 years"),
+        ("B01001_018E", "60 and 61 years"),
+        ("B01001_019E", "62 to 64 years"),
+    ),
+    "population_65_plus": (
+        ("B01001_020E", "65 and 66 years"),
+        ("B01001_021E", "67 to 69 years"),
+        ("B01001_022E", "70 to 74 years"),
+        ("B01001_023E", "75 to 79 years"),
+        ("B01001_024E", "80 to 84 years"),
+        ("B01001_025E", "85 years and over"),
+    ),
+}
+
+def female_code(male_code: str) -> str:
+    number = int(male_code.split("_")[1][:3])
+    return f"B01001_{number + 24:03d}E"
+
+
+
 # B03002. Hispanic or Latino of any race is one group. The rest are
 # non-Hispanic single races. American Indian and Alaska Native, Native
 # Hawaiian and Other Pacific Islander, some other race, and two or more races
@@ -149,11 +189,144 @@ EDUCATION_GROUPS = {
         ("B15003_025E", "Doctorate degree"),
     ),
 }
-COUNT_GROUP_TABLES = (("B03002", RACE_ETHNICITY_GROUPS), ("B15003", EDUCATION_GROUPS))
+# Male and female adults in each persona band, summed from the B01001 codes
+# the age_bands request already downloads.
+SEX_BY_AGE_GROUPS = {
+    f"{sex.lower()}_{column}": tuple(
+        (code if sex == "Male" else female_code(code), f"{sex}:!!{phrase}")
+        for code, phrase in pairs
+    )
+    for column, pairs in MALE_BANDS.items()
+    for sex in ("Male", "Female")
+}
+# B19001 household income brackets. Each bracket's lower bound is in
+# HOUSEHOLD_INCOME_BRACKETS, and its upper bound is the next lower bound.
+HOUSEHOLD_INCOME_BRACKETS = (
+    ("households_income_under_10000", "B19001_002E", "Less than $10,000", 0),
+    ("households_income_10000_14999", "B19001_003E", "$10,000 to $14,999", 10000),
+    ("households_income_15000_19999", "B19001_004E", "$15,000 to $19,999", 15000),
+    ("households_income_20000_24999", "B19001_005E", "$20,000 to $24,999", 20000),
+    ("households_income_25000_29999", "B19001_006E", "$25,000 to $29,999", 25000),
+    ("households_income_30000_34999", "B19001_007E", "$30,000 to $34,999", 30000),
+    ("households_income_35000_39999", "B19001_008E", "$35,000 to $39,999", 35000),
+    ("households_income_40000_44999", "B19001_009E", "$40,000 to $44,999", 40000),
+    ("households_income_45000_49999", "B19001_010E", "$45,000 to $49,999", 45000),
+    ("households_income_50000_59999", "B19001_011E", "$50,000 to $59,999", 50000),
+    ("households_income_60000_74999", "B19001_012E", "$60,000 to $74,999", 60000),
+    ("households_income_75000_99999", "B19001_013E", "$75,000 to $99,999", 75000),
+    ("households_income_100000_124999", "B19001_014E", "$100,000 to $124,999", 100000),
+    ("households_income_125000_149999", "B19001_015E", "$125,000 to $149,999", 125000),
+    ("households_income_150000_199999", "B19001_016E", "$150,000 to $199,999", 150000),
+    ("households_income_200000_plus", "B19001_017E", "$200,000 or more", 200000),
+)
+HOUSEHOLD_INCOME_GROUPS = {
+    "households": (("B19001_001E", ""),),
+    **{column: ((code, phrase),) for column, code, phrase, _low in HOUSEHOLD_INCOME_BRACKETS},
+}
+# B23003 counts women 20 to 64. Children are the householder's own children.
+MOTHER_GROUPS = {
+    "women_20_64": (("B23003_001E", ""),),
+    "mothers_with_children_under_18": (
+        ("B23003_002E", "With own children of the householder under 18 years:"),
+    ),
+    "mothers_with_children_under_6": (
+        ("B23003_003E", "With own children of the householder under 18 years:!!Under 6 years only:"),
+        (
+            "B23003_010E",
+            "With own children of the householder under 18 years:!!Under 6 years and 6 to 17 years:",
+        ),
+    ),
+}
+# B13016 counts women 15 to 50. Its youngest band starts at 15, so the
+# 18-to-34 persona band is the closest fit as 15 to 34.
+BIRTH = "Women who had a birth in the past 12 months:"
+BIRTH_GROUPS = {
+    "women_15_50": (("B13016_001E", ""),),
+    "recent_births": (("B13016_002E", BIRTH),),
+    "recent_births_15_34": (
+        ("B13016_003E", f"{BIRTH}!!15 to 19 years old"),
+        ("B13016_004E", f"{BIRTH}!!20 to 24 years old"),
+        ("B13016_005E", f"{BIRTH}!!25 to 29 years old"),
+        ("B13016_006E", f"{BIRTH}!!30 to 34 years old"),
+    ),
+    "recent_births_35_44": (
+        ("B13016_007E", f"{BIRTH}!!35 to 39 years old"),
+        ("B13016_008E", f"{BIRTH}!!40 to 44 years old"),
+    ),
+    "recent_births_45_50": (("B13016_009E", f"{BIRTH}!!45 to 50 years old"),),
+}
+TENURE_GROUPS = {
+    "owner_occupied_households": (("B25003_002E", "Owner occupied"),),
+    "renter_occupied_households": (("B25003_003E", "Renter occupied"),),
+}
+
+
+def tenure_band(tenure: str, first: int, phrases: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (f"B25007_{first + index:03d}E", f"{tenure} occupied:!!Householder {phrase}")
+        for index, phrase in enumerate(phrases)
+    )
+
+
+# B25007 householder ages. Its youngest band is 15 to 24, so the 18-to-34
+# persona band is the closest fit as 15 to 34. 55 and older adds 55 to 59,
+# 60 to 64, 65 to 74, 75 to 84, and 85 and over.
+TENURE_BY_AGE_GROUPS = {
+    f"{tenure.lower()}_occupied_householder_{band}": tenure_band(tenure, start + offset, phrases)
+    for tenure, start in (("Owner", 3), ("Renter", 13))
+    for band, offset, phrases in (
+        ("15_34", 0, ("15 to 24 years", "25 to 34 years")),
+        ("35_44", 2, ("35 to 44 years",)),
+        ("45_54", 3, ("45 to 54 years",)),
+        (
+            "55_plus",
+            4,
+            ("55 to 59 years", "60 to 64 years", "65 to 74 years", "75 to 84 years", "85 years and over"),
+        ),
+    )
+}
+# C24010 civilian employed population 16 and older, female side.
+FEMALE_OCCUPATION = "Female:!!Management, business, science, and arts occupations:"
+OCCUPATION_GROUPS = {
+    "employed_women": (("C24010_038E", "Female:"),),
+    "women_management_business_science_arts": (("C24010_039E", FEMALE_OCCUPATION),),
+    "women_arts_design_entertainment_sports_media": (
+        (
+            "C24010_051E",
+            f"{FEMALE_OCCUPATION}!!Education, legal, community service, arts, and media occupations:"
+            "!!Arts, design, entertainment, sports, and media occupations",
+        ),
+    ),
+}
+# (ACS table, columns as sums of codes, request that downloads the codes).
+# A request of None reuses codes another request already downloads.
+COUNT_GROUP_TABLES = (
+    ("B03002", RACE_ETHNICITY_GROUPS, "race_ethnicity"),
+    ("B15003", EDUCATION_GROUPS, "education"),
+    ("B01001", SEX_BY_AGE_GROUPS, None),
+    ("B19001", HOUSEHOLD_INCOME_GROUPS, "household_income"),
+    ("B23003", MOTHER_GROUPS, "mothers"),
+    ("B13016", BIRTH_GROUPS, "mothers"),
+    ("B25003", TENURE_GROUPS, "tenure"),
+    ("B25007", TENURE_BY_AGE_GROUPS, "tenure"),
+    ("C24010", OCCUPATION_GROUPS, "occupation"),
+)
 POPULATION_25_PLUS = "population_25_plus"
-ADDED_COLUMNS = (
+RACE_EDUCATION_COLUMNS = (
     tuple(RACE_ETHNICITY_GROUPS) + (POPULATION_25_PLUS,) + tuple(EDUCATION_GROUPS)
 )
+PROFILE_COLUMNS = (
+    tuple(SEX_BY_AGE_GROUPS)
+    + tuple(HOUSEHOLD_INCOME_GROUPS)
+    + tuple(MOTHER_GROUPS)
+    + tuple(BIRTH_GROUPS)
+    + tuple(TENURE_GROUPS)
+    + tuple(TENURE_BY_AGE_GROUPS)
+    + tuple(OCCUPATION_GROUPS)
+)
+# Each set is filled on a stored ZIP only when every column in that set is blank.
+BACKFILL_SETS = (RACE_EDUCATION_COLUMNS, PROFILE_COLUMNS)
+ADDED_COLUMNS = RACE_EDUCATION_COLUMNS + PROFILE_COLUMNS
 BASE_COLUMNS = COLUMNS
 COLUMNS = BASE_COLUMNS + ADDED_COLUMNS
 INTEGER_COLUMNS = {
@@ -170,38 +343,6 @@ INTEGER_COLUMNS = {
     "population_65_plus",
     *ADDED_COLUMNS,
 }
-# Male B01001 age bands, then the matching female row 24 codes later.
-MALE_BANDS = {
-    "population_18_34": (
-        ("B01001_007E", "18 and 19 years"),
-        ("B01001_008E", "20 years"),
-        ("B01001_009E", "21 years"),
-        ("B01001_010E", "22 to 24 years"),
-        ("B01001_011E", "25 to 29 years"),
-        ("B01001_012E", "30 to 34 years"),
-    ),
-    "population_35_44": (
-        ("B01001_013E", "35 to 39 years"),
-        ("B01001_014E", "40 to 44 years"),
-    ),
-    "population_45_54": (
-        ("B01001_015E", "45 to 49 years"),
-        ("B01001_016E", "50 to 54 years"),
-    ),
-    "population_55_64": (
-        ("B01001_017E", "55 to 59 years"),
-        ("B01001_018E", "60 and 61 years"),
-        ("B01001_019E", "62 to 64 years"),
-    ),
-    "population_65_plus": (
-        ("B01001_020E", "65 and 66 years"),
-        ("B01001_021E", "67 to 69 years"),
-        ("B01001_022E", "70 to 74 years"),
-        ("B01001_023E", "75 to 79 years"),
-        ("B01001_024E", "80 to 84 years"),
-        ("B01001_025E", "85 years and over"),
-    ),
-}
 SEX_TOTALS = {
     "male_population": ("B01001_002E", "Estimate!!Total:!!Male:"),
     "female_population": ("B01001_026E", "Estimate!!Total:!!Female:"),
@@ -211,11 +352,6 @@ MEASURES = {
     "per_capita_income": "B19301_001E",
     "median_age": "B01002_001E",
 }
-
-
-def female_code(male_code: str) -> str:
-    number = int(male_code.split("_")[1][:3])
-    return f"B01001_{number + 24:03d}E"
 
 
 def expected_band_label(sex: str, phrase: str) -> str:
@@ -235,6 +371,15 @@ def band_codes() -> dict[str, tuple[str, ...]]:
 
 def group_codes(groups: dict[str, tuple[tuple[str, str], ...]]) -> tuple[str, ...]:
     return tuple(code for pairs in groups.values() for code, _phrase in pairs)
+
+
+def request_groups() -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Requests for the counted tables, in first-listed order. Tables that share a name share a call."""
+    names: dict[str, list[str]] = {}
+    for _table, groups, request in COUNT_GROUP_TABLES:
+        if request is not None:
+            names.setdefault(request, []).extend(group_codes(groups))
+    return tuple((name, tuple(codes)) for name, codes in names.items())
 
 
 def field_groups() -> tuple[tuple[str, tuple[str, ...]], ...]:
@@ -263,9 +408,7 @@ def field_groups() -> tuple[tuple[str, tuple[str, ...]], ...]:
             ),
         ),
         ("age_bands", tuple(band_variables)),
-        ("race_ethnicity", group_codes(RACE_ETHNICITY_GROUPS)),
-        ("education", group_codes(EDUCATION_GROUPS)),
-    )
+    ) + request_groups()
     for name, variables in groups:
         if not variables or len(variables) > 50:
             raise SystemExit(f"The ACS {name} request has more than 50 variables.")
@@ -718,11 +861,12 @@ def verify_labels(year: int) -> None:
                 raise SystemExit(f"ACS {year} changed the male {column} bands.")
             if labels.get(female) != expected_band_label("Female", phrase):
                 raise SystemExit(f"ACS {year} changed the female {column} bands.")
-    for table, groups in COUNT_GROUP_TABLES:
+    for table, groups, _request in COUNT_GROUP_TABLES:
         table_labels = group_labels(year, table)
         for column, pairs in groups.items():
             for code, phrase in pairs:
-                if table_labels.get(code) != f"Estimate!!Total:!!{phrase}":
+                expected = f"Estimate!!Total:!!{phrase}" if phrase else "Estimate!!Total:"
+                if table_labels.get(code) != expected:
                     raise SystemExit(f"ACS {year} changed the {table} {column} label.")
     income = variable_label(year, MEASURES["median_household_income"]).lower()
     per_capita = variable_label(year, MEASURES["per_capita_income"]).lower()
@@ -781,7 +925,7 @@ def row_from_estimates(year: int, zip_code: str, estimates: dict[str, Decimal | 
     adult = sum_counts(list(band_values.values()))
     counted = {
         column: sum_counts([as_int(estimates.get(code), column) for code, _phrase in pairs])
-        for _table, groups in COUNT_GROUP_TABLES
+        for _table, groups, _request in COUNT_GROUP_TABLES
         for column, pairs in groups.items()
     }
     counted[POPULATION_25_PLUS] = sum_counts(
@@ -1070,21 +1214,21 @@ def stored_pairs(cur, years: list[int]) -> set[tuple[int, str]]:
     return {(int(year), str(zip_code)) for year, zip_code in cur.fetchall()}
 
 
-def backfill_sql() -> str:
-    """Fill the added columns on a stored ZIP only when every one of them is blank."""
-    assignments = ", ".join(f"{name} = %s" for name in ADDED_COLUMNS)
-    still_blank = " AND ".join(f"{name} IS NULL" for name in ADDED_COLUMNS)
+def backfill_sql(columns: tuple[str, ...]) -> str:
+    """Fill one set of added columns on a stored ZIP only when every one of them is blank."""
+    assignments = ", ".join(f"{name} = %s" for name in columns)
+    still_blank = " AND ".join(f"{name} IS NULL" for name in columns)
     return (
         f"UPDATE {TABLE} SET {assignments}, {dataset_stamp.COLUMN} = %s "
         f"WHERE acs_year = %s AND zip = %s AND {still_blank}"
     )
 
 
-def backfill_params(rows: list[tuple], updated_at: datetime) -> list[tuple]:
-    start = len(BASE_COLUMNS)
+def backfill_params(rows: list[tuple], columns: tuple[str, ...], updated_at: datetime) -> list[tuple]:
+    indexes = [COLUMNS.index(name) for name in columns]
     params = []
     for row in rows:
-        added = tuple(row[start : start + len(ADDED_COLUMNS)])
+        added = tuple(row[index] for index in indexes)
         if all(value is None for value in added):
             continue
         params.append(added + (updated_at, row[0], row[1]))
@@ -1096,8 +1240,8 @@ def insert_new_years(
 ) -> tuple[int, int, int]:
     """Insert ZIP rows that are not already stored. Do not delete older years.
 
-    A stored ZIP whose race, ethnicity, and education columns are all blank
-    gets only those columns filled in. Returns inserted, filled, and total rows.
+    Each set in BACKFILL_SETS is filled on a stored ZIP only when every
+    column in that set is blank. Returns inserted, filled, and total rows.
     """
     if not rows:
         return 0, 0, 0
@@ -1129,13 +1273,15 @@ def insert_new_years(
             if stamped:
                 cur.executemany(sql, stamped)
             stored_rows = [row for row in rows if (int(row[0]), str(row[1])) in already]
-            filled = 0
-            for params in backfill_params(stored_rows, updated_at):
-                cur.execute(backfill_sql(), params)
-                filled += max(cur.rowcount or 0, 0)
+            filled: set[tuple[int, str]] = set()
+            for columns in BACKFILL_SETS:
+                for params in backfill_params(stored_rows, columns, updated_at):
+                    cur.execute(backfill_sql(columns), params)
+                    if (cur.rowcount or 0) > 0:
+                        filled.add((params[-2], params[-1]))
             cur.execute(f"SELECT COUNT(*) FROM {TABLE}")
             total = cur.fetchone()[0]
-    return len(stamped), filled, total
+    return len(stamped), len(filled), total
 
 
 def checkpoint_download(holder: dict, rows_so_far: list[tuple], new_rows: list[tuple]) -> None:
