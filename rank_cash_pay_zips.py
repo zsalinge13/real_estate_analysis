@@ -10,7 +10,14 @@ procedure rows. When the join year qualifies, bullets are written only
 there. Otherwise they are written only on the most recent report year that
 qualifies. Every other report year is left blank in that column. Fees are
 not copied from another year. The fee load owns the column and does not
-fill it. The stored form is one entry per ranked ZIP, in persona-list order:
+fill it. Each procedure then gets an affordability screen: a ZIP stays on
+that procedure's list only when its estimated yearly discretionary spending
+(the BLS Consumer Expenditure Surveys 2025 share for the persona's age, times
+the income the persona's cash screen uses) is at least the midpoint of that
+procedure's surgeon fee range. The survivors are re-ranked, so lists differ by
+procedure. A procedure with a blank fee is not screened. cash_pay_zip_rank
+keeps the persona ranking without this screen.
+The stored form is one entry per ranked ZIP, in persona-list order:
 marketing_bullets has one line per ZIP holding that ZIP's age-group header
 sentence, and rank, city, state, zip_code, and insight are same-order lists.
 A group with no ranked ZIP adds no entry.
@@ -26,7 +33,7 @@ from __future__ import annotations
 import csv
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -83,6 +90,47 @@ PERSONAS = (
     ),
 )
 PERSONA_BY_LABEL = {persona.label: persona for persona in PERSONAS}
+
+# Affordability screen. BLS Consumer Expenditure Surveys, calendar year 2025,
+# Table 1300 "Age of reference person: Annual expenditure means, shares,
+# standard errors, and relative standard errors". BLS has no "discretionary"
+# line, so discretionary spending here is the sum of the mean annual spending
+# on food away from home, alcoholic beverages, apparel and services,
+# entertainment, personal care products and services, and reading. The share
+# is that sum over mean income before taxes for the age band. Personas that
+# span two BLS bands are weighted by the number of consumer units in each band.
+DISCRETIONARY_SOURCE_YEAR = 2025
+DISCRETIONARY_SOURCE_URL = (
+    "https://www.bls.gov/cex/tables/calendar-year/mean-item-share-average-standard-error/"
+    "reference-person-age-ranges-2025.xlsx"
+)
+# BLS age band: (consumer units in thousands, mean income before taxes,
+# food away + alcohol + apparel + entertainment + personal care + reading).
+BLS_AGE_BANDS = {
+    "under 25": (5941, 52178, 3580 + 301 + 1375 + 1629 + 562 + 157),
+    "25 to 34": (20969, 115828, 4529 + 617 + 1702 + 3965 + 903 + 77),
+    "35 to 44": (24771, 139176, 4978 + 701 + 2273 + 4071 + 1136 + 128),
+    "45 to 54": (22516, 148365, 5749 + 871 + 3248 + 6909 + 1341 + 113),
+    "55 to 64": (23919, 125333, 3800 + 551 + 2060 + 3998 + 1057 + 110),
+    "65 and older": (39878, 69497, 2818 + 556 + 1383 + 2975 + 757 + 121),
+}
+PERSONA_BLS_BANDS = {
+    "18 to 34": ("under 25", "25 to 34"),
+    "35 to 44": ("35 to 44",),
+    "45 to 54": ("45 to 54",),
+    "55 and older": ("55 to 64", "65 and older"),
+}
+
+
+def bls_discretionary_share(bands: tuple[str, ...]) -> Decimal:
+    spent = sum(Decimal(BLS_AGE_BANDS[band][0] * BLS_AGE_BANDS[band][2]) for band in bands)
+    earned = sum(Decimal(BLS_AGE_BANDS[band][0] * BLS_AGE_BANDS[band][1]) for band in bands)
+    return spent / earned
+
+
+DISCRETIONARY_SHARE = {
+    label: bls_discretionary_share(bands) for label, bands in PERSONA_BLS_BANDS.items()
+}
 
 # The ZIP rank does not change by procedure. A procedure uses these persona
 # lists, and procedures that use the same lists get the same bullet text.
@@ -191,6 +239,8 @@ INTEGER_RANK_COLUMNS = {
 
 if set(PROCEDURE_PERSONAS) != set(procedures.PROCEDURES):
     raise SystemExit("Every procedure needs a persona list.")
+if set(DISCRETIONARY_SHARE) != set(PERSONA_BY_LABEL):
+    raise SystemExit("Every persona needs a BLS discretionary share.")
 if any(label not in PERSONA_BY_LABEL for labels in PROCEDURE_PERSONAS.values() for label in labels):
     raise SystemExit("A procedure lists an unknown persona.")
 if "DELETE" in DELETE_RANK_SQL.upper() and "redfin_real_estate_value" in DELETE_RANK_SQL:
@@ -204,6 +254,7 @@ class PersonaRank:
     per_capita_income_middle: Decimal | None
     listing_price_middle: Decimal | None
     rows: list[dict]
+    passed: list[dict] = field(default_factory=list)
 
 
 def quote_ident(name: str) -> str:
@@ -366,6 +417,21 @@ def passes_cash(row: dict, persona: Persona, income_middle, per_capita_middle, p
     raise SystemExit(f"Unknown cash test {persona.cash!r}.")
 
 
+def income_measure(row: dict, persona: Persona) -> Decimal:
+    """The income the persona's cash screen uses."""
+    if persona.cash == "working":
+        return Decimal(row["median_household_income"])
+    return Decimal(row["per_capita_income"])
+
+
+def income_phrase(persona: Persona) -> str:
+    return "household income" if persona.cash == "working" else "per-person income"
+
+
+def discretionary_income(row: dict, persona: Persona) -> Decimal:
+    return DISCRETIONARY_SHARE[persona.label] * income_measure(row, persona)
+
+
 def cash_signal(row: dict, persona: Persona) -> Decimal:
     if persona.cash == "working":
         return Decimal(row["median_household_income"])
@@ -417,6 +483,7 @@ def rank_persona(rows: list[dict[str, str]], persona: Persona) -> PersonaRank:
         per_capita_middle,
         price_middle,
         ranked,
+        kept,
     )
 
 
@@ -451,7 +518,7 @@ def split_place(row: dict) -> tuple[str, str]:
     return city.strip(), state.strip()
 
 
-def screen_header(screen: PersonaRank) -> str:
+def screen_header(screen: PersonaRank, price: Decimal | None = None) -> str:
     persona = screen.persona
     if screen.household_income_middle is None:
         return (
@@ -483,11 +550,22 @@ def screen_header(screen: PersonaRank) -> str:
         return f"{persona.label}. {failed} ({middles})."
     return (
         f"{persona.label}. {rule} the middle of Los Angeles County ZIPs in this "
-        f"screen ({middles}). Ranked by the share of adults {persona.age_phrase}."
+        f"screen ({middles}). {affordability_header(persona, price)} "
+        f"Ranked by the share of adults {persona.age_phrase}."
     )
 
 
-def zip_insight(screen: PersonaRank, row: dict) -> str:
+def affordability_header(persona: Persona, price: Decimal | None) -> str:
+    if price is None:
+        return "This procedure has no published surgeon fee, so no affordability screen is applied."
+    return (
+        f"Estimated yearly discretionary spending ({format_percent(DISCRETIONARY_SHARE[persona.label])} "
+        f"of {income_phrase(persona)}, BLS Consumer Expenditure Surveys {DISCRETIONARY_SOURCE_YEAR}) "
+        f"covers the {format_money(price)} surgeon fee midpoint."
+    )
+
+
+def zip_insight(screen: PersonaRank, row: dict, price: Decimal | None = None) -> str:
     share = format_percent(row["age_share"])
     if screen.persona.cash == "working":
         insight = (
@@ -503,30 +581,50 @@ def zip_insight(screen: PersonaRank, row: dict) -> str:
             f"per-person income {format_money(Decimal(row['per_capita_income']))} "
             "are at or above those middles."
         )
+    if price is not None:
+        spending = discretionary_income(row, screen.persona).quantize(
+            Decimal(1), rounding=ROUND_HALF_UP
+        )
+        insight += (
+            f" About {format_money(spending)} a year in discretionary spending covers "
+            f"the {format_money(price)} fee midpoint."
+        )
     if row.get("female_share") is not None:
         insight += f" Women are {format_percent(row['female_share'])} of residents."
     return insight
 
 
-def render_screen(screen: PersonaRank) -> list[BulletRow]:
-    header = screen_header(screen)
+def affordable_rows(screen: PersonaRank, price: Decimal | None) -> list[dict]:
+    """The persona's passing ZIPs that can cover the price, re-ranked, top 25."""
+    candidates = screen.passed if screen.passed else screen.rows
+    if price is None:
+        return candidates[:TOP_N]
+    return [row for row in candidates if discretionary_income(row, screen.persona) >= price][
+        :TOP_N
+    ]
+
+
+def render_screen(screen: PersonaRank, price: Decimal | None = None) -> list[BulletRow]:
+    header = screen_header(screen, price)
     rows: list[BulletRow] = []
-    for row in screen.rows:
+    for position, row in enumerate(affordable_rows(screen, price), start=1):
         city, state = split_place(row)
         rows.append(
             BulletRow(
                 header=header,
-                rank=int(row["rank"]),
+                rank=position,
                 city=city,
                 state=state,
                 zip_code=str(row["zip"]),
-                insight=zip_insight(screen, row),
+                insight=zip_insight(screen, row, price),
             )
         )
     return rows
 
 
-def bullet_rows(procedure: str, screens: list[PersonaRank]) -> list[BulletRow]:
+def bullet_rows(
+    procedure: str, screens: list[PersonaRank], price: Decimal | None = None
+) -> list[BulletRow]:
     """ZIP rows for one procedure's persona lists, in list order. A group with no ZIP adds none."""
     labels = PROCEDURE_PERSONAS.get(procedure)
     if not labels:
@@ -534,24 +632,36 @@ def bullet_rows(procedure: str, screens: list[PersonaRank]) -> list[BulletRow]:
     by_label = {screen.persona.label: screen for screen in screens}
     rows: list[BulletRow] = []
     for label in labels:
-        rows.extend(render_screen(by_label[label]))
+        rows.extend(render_screen(by_label[label], price))
     return rows
 
 
 def bullets_by_procedure(
-    procedures_in_year: list[str], screens: list[PersonaRank]
+    procedures_in_year: list[str],
+    screens: list[PersonaRank],
+    prices: dict[str, Decimal | None] | None = None,
 ) -> dict[str, list[BulletRow]]:
-    cache: dict[tuple[str, ...], list[BulletRow]] = {}
+    prices = prices or {}
+    cache: dict[tuple, list[BulletRow]] = {}
     bullets: dict[str, list[BulletRow]] = {}
     for name in procedures_in_year:
         labels = PROCEDURE_PERSONAS.get(name)
+        price = prices.get(name)
         if labels is None:
-            bullets[name] = bullet_rows(name, screens)
+            bullets[name] = bullet_rows(name, screens, price)
             continue
-        if labels not in cache:
-            cache[labels] = bullet_rows(name, screens)
-        bullets[name] = cache[labels]
+        key = (labels, price)
+        if key not in cache:
+            cache[key] = bullet_rows(name, screens, price)
+        bullets[name] = cache[key]
     return bullets
+
+
+def fee_midpoint(low: object, high: object) -> Decimal | None:
+    """Midpoint of the published surgeon fee range. A blank end means no price."""
+    if not fees_are_present(low, high):
+        return None
+    return (Decimal(str(low)) + Decimal(str(high))) / Decimal(2)
 
 
 def flatten(screens: list[PersonaRank]) -> list[dict]:
@@ -793,7 +903,12 @@ def apply_marketing_bullets(
         (chosen,),
     )
     names = [name for year, name, _low, _high in procedure_rows if year == chosen]
-    bullets = bullets_by_procedure(names, screens)
+    prices = {
+        name: fee_midpoint(low, high)
+        for year, name, low, high in procedure_rows
+        if year == chosen
+    }
+    bullets = bullets_by_procedure(names, screens, prices)
     updates = [bullet_update(bullets[name]) + (chosen, name) for name in names]
     if updates:
         cur.executemany(

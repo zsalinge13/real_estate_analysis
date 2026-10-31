@@ -474,6 +474,159 @@ class BulletTests(unittest.TestCase):
         self.assertNotEqual(bullets["breast augmentation"], bullets["facelift"])
 
 
+class AffordabilityTests(unittest.TestCase):
+    def _screen(self, label: str, incomes: dict[str, int]) -> rank.PersonaRank:
+        persona = rank.PERSONA_BY_LABEL[label]
+        passed = []
+        for position, (zip_code, income) in enumerate(incomes.items(), start=1):
+            passed.append(
+                {
+                    "zip": zip_code,
+                    "zip_name": f"place {zip_code}, ca",
+                    "rank": position,
+                    "age_share": Decimal("0.4"),
+                    "median_household_income": income,
+                    "per_capita_income": income,
+                    "median_listing_price_per_square_foot": Decimal(700),
+                    "female_share": None,
+                }
+            )
+        return rank.PersonaRank(
+            persona,
+            Decimal(100000),
+            Decimal(50000),
+            Decimal(600),
+            passed[: rank.TOP_N],
+            passed,
+        )
+
+    def test_shares_come_from_the_bls_age_table(self):
+        self.assertEqual(rank.DISCRETIONARY_SOURCE_YEAR, 2025)
+        self.assertIn("bls.gov/cex", rank.DISCRETIONARY_SOURCE_URL)
+        self.assertIn("2025", rank.DISCRETIONARY_SOURCE_URL)
+        rounded = {
+            label: share.quantize(Decimal("0.0001"))
+            for label, share in rank.DISCRETIONARY_SHARE.items()
+        }
+        self.assertEqual(
+            rounded,
+            {
+                "18 to 34": Decimal("0.1068"),
+                "35 to 44": Decimal("0.0955"),
+                "45 to 54": Decimal("0.1229"),
+                "55 and older": Decimal("0.1075"),
+            },
+        )
+        self.assertEqual(
+            rank.DISCRETIONARY_SHARE["35 to 44"], Decimal(13287) / Decimal(139176)
+        )
+
+    def test_income_measure_follows_the_cash_screen(self):
+        row = {"median_household_income": 200000, "per_capita_income": 80000}
+        young = rank.PERSONA_BY_LABEL["35 to 44"]
+        older = rank.PERSONA_BY_LABEL["55 and older"]
+        self.assertEqual(
+            rank.discretionary_income(row, young), rank.DISCRETIONARY_SHARE["35 to 44"] * 200000
+        )
+        self.assertEqual(
+            rank.discretionary_income(row, older), rank.DISCRETIONARY_SHARE["55 and older"] * 80000
+        )
+
+    def test_fee_midpoint(self):
+        self.assertEqual(rank.fee_midpoint(8000, 15000), Decimal(11500))
+        self.assertEqual(rank.fee_midpoint(5000, 7575), Decimal("6287.5"))
+        self.assertIsNone(rank.fee_midpoint(None, 15000))
+        self.assertIsNone(rank.fee_midpoint(8000, None))
+
+    def test_unaffordable_zip_is_dropped_and_the_rest_re_ranked(self):
+        share = rank.DISCRETIONARY_SHARE["35 to 44"]
+        price = Decimal(10000)
+        just_enough = int((price / share).to_integral_value(rounding="ROUND_CEILING"))
+        screen = self._screen(
+            "35 to 44", {"90001": 50000, "90002": just_enough, "90003": 300000}
+        )
+        kept = rank.render_screen(screen, price)
+        self.assertEqual([(row.rank, row.zip_code) for row in kept], [(1, "90002"), (2, "90003")])
+        unscreened = rank.render_screen(screen, None)
+        self.assertEqual([row.rank for row in unscreened], [1, 2, 3])
+        self.assertIn("no affordability screen", unscreened[0].header)
+
+    def test_dropped_zips_are_backfilled_past_the_top_25(self):
+        incomes = {f"9{index:04d}": 50000 for index in range(rank.TOP_N)}
+        incomes.update({"91111": 300000, "92222": 300000})
+        screen = self._screen("35 to 44", incomes)
+        self.assertNotIn("91111", {row["zip"] for row in screen.rows})
+        kept = rank.render_screen(screen, Decimal(20000))
+        self.assertEqual([row.zip_code for row in kept], ["91111", "92222"])
+
+    def test_rankings_differ_by_procedure_price(self):
+        screen = self._screen("45 to 54", {"90001": 60000, "90002": 200000})
+        older = self._screen("55 and older", {"90001": 60000, "90002": 200000})
+        screens = [screen, older]
+        bullets = rank.bullets_by_procedure(
+            ["forehead lift", "facelift"],
+            screens,
+            {"forehead lift": Decimal(5750), "facelift": Decimal(15500)},
+        )
+        self.assertEqual(
+            [row.zip_code for row in bullets["forehead lift"]], ["90001", "90002", "90001", "90002"]
+        )
+        self.assertEqual([row.zip_code for row in bullets["facelift"]], ["90002", "90002"])
+        self.assertEqual([row.rank for row in bullets["facelift"]], [1, 1])
+
+    def test_header_and_insight_describe_the_screen(self):
+        screen = self._screen("35 to 44", {"90001": 200000})
+        row = rank.render_screen(screen, Decimal(10750))[0]
+        self.assertIn("Estimated yearly discretionary spending (9.5% of household income", row.header)
+        self.assertIn("BLS Consumer Expenditure Surveys 2025", row.header)
+        self.assertIn("covers the $10,750 surgeon fee midpoint.", row.header)
+        self.assertIn("About $19,094 a year in discretionary spending covers the $10,750 fee midpoint.", row.insight)
+        older = self._screen("55 and older", {"90001": 100000})
+        older_row = rank.render_screen(older, Decimal(5750))[0]
+        self.assertIn("10.8% of per-person income", older_row.header)
+
+    def test_a_group_with_no_affordable_zip_adds_no_rows(self):
+        screen = self._screen("55 and older", {"90001": 40000})
+        self.assertEqual(rank.render_screen(screen, Decimal(15500)), [])
+
+    def test_apply_writes_null_when_no_zip_can_afford_the_fee(self):
+        screens = rank.rank_personas(
+            [
+                join_row(
+                    "90012",
+                    zip_name="pasadena, ca",
+                    median_household_income="20000",
+                    population_18_34="40",
+                    adult_population="100",
+                )
+            ]
+        )
+
+        class Cursor:
+            def __init__(self):
+                self.batches = []
+
+            def execute(self, sql, params=None):
+                pass
+
+            def executemany(self, sql, batch):
+                self.batches.append(list(batch))
+
+            def fetchall(self):
+                return []
+
+        cursor = Cursor()
+        rank.apply_marketing_bullets(
+            cursor,
+            screens,
+            [(2024, "rhinoplasty", 7000, 12000), (2024, "liposuction", 1000, 1000)],
+            2024,
+        )
+        by_name = {row[-1]: row for row in cursor.batches[0]}
+        self.assertEqual(by_name["rhinoplasty"][:6], (None,) * 6)
+        self.assertEqual(by_name["liposuction"][1], [1])
+
+
 class BulletYearTests(unittest.TestCase):
     def test_join_acs_year_is_the_preferred_report_year(self):
         self.assertEqual(
@@ -544,7 +697,7 @@ class BulletYearTests(unittest.TestCase):
                     "90012",
                     zip_name="Pasadena",
                     acs_year="2025",
-                    median_household_income="300",
+                    median_household_income="300000",
                     median_listing_price="300",
                     population_18_34="40",
                     adult_population="100",
@@ -639,7 +792,7 @@ class SaveTests(unittest.TestCase):
                 join_row(
                     "90012",
                     zip_name="Pasadena",
-                    median_household_income="300",
+                    median_household_income="300000",
                     median_listing_price="300",
                     population_18_34="40",
                     adult_population="100",
