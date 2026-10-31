@@ -17,3 +17,7 @@ cash_pay_zip_rank.csv
 cash_pay_zip_rank.csv.tmp
 procedure_surgeon_fees.csv
 procedure_surgeon_fees.csv.tmp
+competition_trends.csv
+competition_trends.csv.tmp
+competition_trends_cache.json
+competition_trends_cache.json.tmp
