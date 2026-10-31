@@ -5,8 +5,9 @@ within 50 miles of the practice ZIP. A join row outside it is skipped. The
 screen medians are taken over the eligible ZIPs in that area.
 
 The input is the join that just succeeded. This script does not rebuild
-that join and does not delete Redfin months. Each persona keeps the top 25
-ZIPs that pass its cash screen. The same run writes marketing_bullets on
+that join and does not delete Redfin months. Each persona has a cash screen,
+and each procedure and persona list keeps the top 25 ZIPs that pass it, ranked
+by composite_score (ranking_weights.py). The same run writes marketing_bullets on
 one procedure_surgeon_fees report year. The preferred year is acs_year on
 zip_census_redfin_join. A year qualifies when surgeon_fee_low and
 surgeon_fee_high are both non-null on more than half of that year's
@@ -21,19 +22,19 @@ money a typical household headed by someone in the persona's age band has
 left after estimated taxes and the ZIP's cost of living, times the share
 such a household spends on discretionary items. The household income is the
 median of the B19037 brackets for that householder band, or the ZIP's median
-household income when those brackets are blank. The survivors are
-re-ranked, so lists differ by procedure. A procedure with a blank fee is not
-screened. cash_pay_zip_rank keeps the persona ranking without this screen
-and carries the discretionary fields for each ZIP and persona.
+household income when those brackets are blank. A procedure with a blank
+fee is not screened. The survivors are scored: each factor is a percentile
+rank among every eligible ZIP for the persona, weighted for the procedure.
+cash_pay_zip_rank holds the same lists, one row per procedure, persona, and
+ZIP, with the discretionary fields, the profile measures, and the scores.
 The stored form is one entry per ranked ZIP, in persona-list order:
 marketing_bullets has one line per ZIP holding that ZIP's age-group header
 sentence, and rank, city, state, zip_code, insight, household_income,
 individual_income (ACS per-capita income),
 median_listing_price_per_square_foot, age_range, sex, and the descriptive
-columns after it are same-order lists. Apart from discretionary_income, which
-is the affordability screen, those descriptive columns, including the
-households that can afford the fee, never change a screen or a rank.
-A group with no ranked ZIP adds no entry.
+columns after it, through composite_score and the score_<factor> columns,
+are same-order lists. Race, ethnicity, and education never change a screen
+or a rank. A group with no ranked ZIP adds no entry.
 After that write succeeds, the same run exports every column of
 procedure_surgeon_fees for the chosen report year and every other report
 year. The file has one row per ranked ZIP. report_year, procedure, and the
@@ -45,6 +46,7 @@ from __future__ import annotations
 
 import csv
 import os
+from bisect import bisect_left, bisect_right
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -57,6 +59,7 @@ import load_california
 import practice
 import pull_census_zip_population as census
 import pull_procedure_surgeon_fees as procedures
+import ranking_weights
 
 RANK_TABLE_NAME = "cash_pay_zip_rank"
 RANK_TABLE = "public.cash_pay_zip_rank"
@@ -108,14 +111,28 @@ BULLET_LIST_COLUMNS = (
     ("women_management_professional_share", "numeric[]"),
     ("women_arts_entertainment_media_share", "numeric[]"),
 )
+SCORE_COLUMNS = tuple(f"score_{factor}" for factor in ranking_weights.FACTORS)
+BULLET_LIST_COLUMNS += (("composite_score", "numeric[]"),) + tuple(
+    (name, "numeric[]") for name in SCORE_COLUMNS
+)
 BULLET_LIST_NAMES = tuple(name for name, _sql_type in BULLET_LIST_COLUMNS)
-DESCRIPTIVE_LIST_NAMES = BULLET_LIST_NAMES[BULLET_LIST_NAMES.index("women_in_age_range") :]
+DESCRIPTIVE_LIST_NAMES = BULLET_LIST_NAMES[
+    BULLET_LIST_NAMES.index("women_in_age_range") : BULLET_LIST_NAMES.index("composite_score")
+]
 BULLET_CSV_COLUMNS = ("marketing_bullets",) + BULLET_LIST_NAMES
+# The ZIP and persona measures from DESCRIPTIVE_LIST_NAMES that cash_pay_zip_rank
+# also carries. The discretionary fields are already there.
+MEASURE_COLUMNS = tuple(
+    name for name in DESCRIPTIVE_LIST_NAMES if name not in discretionary.FIELD_TYPES
+)
+SCORE_PLACES = Decimal("0.01")
+COMPOSITE_PLACES = Decimal("0.1")
+NEUTRAL_PERCENTILE = Decimal("0.5")
 
-# Equal age shares are the close case. The higher cash signal ranks first.
-# Household income is that signal for working-age personas. Median listing
-# price per square foot is that signal for ages 65 and older. The female share
-# is not a rank key.
+# composite_score ranks each list. Equal scores are the close case: the higher
+# age share ranks first, then the higher cash signal. Household income is that
+# signal for working-age personas. Median listing price per square foot is
+# that signal for ages 65 and older.
 
 
 @dataclass(frozen=True)
@@ -174,11 +191,11 @@ EDUCATION_LABELS = {
     "education_graduate_or_professional": "Graduate or professional degree",
 }
 BACHELORS_OR_HIGHER = ("education_bachelors", "education_graduate_or_professional")
-MOTHER_PROCEDURES = frozenset(
-    {"tummy tuck", "breast lift", "breast augmentation", "breast reduction", "liposuction"}
-)
+MOTHER_PROCEDURES = ranking_weights.MOTHER_PROCEDURES
 
 RANK_COLUMNS = (
+    "procedure",
+    "surgeon_fee_midpoint",
     "persona",
     "rank",
     "zip",
@@ -203,8 +220,13 @@ RANK_COLUMNS = (
     "month_date_yyyymm",
     "date_pulled_yyyymmdd",
     *discretionary.FIELD_TYPES,
+    *MEASURE_COLUMNS,
+    "composite_score",
+    *SCORE_COLUMNS,
 )
 COLUMN_TYPES = {
+    "procedure": "text",
+    "surgeon_fee_midpoint": "numeric",
     "persona": "text",
     "rank": "integer",
     "zip": "text",
@@ -229,8 +251,15 @@ COLUMN_TYPES = {
     "month_date_yyyymm": "text",
     "date_pulled_yyyymmdd": "text",
     **discretionary.FIELD_TYPES,
+    **{
+        name: sql_type.removesuffix("[]")
+        for name, sql_type in BULLET_LIST_COLUMNS
+        if name in MEASURE_COLUMNS or name == "composite_score" or name in SCORE_COLUMNS
+    },
 }
 NOT_NULL_COLUMNS = {
+    "procedure",
+    "composite_score",
     "persona",
     "rank",
     "zip",
@@ -278,6 +307,8 @@ if any(persona.householder_band not in discretionary.AGE_ADJUSTMENTS for persona
     raise SystemExit("Every persona needs a BLS age adjustment.")
 if any(label not in PERSONA_BY_LABEL for labels in PROCEDURE_PERSONAS.values() for label in labels):
     raise SystemExit("A procedure lists an unknown persona.")
+for _procedure in PROCEDURE_PERSONAS:
+    ranking_weights.procedure_group(_procedure)
 if "DELETE" in DELETE_RANK_SQL.upper() and "redfin_real_estate_value" in DELETE_RANK_SQL:
     raise SystemExit("The rank refresh must not delete Redfin rows.")
 
@@ -290,6 +321,7 @@ class PersonaRank:
     listing_price_middle: Decimal | None
     rows: list[dict]
     passed: list[dict] = field(default_factory=list)
+    eligible: list[dict] = field(default_factory=list)
 
 
 def quote_ident(name: str) -> str:
@@ -622,6 +654,7 @@ def rank_persona(rows: list[dict[str, str]], persona: Persona) -> PersonaRank:
         price_middle,
         ranked,
         kept,
+        prepared,
     )
 
 
@@ -703,6 +736,13 @@ class BulletRow:
     owner_occupied_share_age_range: Decimal | None = None
     women_management_professional_share: Decimal | None = None
     women_arts_entertainment_media_share: Decimal | None = None
+    composite_score: Decimal | None = None
+    scores: dict[str, Decimal | None] = field(default_factory=dict)
+
+    def value(self, name: str) -> object:
+        if name in SCORE_COLUMNS:
+            return self.scores.get(name)
+        return getattr(self, name)
 
 
 def split_place(row: dict) -> tuple[str, str]:
@@ -772,7 +812,7 @@ def screen_header(procedure: str, screen: PersonaRank, price: Decimal | None = N
     sentences = [
         f"Market {procedure} to {group} in the ZIP codes below.",
         why,
-        f"ZIP codes are ranked by their share of {group}.",
+        ranking_sentence(procedure, persona, price),
         practice.DISTANCE_RULE,
         "Race, ethnicity and education describe these ZIP codes and are not used to rank them.",
     ]
@@ -795,12 +835,20 @@ def zip_insight(
     metrics = metrics if metrics is not None else zip_metrics(row, screen.persona, price)
     city, _ = split_place(row)
     place = f"{display_city(city)} ({row['zip']})" if city else f"ZIP code {row['zip']}"
-    standing = "the highest" if position == 1 else f"the {ordinal(position)}-highest"
     group = screen.persona.age_phrase
-    sentences = [
-        f"Why {place}: {format_percent(row['age_share'])} of adults are "
-        f"{group}, {standing} share in this list."
-    ]
+    standing = (
+        f"Why {place}: it ranks {ordinal(position)} in this list with a score of "
+        f"{row['composite_score']} out of 100"
+    )
+    drivers = driver_sentence(row, screen.persona)
+    if drivers:
+        standing += f", driven most by {drivers}."
+    else:
+        standing += (
+            f". No measure here is above the median of ZIP codes within "
+            f"{practice.MAX_PRACTICE_DISTANCE_MILES} miles."
+        )
+    sentences = [standing, f"{format_percent(row['age_share'])} of adults here are {group}."]
     household = format_money(Decimal(row["median_household_income"]))
     listing = format_money(row["median_listing_price_per_square_foot"])
     if screen.persona.cash == "working":
@@ -958,7 +1006,7 @@ def pareto_tail(
 
 
 def zip_metrics(row: dict, persona: Persona, price: Decimal | None) -> dict:
-    """List values for one ZIP row. Only discretionary_income, copied from the row, is a screen."""
+    """List values for one ZIP row. discretionary_income, copied from the row, is the screen."""
     profile = row.get("profile") or {}
     women = count_sum(profile, [f"female_{column}" for column in persona.age_columns])
     men = count_sum(profile, [f"male_{column}" for column in persona.age_columns])
@@ -1032,21 +1080,167 @@ def describe_sentence(row: dict) -> str:
 
 
 def affordable_rows(screen: PersonaRank, price: Decimal | None) -> list[dict]:
-    """The persona's passing ZIPs that can cover the price, re-ranked, top 25."""
+    """The persona's ZIPs that pass the cash screen and, with a price, cover it."""
     candidates = screen.passed if screen.passed else screen.rows
     if price is None:
-        return candidates[:TOP_N]
-    return [row for row in candidates if covers_price(row, price)][:TOP_N]
+        return list(candidates)
+    return [row for row in candidates if covers_price(row, price)]
+
+
+def percentile_ranks(values: dict[str, Decimal | None]) -> dict[str, Decimal]:
+    """Each ZIP's percentile rank among the non-blank values, from 0 to 1.
+
+    Tied values share the middle of their ranks. A blank value, or a factor
+    with fewer than two values, gets NEUTRAL_PERCENTILE.
+    """
+    present = sorted(value for value in values.values() if value is not None)
+    count = len(present)
+    ranks: dict[str, Decimal] = {}
+    for zip_code, value in values.items():
+        if value is None or count < 2:
+            ranks[zip_code] = NEUTRAL_PERCENTILE
+            continue
+        below = bisect_left(present, value)
+        equal = bisect_right(present, value) - below
+        ranks[zip_code] = (Decimal(below) + Decimal(equal - 1) / 2) / Decimal(count - 1)
+    return ranks
+
+
+def factor_value(factor: str, row: dict, metrics: dict) -> Decimal | None:
+    if factor == "age_share":
+        return row["age_share"]
+    value = metrics.get(factor)
+    if value is None:
+        return None
+    if factor in ranking_weights.PER_ADULT_FACTORS:
+        adults = row.get("adult_population")
+        return Decimal(value) / Decimal(adults) if adults else None
+    return Decimal(value)
+
+
+def score_screen(procedure: str, screen: PersonaRank, price: Decimal | None = None) -> list[dict]:
+    """One procedure list for one persona, ranked by composite_score, top 25.
+
+    The hard screens come first: the cash screen, then, with a price, the
+    affordability screen. Percentile ranks are taken over every eligible ZIP
+    within 50 miles, including ZIPs a screen dropped.
+    """
+    candidates = affordable_rows(screen, price)
+    if not candidates:
+        return []
+    weights = ranking_weights.weights(procedure, price is not None)
+    pool = list(screen.eligible)
+    listed = {row["zip"] for row in pool}
+    pool += [row for row in candidates if row["zip"] not in listed]
+    metrics = {row["zip"]: zip_metrics(row, screen.persona, price) for row in pool}
+    percentiles = {
+        factor: percentile_ranks(
+            {row["zip"]: factor_value(factor, row, metrics[row["zip"]]) for row in pool}
+        )
+        for factor in weights
+    }
+    scored: list[dict] = []
+    for row in candidates:
+        zip_code = row["zip"]
+        total = Decimal(0)
+        parts: dict[str, Decimal | None] = dict.fromkeys(SCORE_COLUMNS)
+        for factor, weight in weights.items():
+            part = Decimal(100) * weight * percentiles[factor][zip_code]
+            total += part
+            parts[f"score_{factor}"] = part.quantize(SCORE_PLACES, rounding=ROUND_HALF_UP)
+        scored.append(
+            {
+                **row,
+                **metrics[zip_code],
+                "procedure": procedure,
+                "surgeon_fee_midpoint": price,
+                "persona": screen.persona.label,
+                "household_income_middle": screen.household_income_middle,
+                "per_capita_income_middle": screen.per_capita_income_middle,
+                "listing_price_middle": screen.listing_price_middle,
+                "score": total,
+                "composite_score": total.quantize(COMPOSITE_PLACES, rounding=ROUND_HALF_UP),
+                **parts,
+                "percentiles": {factor: percentiles[factor][zip_code] for factor in weights},
+            }
+        )
+    scored.sort(
+        key=lambda row: (
+            -row["score"],
+            -row["age_share"],
+            -cash_signal(row, screen.persona),
+            row["zip"],
+        )
+    )
+    ranked = scored[:TOP_N]
+    for position, row in enumerate(ranked, start=1):
+        row["rank"] = position
+    return ranked
+
+
+def score_drivers(row: dict) -> list[str]:
+    """Up to three factors above the median that add the most to the score."""
+    ranks = row.get("percentiles") or {}
+    order = sorted(
+        ranks, key=lambda factor: (-row[f"score_{factor}"], ranking_weights.FACTORS.index(factor))
+    )
+    return [factor for factor in order if ranks[factor] > NEUTRAL_PERCENTILE][:3]
+
+
+def percentile_phrase(rank: Decimal) -> str:
+    if rank >= 1:
+        return "the highest within 50 miles"
+    points = int((rank * 100).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+    return f"{ordinal(min(99, max(1, points)))} percentile"
+
+
+def plain_list(items: list[str]) -> str:
+    if len(items) <= 1:
+        return "".join(items)
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+def persona_words(template: str, persona: Persona) -> str:
+    return template.format(group=persona.age_phrase, householder=persona.householder_phrase)
+
+
+def driver_sentence(row: dict, persona: Persona) -> str:
+    ranks = row.get("percentiles") or {}
+    drivers = [
+        f"{persona_words(ranking_weights.DRIVER_PHRASES[factor], persona)} "
+        f"({percentile_phrase(ranks[factor])})"
+        for factor in score_drivers(row)
+    ]
+    return plain_list(drivers)
+
+
+def ranking_sentence(procedure: str, persona: Persona, price: Decimal | None) -> str:
+    weights = ranking_weights.weights(procedure, price is not None)
+    measures = [
+        f"{persona_words(ranking_weights.FACTOR_LABELS[factor], persona)} "
+        f"({int((weight * 100).quantize(Decimal(1), rounding=ROUND_HALF_UP))}%)"
+        for factor, weight in sorted(weights.items(), key=lambda item: -item[1])
+    ]
+    return (
+        "ZIP codes are ranked by a score from 0 to 100 that compares each one with the other "
+        f"ZIP codes within {practice.MAX_PRACTICE_DISTANCE_MILES} miles on these weighted "
+        f"measures: {plain_list(measures)}."
+    )
 
 
 def render_screen(
-    procedure: str, screen: PersonaRank, price: Decimal | None = None
+    procedure: str,
+    screen: PersonaRank,
+    price: Decimal | None = None,
+    scored: list[dict] | None = None,
 ) -> list[BulletRow]:
     header = screen_header(procedure, screen, price)
+    scored = score_screen(procedure, screen, price) if scored is None else scored
     rows: list[BulletRow] = []
-    for position, row in enumerate(affordable_rows(screen, price), start=1):
+    for position, row in enumerate(scored, start=1):
         city, state = split_place(row)
-        metrics = zip_metrics(row, screen.persona, price)
         rows.append(
             BulletRow(
                 header=header,
@@ -1057,7 +1251,7 @@ def render_screen(
                 practice_zip_code=row.get("practice_zip_code"),
                 county=row.get("county"),
                 distance_from_practice_miles=row.get("distance_from_practice_miles"),
-                insight=zip_insight(screen, row, position, price, metrics, procedure),
+                insight=zip_insight(screen, row, position, price, row, procedure),
                 household_income=row["median_household_income"],
                 individual_income=row["per_capita_income"],
                 median_listing_price_per_square_foot=row["median_listing_price_per_square_foot"],
@@ -1065,24 +1259,55 @@ def render_screen(
                 sex=sex_label(row.get("female_share")),
                 race_and_ethnicity=row.get("race_and_ethnicity"),
                 education_level=row.get("education_level"),
-                **{name: metrics[name] for name in DESCRIPTIVE_LIST_NAMES},
+                **{name: row[name] for name in DESCRIPTIVE_LIST_NAMES},
+                composite_score=row["composite_score"],
+                scores={name: row[name] for name in SCORE_COLUMNS},
             )
         )
     return rows
+
+
+ProcedureLists = dict[str, list[tuple[PersonaRank, list[dict]]]]
+
+
+def procedure_lists(
+    procedures_in_year: list[str],
+    screens: list[PersonaRank],
+    prices: dict[str, Decimal | None] | None = None,
+) -> ProcedureLists:
+    """Scored persona lists for each procedure, in persona-list order."""
+    prices = prices or {}
+    by_label = {screen.persona.label: screen for screen in screens}
+    lists: ProcedureLists = {}
+    for name in procedures_in_year:
+        price = prices.get(name)
+        lists[name] = [
+            (by_label[label], score_screen(name, by_label[label], price))
+            for label in PROCEDURE_PERSONAS.get(name, ())
+        ]
+    return lists
+
+
+def bullets_from_lists(
+    lists: ProcedureLists, prices: dict[str, Decimal | None] | None = None
+) -> dict[str, list[BulletRow]]:
+    prices = prices or {}
+    return {
+        name: [
+            row
+            for screen, scored in persona_lists
+            for row in render_screen(name, screen, prices.get(name), scored)
+        ]
+        for name, persona_lists in lists.items()
+    }
 
 
 def bullet_rows(
     procedure: str, screens: list[PersonaRank], price: Decimal | None = None
 ) -> list[BulletRow]:
     """ZIP rows for one procedure's persona lists, in list order. A group with no ZIP adds none."""
-    labels = PROCEDURE_PERSONAS.get(procedure)
-    if not labels:
-        return []
-    by_label = {screen.persona.label: screen for screen in screens}
-    rows: list[BulletRow] = []
-    for label in labels:
-        rows.extend(render_screen(procedure, by_label[label], price))
-    return rows
+    lists = procedure_lists([procedure], screens, {procedure: price})
+    return bullets_from_lists(lists, {procedure: price})[procedure]
 
 
 def bullets_by_procedure(
@@ -1090,11 +1315,7 @@ def bullets_by_procedure(
     screens: list[PersonaRank],
     prices: dict[str, Decimal | None] | None = None,
 ) -> dict[str, list[BulletRow]]:
-    prices = prices or {}
-    bullets: dict[str, list[BulletRow]] = {}
-    for name in procedures_in_year:
-        bullets[name] = bullet_rows(name, screens, prices.get(name))
-    return bullets
+    return bullets_from_lists(procedure_lists(procedures_in_year, screens, prices), prices)
 
 
 def fee_midpoint(low: object, high: object) -> Decimal | None:
@@ -1107,11 +1328,14 @@ def fee_midpoint(low: object, high: object) -> Decimal | None:
 RANK_DISTANCE_PLACES = Decimal("0.1")
 
 
-def flatten(screens: list[PersonaRank]) -> list[dict]:
-    """cash_pay_zip_rank rows. Every row has the practice ZIP and its distance to one decimal."""
+def flatten(lists: ProcedureLists) -> list[dict]:
+    """cash_pay_zip_rank rows, one per procedure, persona, and ranked ZIP.
+
+    Every row has the practice ZIP and its distance to one decimal.
+    """
     rows: list[dict] = []
-    for screen in screens:
-        for row in screen.rows:
+    for persona_lists in lists.values():
+        for row in (item for _screen, scored in persona_lists for item in scored):
             distance = row.get("distance_from_practice_miles")
             if row.get("practice_zip_code") != practice.PRACTICE_ZIP_CODE or practice.beyond_distance(distance):
                 raise SystemExit(f"ZIP {row['zip']} is outside the practice area but was ranked.")
@@ -1167,8 +1391,42 @@ def schema_sql() -> str:
     return (
         f"CREATE TABLE IF NOT EXISTS {RANK_TABLE} (\n"
         f"{body},\n"
-        "    PRIMARY KEY (persona, zip)\n"
+        f"    PRIMARY KEY ({', '.join(RANK_KEY)})\n"
         ");\n"
+    )
+
+
+RANK_KEY = ("procedure", "persona", "zip")
+RANK_KEY_NAME = f"{RANK_TABLE_NAME}_pkey"
+
+
+def rank_key_columns(cur) -> list[str]:
+    cur.execute(
+        """
+        SELECT kcu.column_name
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON kcu.constraint_name = tc.constraint_name
+         AND kcu.table_schema = tc.table_schema
+        WHERE tc.table_schema = 'public'
+          AND tc.table_name = %s
+          AND tc.constraint_type = 'PRIMARY KEY'
+        ORDER BY kcu.ordinal_position
+        """,
+        (RANK_TABLE_NAME,),
+    )
+    return [str(name) for (name,) in (cur.fetchall() or [])]
+
+
+def ensure_rank_key(cur) -> None:
+    """Key the emptied table on procedure, persona, and ZIP. An older key was persona and ZIP."""
+    if rank_key_columns(cur) == list(RANK_KEY):
+        return
+    cur.execute(f"ALTER TABLE {RANK_TABLE} DROP CONSTRAINT IF EXISTS {RANK_KEY_NAME}")
+    for name in RANK_KEY:
+        cur.execute(f"ALTER TABLE {RANK_TABLE} ALTER COLUMN {quote_ident(name)} SET NOT NULL")
+    cur.execute(
+        f"ALTER TABLE {RANK_TABLE} ADD CONSTRAINT {RANK_KEY_NAME} PRIMARY KEY ({', '.join(RANK_KEY)})"
     )
 
 
@@ -1328,8 +1586,22 @@ def bullet_update(rows: list[BulletRow]) -> tuple:
     if not rows:
         return (None,) * (1 + len(BULLET_LIST_COLUMNS))
     return ("\n".join(row.header for row in rows),) + tuple(
-        [getattr(row, name) for row in rows] for name in BULLET_LIST_NAMES
+        [row.value(name) for row in rows] for name in BULLET_LIST_NAMES
     )
+
+
+def procedure_prices(
+    procedure_rows: list[tuple[int, str, object, object]], preferred_year: int
+) -> tuple[int, list[str], dict[str, Decimal | None]]:
+    """The bullet report year, its procedures, and each fee midpoint."""
+    chosen = select_bullet_report_year(preferred_year, procedure_rows)
+    names = [name for year, name, _low, _high in procedure_rows if year == chosen]
+    prices = {
+        name: fee_midpoint(low, high)
+        for year, name, low, high in procedure_rows
+        if year == chosen
+    }
+    return chosen, names, prices
 
 
 def apply_marketing_bullets(
@@ -1337,13 +1609,14 @@ def apply_marketing_bullets(
     screens: list[PersonaRank],
     procedure_rows: list[tuple[int, str, object, object]],
     preferred_year: int,
+    lists: ProcedureLists | None = None,
 ) -> tuple[int, int]:
     """Write bullet rows on one qualifying report year and blank every other year.
 
     Surgeon fee columns are not updated. A blank fee stays blank.
     """
     ensure_bullet_columns(cur)
-    chosen = select_bullet_report_year(preferred_year, procedure_rows)
+    chosen, names, prices = procedure_prices(procedure_rows, preferred_year)
     assignments = ", ".join(
         f"{quote_ident(name)} = %s" for name in BULLET_CSV_COLUMNS
     )
@@ -1352,13 +1625,9 @@ def apply_marketing_bullets(
         f"UPDATE {procedures.TABLE} SET {cleared} WHERE report_year <> %s",
         (chosen,),
     )
-    names = [name for year, name, _low, _high in procedure_rows if year == chosen]
-    prices = {
-        name: fee_midpoint(low, high)
-        for year, name, low, high in procedure_rows
-        if year == chosen
-    }
-    bullets = bullets_by_procedure(names, screens, prices)
+    if lists is None:
+        lists = procedure_lists(names, screens, prices)
+    bullets = bullets_from_lists(lists, prices)
     updates = [bullet_update(bullets[name]) + (chosen, name) for name in names]
     if updates:
         cur.executemany(
@@ -1375,35 +1644,42 @@ def save_rank(
     updated_at: datetime | None = None,
     *,
     preferred_year: int,
-) -> tuple[int, int, int]:
-    """Replace the rank snapshot and write procedure bullets. Do not drop tables."""
+) -> tuple[int, int, int, list[dict]]:
+    """Replace the rank snapshot and write procedure bullets. Do not drop tables.
+
+    The rank rows are the procedure lists for the bullet report year, so they
+    use that year's fee midpoints. They are returned for the CSV.
+    """
     if "redfin_real_estate_value" in DELETE_RANK_SQL:
         raise SystemExit("The rank refresh must not delete Redfin rows.")
     updated_at = dataset_stamp.stamp(updated_at)
-    rows = flatten(screens)
     stored = RANK_COLUMNS + (dataset_stamp.COLUMN,)
     column_list = ", ".join(quote_ident(name) for name in stored)
     placeholders = ", ".join(["%s"] * len(stored))
     insert_sql = f"INSERT INTO {RANK_TABLE} ({column_list}) VALUES ({placeholders})"
-    _updated_at, stamped = dataset_stamp.stamp_rows(
-        [tuple(rank_db_value(name, row) for name in RANK_COLUMNS) for row in rows],
-        updated_at,
-    )
     with conn.transaction():
         with conn.cursor() as cur:
+            procedure_rows = fetch_procedure_rows(cur)
+            _year, names, prices = procedure_prices(procedure_rows, preferred_year)
+            lists = procedure_lists(names, screens, prices)
+            rows = flatten(lists)
+            _updated_at, stamped = dataset_stamp.stamp_rows(
+                [tuple(rank_db_value(name, row) for name in RANK_COLUMNS) for row in rows],
+                updated_at,
+            )
             ensure_rank_columns(cur)
             cur.execute(DELETE_RANK_SQL)
+            ensure_rank_key(cur)
             if stamped:
                 cur.executemany(insert_sql, stamped)
-            procedure_rows = fetch_procedure_rows(cur)
             year, bullet_count = apply_marketing_bullets(
-                cur, screens, procedure_rows, preferred_year
+                cur, screens, procedure_rows, preferred_year, lists
             )
             cur.execute(f"SELECT COUNT(*) FROM {RANK_TABLE}")
             count = cur.fetchone()[0]
     if count != len(rows):
         raise SystemExit(f"{RANK_TABLE} has {count} rows after loading {len(rows)}.")
-    return count, year, bullet_count
+    return count, year, bullet_count, rows
 
 
 def procedure_csv_cell(value: object) -> object:
@@ -1583,13 +1859,14 @@ def main(argv: list[str] | None = None) -> int:
     join_rows = read_join_csv(Path(args[0]))
     preferred_year = join_acs_year(join_rows)
     screens = rank_personas(join_rows)
-    rows = flatten(screens)
-    write_rank_csv(rows)
-    summary = ", ".join(f"{len(screen.rows)} for {screen.persona.label}" for screen in screens)
-    print(f"Ranked cash-pay ZIPs: {summary}. Wrote {len(rows)} rows to {OUTPUT_CSV_NAME}.")
+    summary = ", ".join(f"{len(screen.passed)} for {screen.persona.label}" for screen in screens)
+    print(f"ZIPs passing the cash screen: {summary}.")
     if not database_url():
+        rows = flatten(procedure_lists(list(PROCEDURE_PERSONAS), screens))
+        write_rank_csv(rows)
         print(
-            f"{DATABASE_URL_ENV} is not set. "
+            f"{DATABASE_URL_ENV} is not set, so no surgeon fee was read and no list was "
+            f"screened for affordability. Wrote {len(rows)} rows to {OUTPUT_CSV_NAME}. "
             f"Left {RANK_TABLE} and {procedures.TABLE} unchanged."
         )
         return 0
@@ -1597,9 +1874,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"dataset_updated_at: {updated_at.isoformat()}")
     try:
         with load_california.connect() as conn:
-            count, year, bullet_count = save_rank(
+            count, year, bullet_count, rows = save_rank(
                 conn, screens, updated_at, preferred_year=preferred_year
             )
+            write_rank_csv(rows)
             fee_count = export_procedure_fees(conn)
     except SystemExit as exc:
         print(public_error(exc), file=sys.stderr)
@@ -1607,6 +1885,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(public_error(exc), file=sys.stderr)
         return 1
+    print(f"Wrote {len(rows)} rows to {OUTPUT_CSV_NAME}.")
     print(
         f"Replaced {RANK_TABLE} with {count} rows. "
         f"Wrote {procedures.MARKETING_BULLETS} on {bullet_count} rows "

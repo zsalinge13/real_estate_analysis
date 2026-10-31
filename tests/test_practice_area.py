@@ -241,7 +241,7 @@ class RankTests(unittest.TestCase):
         self.assertIn("medians of ZIP codes within 50 miles of the practice, $200,000", bullet.header)
         self.assertIn("the median of ZIP codes within 50 miles of the practice.", bullet.insight)
         self.assertNotIn("Los Angeles County", bullet.header + bullet.insight)
-        self.assertEqual(rank.RANK_COLUMNS[4:7], practice.FIELDS)
+        self.assertEqual(rank.RANK_COLUMNS[6:9], practice.FIELDS)
 
 
 class DistanceRuleTests(unittest.TestCase):
@@ -288,7 +288,7 @@ class DistanceRuleTests(unittest.TestCase):
 
     def test_no_output_row_is_over_50_miles(self):
         screens = rank.rank_personas(self.rows())
-        ranked = rank.flatten(screens)
+        ranked = rank.flatten(rank.procedure_lists(list(rank.PROCEDURE_PERSONAS), screens))
         self.assertTrue(ranked)
         for row in ranked:
             self.assertEqual(row["practice_zip_code"], "90210")
@@ -314,9 +314,10 @@ class DistanceRuleTests(unittest.TestCase):
 
     def test_a_ranked_far_row_is_refused(self):
         screens = rank.rank_personas(self.rows())
-        screens[0].rows[0]["distance_from_practice_miles"] = Decimal("50.01")
+        lists = rank.procedure_lists(["rhinoplasty"], screens)
+        lists["rhinoplasty"][0][1][0]["distance_from_practice_miles"] = Decimal("50.01")
         with self.assertRaises(SystemExit):
-            rank.flatten(screens)
+            rank.flatten(lists)
 
 
 class CensusTests(unittest.TestCase):

@@ -359,7 +359,7 @@ class BulletTests(unittest.TestCase):
         young = rows("breast augmentation")
         older = rows("facelift")
         def lists(name):
-            return [(row.age_range, row.zip_code, row.insight) for row in rows(name)]
+            return [(row.age_range, row.zip_code) for row in rows(name)]
 
         self.assertEqual(lists("breast augmentation"), lists("rhinoplasty"))
         self.assertEqual(lists("breast augmentation"), lists("buttock augmentation with fat grafting"))
@@ -380,14 +380,21 @@ class BulletTests(unittest.TestCase):
             "Why: median household income and median listing price per square foot in these "
             "ZIP codes are at or above the medians of ZIP codes within 50 miles of the practice, $200 and $345. "
             "Affordability wasn't checked because this procedure has no published surgeon fee. "
-            "ZIP codes are ranked by their share of adults ages 25 to 44. "
+            "ZIP codes are ranked by a score from 0 to 100 that compares each one with the other "
+            "ZIP codes within 50 miles on these weighted measures: share of adults ages 25 to 44 (38%), "
+            "women's share of adults ages 25 to 44 (25%), home ownership among households headed by "
+            "someone 25–44 (13%), share of employed women in management and professional jobs (13%), "
+            "mothers of children under 18 per adult (5%), mothers of children under 6 per adult (4%), "
+            "and recent births per adult (4%). "
             "Only ZIP codes within 50 miles of the practice (ZIP 90210) are included, because patients "
             "rarely drive more than 50 miles to a new practice that is still building its reputation. "
             "Race, ethnicity and education describe these ZIP codes and are not used to rank them.",
         )
         self.assertEqual(
             young[0].insight,
-            "Why Pasadena (90012): 40.0% of adults are ages 25 to 44, the highest share in this list. "
+            "Why Pasadena (90012): it ranks 1st in this list with a score of 31.3 out of 100. "
+            "No measure here is above the median of ZIP codes within 50 miles. "
+            "40.0% of adults here are ages 25 to 44. "
             "Median household income is $300 and median listing price per square foot is $640, "
             "both at or above the median of ZIP codes within 50 miles of the practice. "
             "After an estimated $26 in taxes and $53,014 in essential costs, a typical household headed "
@@ -464,6 +471,8 @@ class BulletTests(unittest.TestCase):
             "race_and_ethnicity",
             "education_level",
             *rank.DESCRIPTIVE_LIST_NAMES,
+            "composite_score",
+            *rank.SCORE_COLUMNS,
         ]
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "procedure_surgeon_fees.csv"
@@ -512,10 +521,13 @@ class BulletTests(unittest.TestCase):
         names = ["breast augmentation", "rhinoplasty", "facelift", "eyelid surgery"]
         bullets = rank.bullets_by_procedure(names, self.screens)
         def body(name):
-            return [(row.age_range, row.rank, row.zip_code, row.insight) for row in bullets[name]]
+            return [(row.age_range, row.rank, row.zip_code) for row in bullets[name]]
 
         self.assertEqual(body("breast augmentation"), body("rhinoplasty"))
         self.assertEqual(body("facelift"), body("eyelid surgery"))
+        self.assertNotEqual(
+            bullets["breast augmentation"][0].composite_score, bullets["rhinoplasty"][0].composite_score
+        )
         self.assertTrue(bullets["rhinoplasty"][0].header.startswith("Market rhinoplasty to "))
         self.assertNotEqual(bullets["breast augmentation"], bullets["facelift"])
 
@@ -613,7 +625,7 @@ class AffordabilityTests(unittest.TestCase):
             "25–44", {"90001": 50000, "90002": just_enough, "90003": 300000}
         )
         kept = rank.render_screen("tummy tuck", screen, price)
-        self.assertEqual([(row.rank, row.zip_code) for row in kept], [(1, "90002"), (2, "90003")])
+        self.assertEqual([(row.rank, row.zip_code) for row in kept], [(1, "90003"), (2, "90002")])
         self.assertEqual([row.income_needed for row in kept], [just_enough, just_enough])
         unscreened = rank.render_screen("tummy tuck", screen, None)
         self.assertEqual([row.rank for row in unscreened], [1, 2, 3])
@@ -626,9 +638,9 @@ class AffordabilityTests(unittest.TestCase):
         self.assertIn(
             "a typical household headed by someone 25–44 here has nothing left of its $50,000 income "
             "for discretionary items.",
-            unscreened[0].insight,
+            unscreened[2].insight,
         )
-        self.assertIn("the 2nd-highest share in this list.", kept[1].insight)
+        self.assertTrue(kept[1].insight.startswith("Why Place 90002 (90002): it ranks 2nd in this list "))
 
     def test_join_without_housing_costs_is_refused(self):
         rows = [
@@ -669,7 +681,7 @@ class AffordabilityTests(unittest.TestCase):
             {"forehead lift": Decimal(5750), "facelift": Decimal(15500)},
         )
         self.assertEqual(
-            [row.zip_code for row in bullets["forehead lift"]], ["90001", "90002", "90001", "90002"]
+            [row.zip_code for row in bullets["forehead lift"]], ["90002", "90001", "90001", "90002"]
         )
         self.assertEqual([row.zip_code for row in bullets["facelift"]], ["90002", "90002"])
         self.assertEqual([row.rank for row in bullets["facelift"]], [1, 1])
@@ -1138,6 +1150,17 @@ class MeasureColumnTests(unittest.TestCase):
                 "owner_occupied_share_age_range",
                 "women_management_professional_share",
                 "women_arts_entertainment_media_share",
+                "composite_score",
+                "score_age_share",
+                "score_women_share_of_age_range",
+                "score_affordable_households_share",
+                "score_affordable_households",
+                "score_mothers_with_children_under_18",
+                "score_mothers_with_children_under_6",
+                "score_recent_births",
+                "score_owner_occupied_share_age_range",
+                "score_women_management_professional_share",
+                "score_women_arts_entertainment_media_share",
             ],
         )
 
@@ -1338,7 +1361,7 @@ class BulletYearTests(unittest.TestCase):
             report_year,
             name,
         ) = updates[0]
-        self.assertEqual(len(descriptive), len(rank.DESCRIPTIVE_LIST_NAMES))
+        self.assertEqual(len(descriptive), len(rank.DESCRIPTIVE_LIST_NAMES) + 1 + len(rank.SCORE_COLUMNS))
         self.assertEqual((races, educations), ([None], [None]))
         self.assertEqual(incomes, [300000])
         self.assertEqual(individual_incomes, [80000])
@@ -1349,7 +1372,7 @@ class BulletYearTests(unittest.TestCase):
         self.assertEqual((cities, states, zips), (["Pasadena"], [""], ["90012"]))
         self.assertEqual((practice_zips, counties, distances), (["90210"], ["Los Angeles"], [Decimal("8.50")]))
         self.assertTrue(
-            insights[0].startswith("Why Pasadena (90012): 40.0% of adults are ages 25 to 44, the highest share")
+            insights[0].startswith("Why Pasadena (90012): it ranks 1st in this list with a score of ")
         )
         joined = " ".join(sql for sql, _params in cursor.statements)
         for name, sql_type in rank.BULLET_LIST_COLUMNS:
@@ -1439,6 +1462,9 @@ class SaveTests(unittest.TestCase):
                         (2025, "facelift", None, None),
                         (2025, "rhinoplasty", None, None),
                     ]
+                elif "information_schema.table_constraints" in text:
+                    self._fetchone = None
+                    self._fetchall = [("persona",), ("zip",)]
                 elif "SELECT COUNT(*)" in text:
                     self._fetchone = (self.count,)
                 else:
@@ -1474,10 +1500,14 @@ class SaveTests(unittest.TestCase):
                 return self.cursor_obj
 
         conn = Connection()
-        count, year, bullet_count = rank.save_rank(
+        count, year, bullet_count, rows = rank.save_rank(
             conn, screens, moment, preferred_year=2024
         )
         self.assertEqual(count, 1)
+        self.assertEqual(
+            [(row["procedure"], row["persona"], row["zip"], row["surgeon_fee_midpoint"]) for row in rows],
+            [("rhinoplasty", "25–44", "90012", Decimal(9500))],
+        )
         self.assertEqual(year, 2024)
         self.assertEqual(bullet_count, 3)
         statements = conn.cursor_obj.statements
@@ -1508,6 +1538,16 @@ class SaveTests(unittest.TestCase):
         self.assertEqual(by_name["custom procedure"][:6], (None,) * 6)
         insert = next(rows for sql, rows in statements if "INSERT INTO public.cash_pay_zip_rank" in sql)
         self.assertIs(insert[0][-1], moment)
+        texts = [sql for sql, _params in statements]
+        delete_at = texts.index("DELETE FROM public.cash_pay_zip_rank")
+        key_at = texts.index(
+            "ALTER TABLE public.cash_pay_zip_rank ADD CONSTRAINT cash_pay_zip_rank_pkey "
+            "PRIMARY KEY (procedure, persona, zip)"
+        )
+        self.assertLess(delete_at, key_at)
+        self.assertIn("ALTER TABLE public.cash_pay_zip_rank DROP CONSTRAINT IF EXISTS cash_pay_zip_rank_pkey", texts)
+        insert_at = next(index for index, sql in enumerate(texts) if sql.startswith("INSERT INTO public.cash_pay_zip_rank"))
+        self.assertLess(key_at, insert_at)
         update_sql = next(sql for sql, rows in statements if isinstance(rows, list) and "marketing_bullets = %s" in sql)
         self.assertNotIn("dataset_updated_at", update_sql)
         self.assertNotIn("surgeon_fee_low", update_sql)
@@ -1523,7 +1563,7 @@ class SaveTests(unittest.TestCase):
     def test_schema_adds_the_rank_table_without_dropping(self):
         schema = rank.schema_sql()
         self.assertIn("CREATE TABLE IF NOT EXISTS public.cash_pay_zip_rank", schema)
-        self.assertIn("PRIMARY KEY (persona, zip)", schema)
+        self.assertIn("PRIMARY KEY (procedure, persona, zip)", schema)
         self.assertIn("dataset_updated_at timestamptz", schema)
         self.assertNotIn("DROP", schema.upper())
         self.assertEqual(rank.DELETE_RANK_SQL, "DELETE FROM public.cash_pay_zip_rank")
@@ -1565,12 +1605,24 @@ class MainTests(unittest.TestCase):
             self.assertIn("procedure_surgeon_fees unchanged", stdout.getvalue())
             with output.open(newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["zip"], "90012")
+        young = [name for name, labels in rank.PROCEDURE_PERSONAS.items() if "25–44" in labels]
+        self.assertEqual([row["procedure"] for row in rows], young)
+        self.assertTrue(all(row["zip"] == "90012" and row["rank"] == "1" for row in rows))
+        self.assertTrue(all(row["surgeon_fee_midpoint"] == "" for row in rows))
+        self.assertIn("no list was screened for affordability", stdout.getvalue())
+        rows = [row for row in rows if row["procedure"] == "rhinoplasty"]
         self.assertEqual(rows[0]["persona"], "25–44")
-        self.assertEqual(rows[0]["rank"], "1")
         self.assertEqual(rows[0]["zip_name"], "Pasadena")
-        self.assertEqual(list(rank.RANK_COLUMNS[-7:]), list(discretionary.FIELD_TYPES))
+        start = rank.RANK_COLUMNS.index("household_income_for_age_range")
+        self.assertEqual(list(rank.RANK_COLUMNS[start : start + 7]), list(discretionary.FIELD_TYPES))
+        self.assertEqual(
+            list(rank.RANK_COLUMNS[start + 7 :]),
+            list(rank.MEASURE_COLUMNS) + ["composite_score", *rank.SCORE_COLUMNS],
+        )
+        self.assertEqual(rows[0]["score_affordable_households"], "")
+        self.assertNotEqual(rows[0]["score_women_arts_entertainment_media_share"], "")
+        self.assertEqual(rows[0]["score_mothers_with_children_under_18"], "")
+        self.assertEqual(rows[0]["composite_score"], "50.0")
         self.assertEqual(rows[0]["household_income_for_age_range"], "200000")
         self.assertEqual(rows[0]["average_cost_of_living"], "53014")
         self.assertEqual(rows[0]["income_bracket"], "$200,000 and more")
@@ -1585,7 +1637,7 @@ class MainTests(unittest.TestCase):
         def save_rank(conn, screens, updated_at=None, preferred_year=None):
             calls.append("save")
             seen["year"] = preferred_year
-            return (1, preferred_year, 2)
+            return (1, preferred_year, 2, [{"procedure": "facelift", "persona": "45–64", "zip": "90012"}])
 
         def export_procedure_fees(conn, path=None):
             calls.append("export")
@@ -1638,6 +1690,7 @@ class MainTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(calls, ["save", "export"])
         self.assertEqual(seen["year"], 2024)
+        self.assertIn("Wrote 1 rows to cash_pay_zip_rank.csv.", stdout.getvalue())
         self.assertIn("Wrote 9 rows to procedure_surgeon_fees.csv.", stdout.getvalue())
 
 
@@ -1713,6 +1766,8 @@ class ProcedureFeeExportTests(unittest.TestCase):
             "race_and_ethnicity",
             "education_level",
             *rank.DESCRIPTIVE_LIST_NAMES,
+            "composite_score",
+            *rank.SCORE_COLUMNS,
         ]
         moment = datetime(2026, 10, 27, 17, 0, tzinfo=timezone.utc)
         headers = "25–44. Ranked.\n45–64. Ranked."
@@ -1732,7 +1787,7 @@ class ProcedureFeeExportTests(unittest.TestCase):
             ["woman", None],
             ["Hispanic or Latino", None],
             ["Bachelor's degree", None],
-        ) + tuple([None, None] for _name in rank.DESCRIPTIVE_LIST_NAMES)
+        ) + tuple([None, None] for _name in (*rank.DESCRIPTIVE_LIST_NAMES, "composite_score", *rank.SCORE_COLUMNS))
         blank = (None,) * (len(rank.BULLET_CSV_COLUMNS) - 1)
         table_rows = [
             (2024, "facelift", 10, 1000, 2000, "national", "https://example.test/2024", moment, None, "older") + blank,
@@ -1766,6 +1821,8 @@ class ProcedureFeeExportTests(unittest.TestCase):
                         "race_and_ethnicity",
                         "education_level",
                         *rank.DESCRIPTIVE_LIST_NAMES,
+                        "composite_score",
+                        *rank.SCORE_COLUMNS,
                     ],
                 )
                 written = list(reader)
