@@ -378,7 +378,8 @@ class BulletTests(unittest.TestCase):
             "Why: median household income and median listing price per square foot in these "
             "ZIP codes are at or above the Los Angeles County medians of $200 and $345. "
             "Affordability wasn't checked because this procedure has no published surgeon fee. "
-            "ZIP codes are ranked by their share of adults ages 18 to 34.",
+            "ZIP codes are ranked by their share of adults ages 18 to 34. "
+            "Race, ethnicity and education describe these ZIP codes and are not used to rank them.",
         )
         self.assertTrue(
             young[1].header.startswith("Market breast augmentation to adults ages 35 to 44 in the ZIP codes below. Why: ")
@@ -453,6 +454,8 @@ class BulletTests(unittest.TestCase):
             "median_listing_price_per_square_foot",
             "age_range",
             "sex",
+            "race_and_ethnicity",
+            "education_level",
         ]
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "procedure_surgeon_fees.csv"
@@ -461,7 +464,7 @@ class BulletTests(unittest.TestCase):
                 [
                     (2024, "facelift", 8000) + stored,
                     (2024, "custom procedure", 100) + rank.bullet_update([]),
-                    (2025, "facelift", None) + (None,) * 11,
+                    (2025, "facelift", None) + (None,) * 13,
                 ],
                 path,
             )
@@ -705,6 +708,16 @@ class MeasureColumnTests(unittest.TestCase):
                     adult_population="100",
                     female_population="538",
                     male_population="462",
+                    hispanic_or_latino_population="150",
+                    non_hispanic_white_population="520",
+                    non_hispanic_black_population="40",
+                    non_hispanic_asian_population="230",
+                    non_hispanic_other_or_multiracial_population="60",
+                    education_less_than_high_school="20",
+                    education_high_school="80",
+                    education_some_college_or_associate="150",
+                    education_bachelors="410",
+                    education_graduate_or_professional="340",
                 )
             ]
         )
@@ -717,7 +730,19 @@ class MeasureColumnTests(unittest.TestCase):
             self.assertEqual(row.individual_income, 120000)
             self.assertEqual(row.median_listing_price_per_square_foot, Decimal("857.5"))
             self.assertEqual(row.sex, "woman")
-            self.assertIn("Women are 53.8% of residents.", row.insight)
+            self.assertEqual(row.race_and_ethnicity, "Non-Hispanic White")
+            self.assertEqual(row.education_level, "Bachelor's degree")
+            self.assertTrue(
+                row.insight.endswith(
+                    "Women are 53.8% of residents. Non-Hispanic White residents are the largest "
+                    "group at 52.0%, and 75.0% of adults 25 and older have a bachelor's degree or higher."
+                ),
+                row.insight,
+            )
+            self.assertIn(
+                " Race, ethnicity and education describe these ZIP codes and are not used to rank them. Source: ",
+                row.header,
+            )
             self.assertIn("median listing price per square foot is $858", row.insight.lower())
             self.assertTrue(row.insight.startswith("Why Marina del Rey (90292): "))
             self.assertEqual(row.city, "marina del rey")
@@ -737,6 +762,51 @@ class MeasureColumnTests(unittest.TestCase):
             self.assertNotRegex(text, r"\$[\d,]+\.\d")
             self.assertTrue(text.endswith("."), text)
         self.assertIn("$8,251", " ".join(texts))
+
+    def test_race_and_education_describe_but_never_rank(self):
+        def zip_row(zip_code, white, hispanic, bachelors, share):
+            return join_row(
+                zip_code,
+                median_household_income="300000",
+                population_35_44=share,
+                adult_population="100",
+                hispanic_or_latino_population=hispanic,
+                non_hispanic_white_population=white,
+                non_hispanic_black_population="0",
+                non_hispanic_asian_population="0",
+                non_hispanic_other_or_multiracial_population="0",
+                education_less_than_high_school="10",
+                education_high_school="10",
+                education_some_college_or_associate="10",
+                education_bachelors=bachelors,
+                education_graduate_or_professional="0",
+            )
+
+        rows = [zip_row("90001", "10", "90", "0", "30"), zip_row("90002", "90", "10", "90", "20")]
+        plain = [join_row(row["zip"], **{k: v for k, v in row.items() if k not in rank.RACE_ETHNICITY_LABELS and k not in rank.EDUCATION_LABELS}) for row in rows]
+        ranked = rank.bullet_rows("tummy tuck", rank.rank_personas(rows), Decimal(10750))
+        unlabeled = rank.bullet_rows("tummy tuck", rank.rank_personas(plain), Decimal(10750))
+        self.assertEqual(
+            [(row.age_range, row.rank, row.zip_code) for row in ranked],
+            [(row.age_range, row.rank, row.zip_code) for row in unlabeled],
+        )
+        self.assertEqual([row.race_and_ethnicity for row in ranked[:2]], ["Hispanic or Latino", "Non-Hispanic White"])
+        self.assertEqual([row.education_level for row in ranked[:2]], ["Less than high school", "Bachelor's degree"])
+        self.assertEqual([row.race_and_ethnicity for row in unlabeled], [None] * len(unlabeled))
+        self.assertNotIn("largest group", unlabeled[0].insight)
+        self.assertNotIn("bachelor", unlabeled[0].insight)
+        self.assertIn("are not used to rank them.", unlabeled[0].header)
+        tie = rank.largest_group(
+            {name: "5" for name in rank.EDUCATION_LABELS}, rank.EDUCATION_LABELS
+        )
+        self.assertEqual(tie, ("Less than high school", Decimal("0.2")))
+        only_degree = dict(rows[1])
+        only_degree["non_hispanic_asian_population"] = ""
+        described = rank.describe_zip(only_degree)
+        self.assertEqual(
+            rank.describe_sentence(described),
+            "Of adults 25 and older, 75.0% have a bachelor's degree or higher.",
+        )
 
     def test_sex_is_woman_at_fifty_percent_or_more(self):
         self.assertEqual(rank.sex_label(Decimal("0.538")), "woman")
@@ -763,7 +833,10 @@ class MeasureColumnTests(unittest.TestCase):
         row = rank.bullet_rows("tummy tuck", screens, Decimal(10750))[0]
         self.assertEqual(row.sex, "man")
         self.assertIn("Women are 49.9% of residents.", row.insight)
-        self.assertEqual(rank.BULLET_LIST_COLUMNS[-1], ("sex", "text[]"))
+        self.assertEqual(
+            rank.BULLET_LIST_COLUMNS[-3:],
+            (("sex", "text[]"), ("race_and_ethnicity", "text[]"), ("education_level", "text[]")),
+        )
 
     def test_blank_female_share_leaves_sex_blank(self):
         screens = rank.rank_personas(
@@ -787,16 +860,16 @@ class MeasureColumnTests(unittest.TestCase):
         expanded = rank.expand_marketing_bullet_rows(
             columns, [(2024, "arm lift") + rank.bullet_update(found)]
         )
-        tail = [row[-5:] for row in expanded]
+        tail = [row[-7:] for row in expanded]
         self.assertEqual(
             tail,
             [
-                (146167, 120000, Decimal("857.5"), "35 to 44", "woman"),
-                (146167, 120000, Decimal("857.5"), "55 and older", "woman"),
+                (146167, 120000, Decimal("857.5"), "35 to 44", "woman", "Non-Hispanic White", "Bachelor's degree"),
+                (146167, 120000, Decimal("857.5"), "55 and older", "woman", "Non-Hispanic White", "Bachelor's degree"),
             ],
         )
         self.assertEqual(
-            list(rank.BULLET_CSV_COLUMNS[-6:]),
+            list(rank.BULLET_CSV_COLUMNS[-8:]),
             [
                 "insight",
                 "household_income",
@@ -804,6 +877,8 @@ class MeasureColumnTests(unittest.TestCase):
                 "median_listing_price_per_square_foot",
                 "age_range",
                 "sex",
+                "race_and_ethnicity",
+                "education_level",
             ],
         )
 
@@ -950,9 +1025,12 @@ class BulletYearTests(unittest.TestCase):
             prices,
             ages,
             sexes,
+            races,
+            educations,
             report_year,
             name,
         ) = updates[0]
+        self.assertEqual((races, educations), ([None], [None]))
         self.assertEqual(incomes, [300000])
         self.assertEqual(individual_incomes, [80000])
         self.assertEqual((len(updates), report_year, name), (1, 2024, "rhinoplasty"))
@@ -1306,6 +1384,8 @@ class ProcedureFeeExportTests(unittest.TestCase):
             "median_listing_price_per_square_foot",
             "age_range",
             "sex",
+            "race_and_ethnicity",
+            "education_level",
         ]
         moment = datetime(2026, 10, 27, 17, 0, tzinfo=timezone.utc)
         headers = "18 to 34. Ranked.\n35 to 44. Ranked."
@@ -1320,8 +1400,10 @@ class ProcedureFeeExportTests(unittest.TestCase):
             [Decimal("858"), Decimal("612.5")],
             ["18 to 34", "35 to 44"],
             ["woman", None],
+            ["Hispanic or Latino", None],
+            ["Bachelor's degree", None],
         )
-        blank = (None,) * 10
+        blank = (None,) * 12
         table_rows = [
             (2024, "facelift", 10, 1000, 2000, "national", "https://example.test/2024", moment, None, "older") + blank,
             (2024, "rhinoplasty", 11, 1100, 2100, "national", "https://example.test/2024", moment, headers, "older") + lists,
@@ -1348,6 +1430,8 @@ class ProcedureFeeExportTests(unittest.TestCase):
                         "median_listing_price_per_square_foot",
                         "age_range",
                         "sex",
+                        "race_and_ethnicity",
+                        "education_level",
                     ],
                 )
                 written = list(reader)
@@ -1376,14 +1460,16 @@ class ProcedureFeeExportTests(unittest.TestCase):
                     row["median_listing_price_per_square_foot"],
                     row["age_range"],
                     row["sex"],
+                    row["race_and_ethnicity"],
+                    row["education_level"],
                 )
                 for row in written
             ],
             [
-                ("", "", "", "", ""),
-                ("146167", "64075", "858", "18 to 34", "woman"),
-                ("98000", "52010", "612.5", "35 to 44", ""),
-                ("", "", "", "", ""),
+                ("", "", "", "", "", "", ""),
+                ("146167", "64075", "858", "18 to 34", "woman", "Hispanic or Latino", "Bachelor's degree"),
+                ("98000", "52010", "612.5", "35 to 44", "", "", ""),
+                ("", "", "", "", "", "", ""),
             ],
         )
         self.assertEqual(written[1]["surgeon_fee_low"], "1100")

@@ -259,6 +259,9 @@ class CensusTests(unittest.TestCase):
                 self.pairs = set(pairs)
                 self.statements: list[str] = []
                 self.inserted: list[tuple] = []
+                self.updates: list[tuple] = []
+                self.blank_added: set[tuple[int, str]] = set()
+                self.rowcount = 0
                 self._rows = None
 
             def __enter__(self):
@@ -267,10 +270,18 @@ class CensusTests(unittest.TestCase):
             def __exit__(self, *_args):
                 return False
 
-            def execute(self, sql, _params=None):
+            def execute(self, sql, params=None):
                 text = " ".join(sql.split())
                 self.statements.append(text)
-                if "SELECT acs_year, zip" in text:
+                self.rowcount = 0
+                if text.startswith("UPDATE"):
+                    key = (params[-2], params[-1])
+                    if key in self.blank_added:
+                        self.blank_added.discard(key)
+                        self.updates.append(tuple(params))
+                        self.rowcount = 1
+                    self._rows = None
+                elif "SELECT acs_year, zip" in text:
                     self._rows = list(self.pairs)
                 elif "COUNT(*)" in text:
                     self._rows = [(len(self.pairs),)]
@@ -306,7 +317,7 @@ class CensusTests(unittest.TestCase):
 
         stamp = datetime(2026, 10, 27, 17, 0, tzinfo=timezone.utc)
         stored = Connection({(2023, "90001"), (2024, "90001")})
-        inserted, total = census.insert_new_years(stored, [(2024, "90001")], stamp)
+        inserted, _filled, total = census.insert_new_years(stored, [(2024, "90001")], stamp)
         self.assertEqual(inserted, 0)
         self.assertEqual(total, 2)
         self.assertEqual(stored.cursor_obj.inserted, [])
@@ -318,7 +329,7 @@ class CensusTests(unittest.TestCase):
         missing = Connection({(2023, "90001")})
         row = (2024, "90001")
         other = (2024, "90211")
-        inserted, total = census.insert_new_years(missing, [row, other], stamp)
+        inserted, _filled, total = census.insert_new_years(missing, [row, other], stamp)
         self.assertEqual(inserted, 2)
         self.assertEqual(total, 3)
         self.assertEqual(
@@ -333,10 +344,120 @@ class CensusTests(unittest.TestCase):
 
         partial = Connection({(2024, "90001")})
         added = (2024, "90210")
-        inserted, total = census.insert_new_years(partial, [added], stamp)
+        inserted, _filled, total = census.insert_new_years(partial, [added], stamp)
         self.assertEqual(inserted, 1)
         self.assertEqual(partial.cursor_obj.inserted, [added + (stamp,)])
         self.assertNotIn("delete", " ".join(partial.cursor_obj.statements).lower())
+
+    def test_stored_zip_gets_only_its_blank_race_and_education_filled(self):
+        class Cursor:
+            def __init__(self):
+                self.statements: list[tuple[str, tuple | None]] = []
+                self.inserted: list[tuple] = []
+                self.blank = {(2024, "90001")}
+                self.rowcount = 0
+                self._rows = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def execute(self, sql, params=None):
+                text = " ".join(sql.split())
+                self.statements.append((text, params))
+                self.rowcount = 0
+                self._rows = None
+                if text.startswith("UPDATE"):
+                    key = (params[-2], params[-1])
+                    if key in self.blank:
+                        self.blank.discard(key)
+                        self.rowcount = 1
+                elif "SELECT acs_year, zip" in text:
+                    self._rows = [(2024, "90001"), (2024, "90002")]
+                elif "COUNT(*)" in text:
+                    self._rows = [(3,)]
+
+            def executemany(self, sql, rows):
+                self.inserted.extend(rows)
+
+            def fetchone(self):
+                return self._rows[0]
+
+            def fetchall(self):
+                return list(self._rows)
+
+        class Connection:
+            def __init__(self):
+                self.cursor_obj = Cursor()
+
+            def transaction(self):
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def cursor(self):
+                return self.cursor_obj
+
+        stamp = datetime(2026, 10, 31, 17, 0, tzinfo=timezone.utc)
+        base = (None,) * (len(census.BASE_COLUMNS) - 2)
+        added = tuple(range(1, len(census.ADDED_COLUMNS) + 1))
+        stored = (2024, "90001") + base + added
+        already_filled = (2024, "90002") + base + added
+        blank = (2024, "90003") + base + (None,) * len(census.ADDED_COLUMNS)
+        conn = Connection()
+        inserted, filled, total = census.insert_new_years(
+            conn, [stored, already_filled, blank], stamp
+        )
+        self.assertEqual((inserted, filled, total), (1, 1, 3))
+        self.assertEqual(conn.cursor_obj.inserted, [blank + (stamp,)])
+        updates = [(sql, params) for sql, params in conn.cursor_obj.statements if sql.startswith("UPDATE")]
+        self.assertEqual([params for _sql, params in updates][0], added + (stamp, 2024, "90001"))
+        self.assertEqual(len(updates), 2)
+        sql = updates[0][0]
+        for name in census.ADDED_COLUMNS:
+            self.assertIn(f"{name} IS NULL", sql)
+        for name in census.BASE_COLUMNS[2:]:
+            self.assertNotIn(f"{name} =", sql)
+        added_sql = " ".join(text for text, _params in conn.cursor_obj.statements)
+        self.assertIn("ADD COLUMN IF NOT EXISTS education_bachelors integer", added_sql)
+        self.assertNotIn("delete", added_sql.lower())
+
+    def test_race_and_education_groups_sum_their_codes(self):
+        estimates = {code: Decimal(1) for _name, codes in census.field_groups() for code in codes}
+        estimates[census.MEASURES["median_age"]] = Decimal("36.5")
+        row = dict(zip(census.COLUMNS, census.row_from_estimates(2024, "90001", estimates)))
+        self.assertEqual(row["hispanic_or_latino_population"], 1)
+        self.assertEqual(row["non_hispanic_white_population"], 1)
+        self.assertEqual(row["non_hispanic_other_or_multiracial_population"], 4)
+        self.assertEqual(row["education_less_than_high_school"], 15)
+        self.assertEqual(row["education_high_school"], 2)
+        self.assertEqual(row["education_some_college_or_associate"], 3)
+        self.assertEqual(row["education_bachelors"], 1)
+        self.assertEqual(row["education_graduate_or_professional"], 3)
+        self.assertEqual(row["population_25_plus"], 24)
+        codes = census.group_codes(census.RACE_ETHNICITY_GROUPS) + census.group_codes(census.EDUCATION_GROUPS)
+        self.assertNotIn("B03002_001E", codes)
+        self.assertNotIn("B03002_002E", codes)
+        self.assertNotIn("B03002_010E", codes)
+        self.assertEqual(len(codes), len(set(codes)))
+        estimates["B15003_022E"] = None
+        estimates["B03002_008E"] = None
+        partial = dict(zip(census.COLUMNS, census.row_from_estimates(2024, "90001", estimates)))
+        self.assertIsNone(partial["education_bachelors"])
+        self.assertIsNone(partial["population_25_plus"])
+        self.assertIsNone(partial["non_hispanic_other_or_multiracial_population"])
+        self.assertEqual(partial["education_high_school"], 2)
+        self.assertEqual(census.COLUMNS[: len(census.BASE_COLUMNS)], census.BASE_COLUMNS)
+        self.assertTrue(set(census.ADDED_COLUMNS) <= census.INTEGER_COLUMNS)
+        schema = census.schema_sql()
+        for name in census.ADDED_COLUMNS:
+            self.assertIn(f"{name} integer,", schema)
 
     def test_age_bands_sum_adults_and_drop_sentinels(self):
         self.assertIsNone(census.parse_estimate("-666666666"))
@@ -357,7 +478,7 @@ class CensusTests(unittest.TestCase):
         self.assertEqual(row[4], Decimal("36.5"))
         self.assertEqual(row[5], 10)
         self.assertEqual(row[6], 12)
-        band_sum = sum(row[8:])
+        band_sum = sum(row[8:13])
         self.assertEqual(row[7], band_sum)
         estimates["B01001_007E"] = None
         partial = census.row_from_estimates(2024, "90001", estimates)
@@ -367,7 +488,9 @@ class CensusTests(unittest.TestCase):
 
     def test_variable_list_stays_within_the_api_limit(self):
         variables = census.estimate_variables()
-        self.assertLessEqual(len(variables), 50)
+        self.assertTrue(all(len(codes) <= 50 for _name, codes in census.field_groups()))
+        self.assertIn("B03002_012E", variables)
+        self.assertIn("B15003_025E", variables)
         self.assertIn("B19013_001E", variables)
         self.assertIn("B19301_001E", variables)
         self.assertIn("B01002_001E", variables)
@@ -751,7 +874,11 @@ class CensusTests(unittest.TestCase):
 
     def test_field_groups_are_separate_calls(self):
         groups = dict(census.field_groups())
-        self.assertEqual(list(groups), ["income", "age", "sex", "age_bands"])
+        self.assertEqual(
+            list(groups), ["income", "age", "sex", "age_bands", "race_ethnicity", "education"]
+        )
+        self.assertEqual(len(groups["race_ethnicity"]), 8)
+        self.assertEqual(len(groups["education"]), 24)
         self.assertEqual(groups["income"], ("B19013_001E", "B19301_001E"))
         self.assertEqual(groups["age"], ("B01002_001E",))
         self.assertEqual(groups["sex"], ("B01001_002E", "B01001_026E"))
@@ -967,7 +1094,7 @@ class CensusTests(unittest.TestCase):
         ):
             census.fetch_zip_batch(2024, ["90001"] * census.BATCH_SIZE)
         pauses = [call.args[0] for call in slept.call_args_list]
-        self.assertEqual(pauses, [census.CALL_PAUSE_SECONDS] * 3)
+        self.assertEqual(pauses, [census.CALL_PAUSE_SECONDS] * (len(census.field_groups()) - 1))
         self.assertGreaterEqual(census.CALL_PAUSE_SECONDS, 2)
         self.assertEqual(len(["90001"] * census.BATCH_SIZE), 10)
 
