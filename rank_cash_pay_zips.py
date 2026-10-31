@@ -10,15 +10,15 @@ procedure rows. When the join year qualifies, bullets are written only
 there. Otherwise they are written only on the most recent report year that
 qualifies. Every other report year is left blank in that column. Fees are
 not copied from another year. The fee load owns the column and does not
-fill it. The same write fills rank (integer[]) and zip_code (text[]) with one
-element per bullet line. A ZIP line holds its rank and 5-digit ZIP, and the
-line text has neither. A header line holds null in both.
+fill it. The stored form is one entry per ranked ZIP, in persona-list order:
+marketing_bullets has one line per ZIP holding that ZIP's age-group header
+sentence, and rank, city, state, zip_code, and insight are same-order lists.
+A group with no ranked ZIP adds no entry.
 After that write succeeds, the same run exports every column of
-procedure_surgeon_fees, including marketing_bullets, rank, and zip_code, for
-the chosen report year and every other report year. The file has one row per
-bullet line. report_year and procedure repeat on each of those rows, rank and
-zip_code are that line's values or blank, and the bullet text has no line
-break inside the cell.
+procedure_surgeon_fees for the chosen report year and every other report
+year. The file has one row per ranked ZIP. report_year, procedure, and the
+fee columns repeat on each of those rows. A procedure year with no ZIP rows
+stays one row with the bullet fields blank. No cell has a line break.
 """
 
 from __future__ import annotations
@@ -44,8 +44,18 @@ MIN_ACTIVE_LISTINGS = 10
 TOP_N = 25
 DATABASE_URL_ENV = load_california.DATABASE_URL_ENV
 BULLET_RANK = "rank"
-BULLET_ZIP_CODE = "zip_code"
 LEGACY_BULLET_RANK = "bullet_rank"
+# Same-order lists on procedure_surgeon_fees. Element i of each list, with
+# line i of marketing_bullets (that ZIP's group header), is one CSV row.
+BULLET_LIST_COLUMNS = (
+    (BULLET_RANK, "integer[]"),
+    ("city", "text[]"),
+    ("state", "text[]"),
+    ("zip_code", "text[]"),
+    ("insight", "text[]"),
+)
+BULLET_LIST_NAMES = tuple(name for name, _sql_type in BULLET_LIST_COLUMNS)
+BULLET_CSV_COLUMNS = ("marketing_bullets",) + BULLET_LIST_NAMES
 
 # Equal age shares are the close case. The higher cash signal ranks first.
 # Household income is that signal for working-age personas. Listing price
@@ -421,16 +431,24 @@ def rank_personas(rows: list[dict[str, str]]) -> list[PersonaRank]:
 
 
 @dataclass(frozen=True)
-class BulletLine:
-    """One marketing bullet line. Header lines have no rank and no ZIP."""
+class BulletRow:
+    """One ranked ZIP under its age group's header sentence."""
 
-    text: str
-    rank: int | None = None
-    zip_code: str | None = None
+    header: str
+    rank: int
+    city: str
+    state: str
+    zip_code: str
+    insight: str
 
 
-def place_name(row: dict) -> str:
-    return str(row.get("zip_name") or "").strip()
+def split_place(row: dict) -> tuple[str, str]:
+    """City and state from the Realtor.com zip_name, such as "marina del rey, ca"."""
+    name = str(row.get("zip_name") or "").strip()
+    city, comma, state = name.rpartition(",")
+    if not comma:
+        return name, ""
+    return city.strip(), state.strip()
 
 
 def screen_header(screen: PersonaRank) -> str:
@@ -469,67 +487,69 @@ def screen_header(screen: PersonaRank) -> str:
     )
 
 
-def zip_bullet(screen: PersonaRank, row: dict) -> str:
+def zip_insight(screen: PersonaRank, row: dict) -> str:
     share = format_percent(row["age_share"])
     if screen.persona.cash == "working":
-        reason = (
+        insight = (
             f"{share} of adults are {screen.persona.age_phrase}. "
             f"Household income {format_money(Decimal(row['median_household_income']))} "
             f"and listing price per square foot {format_money(row['median_listing_price_per_square_foot'])} "
             "are at or above those middles."
         )
     else:
-        reason = (
+        insight = (
             f"{share} of adults are {screen.persona.age_phrase}. "
             f"Listing price per square foot {format_money(row['median_listing_price_per_square_foot'])} and "
             f"per-person income {format_money(Decimal(row['per_capita_income']))} "
             "are at or above those middles."
         )
     if row.get("female_share") is not None:
-        reason += f" Women are {format_percent(row['female_share'])} of residents."
-    name = place_name(row)
-    if not name:
-        return reason
-    return f"{name}: {reason}"
+        insight += f" Women are {format_percent(row['female_share'])} of residents."
+    return insight
 
 
-def render_screen(screen: PersonaRank) -> list[BulletLine]:
-    lines = [BulletLine(screen_header(screen))]
+def render_screen(screen: PersonaRank) -> list[BulletRow]:
+    header = screen_header(screen)
+    rows: list[BulletRow] = []
     for row in screen.rows:
-        lines.append(
-            BulletLine(zip_bullet(screen, row), int(row["rank"]), str(row["zip"]))
+        city, state = split_place(row)
+        rows.append(
+            BulletRow(
+                header=header,
+                rank=int(row["rank"]),
+                city=city,
+                state=state,
+                zip_code=str(row["zip"]),
+                insight=zip_insight(screen, row),
+            )
         )
-    return lines
+    return rows
 
 
-def bullet_lines(procedure: str, screens: list[PersonaRank]) -> list[BulletLine]:
-    """Bullet lines for one procedure's persona lists. Shared lists repeat."""
+def bullet_rows(procedure: str, screens: list[PersonaRank]) -> list[BulletRow]:
+    """ZIP rows for one procedure's persona lists, in list order. A group with no ZIP adds none."""
     labels = PROCEDURE_PERSONAS.get(procedure)
     if not labels:
-        return [BulletLine(f"{procedure} has no cash-pay persona list.")]
+        return []
     by_label = {screen.persona.label: screen for screen in screens}
-    lines: list[BulletLine] = []
+    rows: list[BulletRow] = []
     for label in labels:
-        lines.extend(render_screen(by_label[label]))
-    return lines
-
-
-def marketing_bullets(procedure: str, screens: list[PersonaRank]) -> str:
-    return "\n".join(line.text for line in bullet_lines(procedure, screens))
+        rows.extend(render_screen(by_label[label]))
+    return rows
 
 
 def bullets_by_procedure(
     procedures_in_year: list[str], screens: list[PersonaRank]
-) -> dict[str, list[BulletLine]]:
-    cache: dict[tuple[str, ...], list[BulletLine]] = {}
-    bullets: dict[str, list[BulletLine]] = {}
+) -> dict[str, list[BulletRow]]:
+    cache: dict[tuple[str, ...], list[BulletRow]] = {}
+    bullets: dict[str, list[BulletRow]] = {}
     for name in procedures_in_year:
         labels = PROCEDURE_PERSONAS.get(name)
         if labels is None:
-            bullets[name] = bullet_lines(name, screens)
+            bullets[name] = bullet_rows(name, screens)
             continue
         if labels not in cache:
-            cache[labels] = bullet_lines(name, screens)
+            cache[labels] = bullet_rows(name, screens)
         bullets[name] = cache[labels]
     return bullets
 
@@ -713,11 +733,7 @@ def procedure_column_types(cur) -> dict[str, str]:
 
 
 def ensure_bullet_columns(cur) -> None:
-    """Add rank and zip_code beside marketing_bullets. An old bullet_rank becomes rank.
-
-    Each holds one element per marketing_bullets line, in line order. Header
-    lines hold null.
-    """
+    """Add the same-order bullet lists beside marketing_bullets. An old bullet_rank becomes rank."""
     procedures.ensure_marketing_bullets(cur)
     found = procedure_column_types(cur)
     if LEGACY_BULLET_RANK in found:
@@ -735,13 +751,24 @@ def ensure_bullet_columns(cur) -> None:
                 f"TYPE integer[] USING CASE WHEN {BULLET_RANK} IS NULL THEN NULL "
                 f"ELSE ARRAY[{BULLET_RANK}::integer] END"
             )
-    cur.execute(
-        f"ALTER TABLE {procedures.TABLE} ADD COLUMN IF NOT EXISTS "
-        f"{quote_ident(BULLET_RANK)} integer[]"
-    )
-    cur.execute(
-        f"ALTER TABLE {procedures.TABLE} ADD COLUMN IF NOT EXISTS "
-        f"{quote_ident(BULLET_ZIP_CODE)} text[]"
+    for name, sql_type in BULLET_LIST_COLUMNS:
+        cur.execute(
+            f"ALTER TABLE {procedures.TABLE} ADD COLUMN IF NOT EXISTS "
+            f"{quote_ident(name)} {sql_type}"
+        )
+
+
+def bullet_update(rows: list[BulletRow]) -> tuple:
+    """marketing_bullets holds one header line per ZIP row. No ZIP rows stores null."""
+    if not rows:
+        return (None,) * (1 + len(BULLET_LIST_COLUMNS))
+    return (
+        "\n".join(row.header for row in rows),
+        [row.rank for row in rows],
+        [row.city for row in rows],
+        [row.state for row in rows],
+        [row.zip_code for row in rows],
+        [row.insight for row in rows],
     )
 
 
@@ -751,35 +778,26 @@ def apply_marketing_bullets(
     procedure_rows: list[tuple[int, str, object, object]],
     preferred_year: int,
 ) -> tuple[int, int]:
-    """Write bullet text on one qualifying report year and blank every other year.
+    """Write bullet rows on one qualifying report year and blank every other year.
 
-    rank and zip_code are written with the text, one element per line.
     Surgeon fee columns are not updated. A blank fee stays blank.
     """
     ensure_bullet_columns(cur)
     chosen = select_bullet_report_year(preferred_year, procedure_rows)
+    assignments = ", ".join(
+        f"{quote_ident(name)} = %s" for name in BULLET_CSV_COLUMNS
+    )
+    cleared = ", ".join(f"{quote_ident(name)} = NULL" for name in BULLET_CSV_COLUMNS)
     cur.execute(
-        f"UPDATE {procedures.TABLE} SET {procedures.MARKETING_BULLETS} = NULL, "
-        f"{BULLET_RANK} = NULL, {BULLET_ZIP_CODE} = NULL "
-        "WHERE report_year <> %s",
+        f"UPDATE {procedures.TABLE} SET {cleared} WHERE report_year <> %s",
         (chosen,),
     )
     names = [name for year, name, _low, _high in procedure_rows if year == chosen]
     bullets = bullets_by_procedure(names, screens)
-    updates = [
-        (
-            "\n".join(line.text for line in bullets[name]),
-            [line.rank for line in bullets[name]],
-            [line.zip_code for line in bullets[name]],
-            chosen,
-            name,
-        )
-        for name in names
-    ]
+    updates = [bullet_update(bullets[name]) + (chosen, name) for name in names]
     if updates:
         cur.executemany(
-            f"UPDATE {procedures.TABLE} SET {procedures.MARKETING_BULLETS} = %s, "
-            f"{BULLET_RANK} = %s, {BULLET_ZIP_CODE} = %s "
+            f"UPDATE {procedures.TABLE} SET {assignments} "
             "WHERE report_year = %s AND procedure = %s",
             updates,
         )
@@ -832,66 +850,72 @@ def procedure_csv_cell(value: object) -> object:
 
 
 def marketing_bullet_cells(value: object) -> list[str]:
-    """One cell per stored line. A cell does not contain a line break.
-
-    Blank text stays one empty cell. Header lines stay, in order, and each
-    ZIP bullet stays on its own cell in that same rank order.
-    """
+    """One header cell per stored line, one line per ZIP row. Blank text has none."""
     if value is None:
-        return [""]
+        return []
     text = str(value).replace("\r\n", "\n").replace("\r", "\n")
-    if text.strip() == "":
-        return [""]
-    cells = [line.strip() for line in text.split("\n") if line.strip()]
-    if not cells:
-        return [""]
-    if any("\n" in cell or "\r" in cell for cell in cells):
-        raise SystemExit("A marketing bullet still contains a line break.")
-    return cells
+    return [line.strip() for line in text.split("\n") if line.strip()]
 
 
-def per_line_values(value: object, count: int, column: str) -> list[object]:
-    """Split a stored rank or zip_code list so element i goes with bullet line i."""
+def per_row_values(value: object, count: int, column: str) -> list[object]:
+    """Element i of a stored same-order list goes with ZIP row i."""
     if value is None:
         return [None] * count
     if not isinstance(value, (list, tuple)):
         raise SystemExit(f"{procedures.TABLE}.{column} is not a list.")
     if len(value) != count:
         raise SystemExit(
-            f"{procedures.TABLE}.{column} has {len(value)} values for {count} bullet lines."
+            f"{procedures.TABLE}.{column} has {len(value)} values for {count} ZIP rows."
         )
     return list(value)
 
 
+def bullet_csv_columns(columns: list[str]) -> list[str]:
+    """Table columns in table order, then the bullet fields in their fixed order."""
+    return [name for name in columns if name not in BULLET_CSV_COLUMNS] + list(
+        BULLET_CSV_COLUMNS
+    )
+
+
 def expand_marketing_bullet_rows(columns: list[str], rows: list[tuple]) -> list[tuple]:
-    """Repeat report_year and procedure once per bullet line, with its rank and ZIP."""
+    """One row per ranked ZIP, with report_year, procedure, and fees repeated.
+
+    A procedure year with no ZIP rows stays one row with the bullet fields blank.
+    Rows follow bullet_csv_columns(columns).
+    """
     if procedures.MARKETING_BULLETS not in columns:
         raise SystemExit(
             f"{procedures.TABLE} is missing {procedures.MARKETING_BULLETS}."
         )
-    index = columns.index(procedures.MARKETING_BULLETS)
-    paired = [
-        columns.index(name)
-        for name in (BULLET_RANK, BULLET_ZIP_CODE)
-        if name in columns
-    ]
+    kept = [index for index, name in enumerate(columns) if name not in BULLET_CSV_COLUMNS]
+    header_index = columns.index(procedures.MARKETING_BULLETS)
     expanded: list[tuple] = []
     for row in rows:
         if len(row) != len(columns):
             raise SystemExit(
                 f"{procedures.OUTPUT_CSV_NAME} row does not match its columns."
             )
-        cells = marketing_bullet_cells(row[index])
-        values = {
-            column: per_line_values(row[column], len(cells), columns[column])
-            for column in paired
-        }
-        for position, cell in enumerate(cells):
-            copied = list(row)
-            copied[index] = cell
-            for column in paired:
-                copied[column] = values[column][position]
-            expanded.append(tuple(copied))
+        base = [row[index] for index in kept]
+        headers = marketing_bullet_cells(row[header_index])
+        lists = [
+            per_row_values(
+                row[columns.index(name)] if name in columns else None,
+                len(headers),
+                name,
+            )
+            for name in BULLET_LIST_NAMES
+        ]
+        if headers and all(value is None for value in lists[0]):
+            raise SystemExit(
+                f"{procedures.TABLE} has {procedures.MARKETING_BULLETS} without ZIP rows."
+            )
+        if not headers:
+            expanded.append(tuple(base + [None] * len(BULLET_CSV_COLUMNS)))
+            continue
+        for position, header in enumerate(headers):
+            expanded.append(
+                tuple(base + [header] + [values[position] for values in lists])
+            )
     return expanded
 
 
@@ -953,7 +977,7 @@ def write_procedure_fee_csv(
     try:
         with tmp.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle, lineterminator="\n")
-            writer.writerow(columns)
+            writer.writerow(bullet_csv_columns(columns))
             for row in expanded:
                 writer.writerow([procedure_csv_cell(value) for value in row])
         os.replace(tmp, path)
