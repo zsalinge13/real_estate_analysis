@@ -48,8 +48,23 @@ def flood_columns(_cur) -> tuple[str, ...]:
     return pull_nfhl_flood_zones.CSV_COLUMNS
 
 
-def census_columns(_cur) -> tuple[str, ...]:
-    return pull_census_zip_population.COLUMNS
+def census_columns(cur) -> tuple[str, ...]:
+    """The load's columns. A table not yet given the race, ethnicity, and education columns omits them."""
+    cur.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = %s
+        """,
+        (pull_census_zip_population.TABLE_NAME,),
+    )
+    present = {name for (name,) in cur.fetchall()}
+    return tuple(
+        name
+        for name in pull_census_zip_population.COLUMNS
+        if name in pull_census_zip_population.BASE_COLUMNS or name in present
+    )
 
 
 def procedure_columns(_cur) -> tuple[str, ...]:

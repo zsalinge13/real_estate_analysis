@@ -243,6 +243,86 @@ class JoinTests(unittest.TestCase):
         self.assertEqual(join.column_sql_type("active_listing_count"), "integer")
         self.assertEqual(join.column_sql_type("zip"), "text")
         self.assertEqual(join.column_sql_type("postal_code"), "text")
+        for name in census.ADDED_COLUMNS:
+            self.assertEqual(join.column_sql_type(name), "integer")
+            self.assertIn(f"    {name} integer,", schema)
+
+    def test_race_and_education_carry_through_the_join(self):
+        left = census_row("90001", 2024, "10")
+        left["hispanic_or_latino_population"] = "120"
+        left["education_bachelors"] = "45"
+        _year, _month, joined = join.join_records([left], [redfin_row("90001", "2024_08")])
+        self.assertEqual(joined[0]["hispanic_or_latino_population"], "120")
+        self.assertEqual(joined[0]["education_bachelors"], "45")
+        self.assertEqual(joined[0]["education_high_school"], "")
+        self.assertEqual(
+            list(join.JOIN_COLUMNS[: len(census.COLUMNS)]), list(census.COLUMNS)
+        )
+
+    def test_older_census_file_without_the_added_columns_still_joins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "census.csv"
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=list(census.BASE_COLUMNS), lineterminator="\n",
+                    extrasaction="ignore",
+                )
+                writer.writeheader()
+                writer.writerow(census_row("90001", 2024, "10"))
+            rows = join.read_census_csv(path)
+        self.assertEqual(rows[0]["education_bachelors"], "")
+        _year, _month, joined = join.join_records(rows, [redfin_row("90001", "2024_08")])
+        self.assertTrue(all(joined[0][name] == "" for name in census.ADDED_COLUMNS))
+
+    def test_replace_adds_missing_columns_to_an_existing_join_table(self):
+        class Cursor:
+            def __init__(self):
+                self.statements = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def execute(self, sql, _params=None):
+                self.statements.append(" ".join(sql.split()))
+
+            def executemany(self, sql, rows):
+                self.rows = list(rows)
+
+            def fetchone(self):
+                return (len(self.rows),)
+
+        class Connection:
+            def __init__(self):
+                self.cursor_obj = Cursor()
+
+            def transaction(self):
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def cursor(self):
+                return self.cursor_obj
+
+        _year, _month, joined = join.join_records(
+            [census_row("90001", 2024, "10")], [redfin_row("90001", "2024_08")]
+        )
+        conn = Connection()
+        self.assertEqual(join.replace_join_table(conn, joined), 1)
+        statements = conn.cursor_obj.statements
+        delete_at = statements.index(join.DELETE_JOIN_SQL)
+        for name in census.ADDED_COLUMNS:
+            alter = (
+                f"ALTER TABLE public.zip_census_redfin_join ADD COLUMN IF NOT EXISTS {name} integer"
+            )
+            self.assertIn(alter, statements)
+            self.assertLess(statements.index(alter), delete_at)
 
 
 class WorkflowTests(unittest.TestCase):

@@ -1,4 +1,4 @@
-"""Load ACS 5-year income, age, and sex for Los Angeles County home-value ZIPs.
+"""Load ACS 5-year income, age, sex, race and ethnicity, and education for Los Angeles County home-value ZIPs.
 
 The Census download requests California ZCTAs. Those codes come from the
 ZCTA-to-county relationship file (any area in a county whose FIPS starts
@@ -14,21 +14,25 @@ the home-value extract and whose majority land area is Los Angeles County
 office, dermatology, or NPI locations.
 
 A run fetches only the latest published ACS 5-year vintage. Income, age,
-sex, and age bands are separate requests, about 10 ZIP codes at a time.
+sex, age bands, race and ethnicity (B03002), and education (B15003) are
+separate requests, about 10 ZIP codes at a time.
 The script waits a couple of seconds between calls. A failure retries that
 piece. Each finished batch is saved before the next batch starts. A closed
 connection, a dropped connection, or a read timeout is retried more than
 once, and each retry waits longer than the one before it. The read timeout
 is 45 minutes. Older years stay in public.census_zip_population. A ZIP
-already stored for that year is not inserted again. The CSV is still
-written when DATABASE_URL is unset.
+already stored for that year is not inserted again. When its race,
+ethnicity, and education columns are all blank, only those columns are
+filled in. The CSV is still written when DATABASE_URL is unset.
 
 When CENSUS_API_KEY is set, it is sent on the first request and is never printed.
 The request URL is not printed.
 
 A newly inserted ZIP records dataset_updated_at. Every new row in the run
 gets that same timestamptz. A ZIP already stored for that year is not
-rewritten, so its timestamp stays as it was.
+rewritten, so its timestamp stays as it was, unless its blank race,
+ethnicity, and education columns are filled in. That row gets the run's
+timestamp.
 """
 
 from __future__ import annotations
@@ -89,6 +93,69 @@ COLUMNS = (
     "population_55_64",
     "population_65_plus",
 )
+# B03002. Hispanic or Latino of any race is one group. The rest are
+# non-Hispanic single races. American Indian and Alaska Native, Native
+# Hawaiian and Other Pacific Islander, some other race, and two or more races
+# are each small in Los Angeles County ZIPs, so they share one group.
+RACE_ETHNICITY_GROUPS = {
+    "hispanic_or_latino_population": (("B03002_012E", "Hispanic or Latino:"),),
+    "non_hispanic_white_population": (("B03002_003E", "Not Hispanic or Latino:!!White alone"),),
+    "non_hispanic_black_population": (
+        ("B03002_004E", "Not Hispanic or Latino:!!Black or African American alone"),
+    ),
+    "non_hispanic_asian_population": (("B03002_006E", "Not Hispanic or Latino:!!Asian alone"),),
+    "non_hispanic_other_or_multiracial_population": (
+        ("B03002_005E", "Not Hispanic or Latino:!!American Indian and Alaska Native alone"),
+        (
+            "B03002_007E",
+            "Not Hispanic or Latino:!!Native Hawaiian and Other Pacific Islander alone",
+        ),
+        ("B03002_008E", "Not Hispanic or Latino:!!Some other race alone"),
+        ("B03002_009E", "Not Hispanic or Latino:!!Two or more races:"),
+    ),
+}
+# B15003 counts people 25 and older by highest level finished.
+EDUCATION_GROUPS = {
+    "education_less_than_high_school": (
+        ("B15003_002E", "No schooling completed"),
+        ("B15003_003E", "Nursery school"),
+        ("B15003_004E", "Kindergarten"),
+        ("B15003_005E", "1st grade"),
+        ("B15003_006E", "2nd grade"),
+        ("B15003_007E", "3rd grade"),
+        ("B15003_008E", "4th grade"),
+        ("B15003_009E", "5th grade"),
+        ("B15003_010E", "6th grade"),
+        ("B15003_011E", "7th grade"),
+        ("B15003_012E", "8th grade"),
+        ("B15003_013E", "9th grade"),
+        ("B15003_014E", "10th grade"),
+        ("B15003_015E", "11th grade"),
+        ("B15003_016E", "12th grade, no diploma"),
+    ),
+    "education_high_school": (
+        ("B15003_017E", "Regular high school diploma"),
+        ("B15003_018E", "GED or alternative credential"),
+    ),
+    "education_some_college_or_associate": (
+        ("B15003_019E", "Some college, less than 1 year"),
+        ("B15003_020E", "Some college, 1 or more years, no degree"),
+        ("B15003_021E", "Associate's degree"),
+    ),
+    "education_bachelors": (("B15003_022E", "Bachelor's degree"),),
+    "education_graduate_or_professional": (
+        ("B15003_023E", "Master's degree"),
+        ("B15003_024E", "Professional school degree"),
+        ("B15003_025E", "Doctorate degree"),
+    ),
+}
+COUNT_GROUP_TABLES = (("B03002", RACE_ETHNICITY_GROUPS), ("B15003", EDUCATION_GROUPS))
+POPULATION_25_PLUS = "population_25_plus"
+ADDED_COLUMNS = (
+    tuple(RACE_ETHNICITY_GROUPS) + (POPULATION_25_PLUS,) + tuple(EDUCATION_GROUPS)
+)
+BASE_COLUMNS = COLUMNS
+COLUMNS = BASE_COLUMNS + ADDED_COLUMNS
 INTEGER_COLUMNS = {
     "acs_year",
     "median_household_income",
@@ -101,6 +168,7 @@ INTEGER_COLUMNS = {
     "population_45_54",
     "population_55_64",
     "population_65_plus",
+    *ADDED_COLUMNS,
 }
 # Male B01001 age bands, then the matching female row 24 codes later.
 MALE_BANDS = {
@@ -165,8 +233,12 @@ def band_codes() -> dict[str, tuple[str, ...]]:
     return codes
 
 
+def group_codes(groups: dict[str, tuple[tuple[str, str], ...]]) -> tuple[str, ...]:
+    return tuple(code for pairs in groups.values() for code, _phrase in pairs)
+
+
 def field_groups() -> tuple[tuple[str, tuple[str, ...]], ...]:
-    """Income, age, sex, and age bands are separate Census calls.
+    """Income, age, sex, age bands, race and ethnicity, and education are separate Census calls.
 
     A failure retries the piece that failed. It does not repeat the pieces
     that already succeeded.
@@ -191,6 +263,8 @@ def field_groups() -> tuple[tuple[str, tuple[str, ...]], ...]:
             ),
         ),
         ("age_bands", tuple(band_variables)),
+        ("race_ethnicity", group_codes(RACE_ETHNICITY_GROUPS)),
+        ("education", group_codes(EDUCATION_GROUPS)),
     )
     for name, variables in groups:
         if not variables or len(variables) > 50:
@@ -199,9 +273,10 @@ def field_groups() -> tuple[tuple[str, tuple[str, ...]], ...]:
 
 
 def estimate_variables() -> tuple[str, ...]:
+    """Every variable the run reads. Each field group is its own request of 50 or fewer."""
     variables = [code for _name, codes in field_groups() for code in codes]
-    if len(variables) > 50:
-        raise SystemExit("The ACS request has more than 50 variables.")
+    if len(variables) != len(set(variables)):
+        raise SystemExit("An ACS variable is requested twice.")
     return tuple(variables)
 
 
@@ -611,8 +686,8 @@ def latest_vintage(this_year: int) -> int:
     raise SystemExit("The Census API did not list an ACS 5-year vintage.")
 
 
-def group_labels(year: int) -> dict[str, str]:
-    url = f"https://api.census.gov/data/{year}/acs/acs5/groups/B01001.json"
+def group_labels(year: int, group: str = "B01001") -> dict[str, str]:
+    url = f"https://api.census.gov/data/{year}/acs/acs5/groups/{group}.json"
     payload = json.loads(fetch_with_optional_key(url))
     variables = payload.get("variables") or {}
     labels = {}
@@ -643,6 +718,12 @@ def verify_labels(year: int) -> None:
                 raise SystemExit(f"ACS {year} changed the male {column} bands.")
             if labels.get(female) != expected_band_label("Female", phrase):
                 raise SystemExit(f"ACS {year} changed the female {column} bands.")
+    for table, groups in COUNT_GROUP_TABLES:
+        table_labels = group_labels(year, table)
+        for column, pairs in groups.items():
+            for code, phrase in pairs:
+                if table_labels.get(code) != f"Estimate!!Total:!!{phrase}":
+                    raise SystemExit(f"ACS {year} changed the {table} {column} label.")
     income = variable_label(year, MEASURES["median_household_income"]).lower()
     per_capita = variable_label(year, MEASURES["per_capita_income"]).lower()
     age = variable_label(year, MEASURES["median_age"]).lower()
@@ -698,6 +779,14 @@ def row_from_estimates(year: int, zip_code: str, estimates: dict[str, Decimal | 
         for column, codes in bands.items()
     }
     adult = sum_counts(list(band_values.values()))
+    counted = {
+        column: sum_counts([as_int(estimates.get(code), column) for code, _phrase in pairs])
+        for _table, groups in COUNT_GROUP_TABLES
+        for column, pairs in groups.items()
+    }
+    counted[POPULATION_25_PLUS] = sum_counts(
+        [counted[column] for column in EDUCATION_GROUPS]
+    )
     income = as_int(estimates.get(MEASURES["median_household_income"]), "income")
     per_capita = as_int(estimates.get(MEASURES["per_capita_income"]), "per capita income")
     age = estimates.get(MEASURES["median_age"])
@@ -715,7 +804,7 @@ def row_from_estimates(year: int, zip_code: str, estimates: dict[str, Decimal | 
         band_values["population_45_54"],
         band_values["population_55_64"],
         band_values["population_65_plus"],
-    )
+    ) + tuple(counted[column] for column in ADDED_COLUMNS)
 
 
 def chunks(items: list[str], size: int):
@@ -943,6 +1032,10 @@ def connect():
     )
 
 
+def added_columns_sql() -> str:
+    return "\n".join(f"    {name} integer," for name in ADDED_COLUMNS)
+
+
 def schema_sql() -> str:
     return f"""
 CREATE TABLE IF NOT EXISTS {TABLE} (
@@ -959,6 +1052,7 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     population_45_54 integer,
     population_55_64 integer,
     population_65_plus integer,
+{added_columns_sql()}
     {dataset_stamp.COLUMN} {dataset_stamp.SQL_TYPE},
     PRIMARY KEY (zip, acs_year)
 );
@@ -976,12 +1070,37 @@ def stored_pairs(cur, years: list[int]) -> set[tuple[int, str]]:
     return {(int(year), str(zip_code)) for year, zip_code in cur.fetchall()}
 
 
+def backfill_sql() -> str:
+    """Fill the added columns on a stored ZIP only when every one of them is blank."""
+    assignments = ", ".join(f"{name} = %s" for name in ADDED_COLUMNS)
+    still_blank = " AND ".join(f"{name} IS NULL" for name in ADDED_COLUMNS)
+    return (
+        f"UPDATE {TABLE} SET {assignments}, {dataset_stamp.COLUMN} = %s "
+        f"WHERE acs_year = %s AND zip = %s AND {still_blank}"
+    )
+
+
+def backfill_params(rows: list[tuple], updated_at: datetime) -> list[tuple]:
+    start = len(BASE_COLUMNS)
+    params = []
+    for row in rows:
+        added = tuple(row[start : start + len(ADDED_COLUMNS)])
+        if all(value is None for value in added):
+            continue
+        params.append(added + (updated_at, row[0], row[1]))
+    return params
+
+
 def insert_new_years(
     conn, rows: list[tuple], updated_at: datetime | None = None
-) -> tuple[int, int]:
-    """Insert ZIP rows that are not already stored. Do not delete older years."""
+) -> tuple[int, int, int]:
+    """Insert ZIP rows that are not already stored. Do not delete older years.
+
+    A stored ZIP whose race, ethnicity, and education columns are all blank
+    gets only those columns filled in. Returns inserted, filled, and total rows.
+    """
     if not rows:
-        return 0, 0
+        return 0, 0, 0
     updated_at = dataset_stamp.stamp(updated_at)
     stored = COLUMNS + (dataset_stamp.COLUMN,)
     column_list = ", ".join(stored)
@@ -997,6 +1116,8 @@ def insert_new_years(
                 f"ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS "
                 f"{dataset_stamp.COLUMN} {dataset_stamp.SQL_TYPE}"
             )
+            for name in ADDED_COLUMNS:
+                cur.execute(f"ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS {name} integer")
             years = sorted({int(row[0]) for row in rows})
             already = stored_pairs(cur, years)
             pending = [
@@ -1007,9 +1128,14 @@ def insert_new_years(
             _updated_at, stamped = dataset_stamp.stamp_rows(pending, updated_at)
             if stamped:
                 cur.executemany(sql, stamped)
+            stored_rows = [row for row in rows if (int(row[0]), str(row[1])) in already]
+            filled = 0
+            for params in backfill_params(stored_rows, updated_at):
+                cur.execute(backfill_sql(), params)
+                filled += max(cur.rowcount or 0, 0)
             cur.execute(f"SELECT COUNT(*) FROM {TABLE}")
             total = cur.fetchone()[0]
-    return len(stamped), total
+    return len(stamped), filled, total
 
 
 def checkpoint_download(holder: dict, rows_so_far: list[tuple], new_rows: list[tuple]) -> None:
@@ -1024,8 +1150,11 @@ def checkpoint_download(holder: dict, rows_so_far: list[tuple], new_rows: list[t
         return
     if holder.get("conn") is None:
         holder["conn"] = connect()
-    added, total = insert_new_years(holder["conn"], new_rows, holder.get("updated_at"))
+    added, filled, total = insert_new_years(
+        holder["conn"], new_rows, holder.get("updated_at")
+    )
     holder["inserted"] = holder.get("inserted", 0) + added
+    holder["filled"] = holder.get("filled", 0) + filled
     holder["total"] = total
 
 
@@ -1069,6 +1198,7 @@ def main() -> int:
     holder: dict = {
         "conn": None,
         "inserted": 0,
+        "filled": 0,
         "total": None,
         "updated_at": updated_at,
     }
@@ -1103,11 +1233,12 @@ def main() -> int:
         print(f"{DATABASE_URL_ENV} is not set. Left {TABLE} unchanged.")
         return 0
     inserted = holder["inserted"]
+    filled = holder["filled"]
     total = holder["total"]
     if total is None:
         try:
             with connect() as conn:
-                inserted, total = insert_new_years(conn, rows)
+                inserted, filled, total = insert_new_years(conn, rows, updated_at)
         except SystemExit as exc:
             print(public_error(exc), file=sys.stderr)
             return 1
@@ -1116,6 +1247,7 @@ def main() -> int:
             return 1
     print(
         f"Inserted {inserted} new rows into {TABLE}. "
+        f"Filled race, ethnicity, and education on {filled} stored rows. "
         f"The table has {total} rows. Older vintages were kept."
     )
     return notify_refresh_review(TABLE_NAME)

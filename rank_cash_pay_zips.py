@@ -67,6 +67,8 @@ BULLET_LIST_COLUMNS = (
     ("median_listing_price_per_square_foot", "numeric[]"),
     ("age_range", "text[]"),
     ("sex", "text[]"),
+    ("race_and_ethnicity", "text[]"),
+    ("education_level", "text[]"),
 )
 BULLET_LIST_NAMES = tuple(name for name, _sql_type in BULLET_LIST_COLUMNS)
 BULLET_CSV_COLUMNS = ("marketing_bullets",) + BULLET_LIST_NAMES
@@ -158,6 +160,23 @@ PROCEDURE_PERSONAS = {
 }
 
 LOWERCASE_CITY_WORDS = frozenset({"del", "de", "of", "the"})
+# Labels for the largest group in a ZIP. The order breaks a tie. These
+# describe the ZIP and are never a screen or a rank key.
+RACE_ETHNICITY_LABELS = {
+    "hispanic_or_latino_population": "Hispanic or Latino",
+    "non_hispanic_white_population": "Non-Hispanic White",
+    "non_hispanic_black_population": "Non-Hispanic Black",
+    "non_hispanic_asian_population": "Non-Hispanic Asian",
+    "non_hispanic_other_or_multiracial_population": "Non-Hispanic other or multiracial",
+}
+EDUCATION_LABELS = {
+    "education_less_than_high_school": "Less than high school",
+    "education_high_school": "High school",
+    "education_some_college_or_associate": "Some college or associate degree",
+    "education_bachelors": "Bachelor's degree",
+    "education_graduate_or_professional": "Graduate or professional degree",
+}
+BACHELORS_OR_HIGHER = ("education_bachelors", "education_graduate_or_professional")
 
 RANK_COLUMNS = (
     "persona",
@@ -363,6 +382,40 @@ def female_share(row: dict[str, str]) -> Decimal | None:
     return Decimal(female) / Decimal(total)
 
 
+def largest_group(row: dict[str, str], labels: dict[str, str]) -> tuple[str | None, Decimal | None]:
+    """Label and share of the largest group. Blank when any count is missing."""
+    counts = {name: as_int(row.get(name), name) for name in labels}
+    if any(value is None for value in counts.values()):
+        return None, None
+    total = sum(counts.values())
+    if total <= 0:
+        return None, None
+    name = max(labels, key=lambda column: counts[column])
+    return labels[name], Decimal(counts[name]) / Decimal(total)
+
+
+def bachelors_or_higher_share(row: dict[str, str]) -> Decimal | None:
+    counts = [as_int(row.get(name), name) for name in EDUCATION_LABELS]
+    if any(value is None for value in counts):
+        return None
+    total = sum(counts)
+    if total <= 0:
+        return None
+    degree = sum(as_int(row.get(name), name) for name in BACHELORS_OR_HIGHER)
+    return Decimal(degree) / Decimal(total)
+
+
+def describe_zip(row: dict[str, str]) -> dict:
+    race, race_share = largest_group(row, RACE_ETHNICITY_LABELS)
+    education, _share = largest_group(row, EDUCATION_LABELS)
+    return {
+        "race_and_ethnicity": race,
+        "race_and_ethnicity_share": race_share,
+        "education_level": education,
+        "bachelors_or_higher_share": bachelors_or_higher_share(row),
+    }
+
+
 def age_count(row: dict[str, str], persona: Persona) -> int | None:
     total = 0
     for column in persona.age_columns:
@@ -421,6 +474,7 @@ def screen_row(row: dict[str, str], persona: Persona) -> dict | None:
         "acs_year": year,
         "month_date_yyyymm": month,
         "date_pulled_yyyymmdd": pulled,
+        **describe_zip(row),
     }
 
 
@@ -526,6 +580,8 @@ class BulletRow:
     median_listing_price_per_square_foot: Decimal | None = None
     age_range: str | None = None
     sex: str | None = None
+    race_and_ethnicity: str | None = None
+    education_level: str | None = None
 
 
 def split_place(row: dict) -> tuple[str, str]:
@@ -593,6 +649,7 @@ def screen_header(procedure: str, screen: PersonaRank, price: Decimal | None = N
         f"Market {procedure} to {group} in the ZIP codes below.",
         why,
         f"ZIP codes are ranked by their share of {group}.",
+        "Race, ethnicity and education describe these ZIP codes and are not used to rank them.",
     ]
     if price is not None:
         sentences.append(f"Source: BLS Consumer Expenditure Surveys, {DISCRETIONARY_SOURCE_YEAR}.")
@@ -634,7 +691,31 @@ def zip_insight(
             )
     if row.get("female_share") is not None:
         sentences.append(f"Women are {format_percent(row['female_share'])} of residents.")
+    described = describe_sentence(row)
+    if described:
+        sentences.append(described)
     return " ".join(sentences)
+
+
+def describe_sentence(row: dict) -> str:
+    """Race, ethnicity, and education in one plain sentence. Nothing when both are blank."""
+    race = row.get("race_and_ethnicity")
+    degree = row.get("bachelors_or_higher_share")
+    degree_clause = f"{format_percent(degree)} of adults 25 and older" if degree is not None else ""
+    if race and degree_clause:
+        return (
+            f"{race} residents are the largest group at "
+            f"{format_percent(row['race_and_ethnicity_share'])}, and {degree_clause} "
+            "have a bachelor's degree or higher."
+        )
+    if race:
+        return (
+            f"{race} residents are the largest group at "
+            f"{format_percent(row['race_and_ethnicity_share'])}."
+        )
+    if degree_clause:
+        return f"Of adults 25 and older, {format_percent(degree)} have a bachelor's degree or higher."
+    return ""
 
 
 def affordable_rows(screen: PersonaRank, price: Decimal | None) -> list[dict]:
@@ -667,6 +748,8 @@ def render_screen(
                 median_listing_price_per_square_foot=row["median_listing_price_per_square_foot"],
                 age_range=screen.persona.label,
                 sex=sex_label(row.get("female_share")),
+                race_and_ethnicity=row.get("race_and_ethnicity"),
+                education_level=row.get("education_level"),
             )
         )
     return rows
@@ -925,6 +1008,8 @@ def bullet_update(rows: list[BulletRow]) -> tuple:
         [row.median_listing_price_per_square_foot for row in rows],
         [row.age_range for row in rows],
         [row.sex for row in rows],
+        [row.race_and_ethnicity for row in rows],
+        [row.education_level for row in rows],
     )
 
 

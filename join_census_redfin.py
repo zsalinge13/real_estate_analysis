@@ -6,7 +6,9 @@ for the chained run has only that calendar year. The join keeps the latest
 equals `zip`. The grain is one row per ZIP.
 
 Prices and census values are copied from those rows. A blank cell stays
-blank. This script does not fill a price from an earlier month.
+blank. This script does not fill a price from an earlier month. A Census
+file from before the race, ethnicity, and education columns were added is
+still read, and those columns stay blank.
 
 The CSV is `zip_census_redfin_join.csv`. When DATABASE_URL is set, those
 rows replace `public.zip_census_redfin_join`. That replace does not delete
@@ -45,6 +47,7 @@ INTEGER_JOIN_COLUMNS = {
     "population_45_54",
     "population_55_64",
     "population_65_plus",
+    *census.ADDED_COLUMNS,
     "active_listing_count",
 }
 TEXT_JOIN_COLUMNS = {
@@ -81,6 +84,14 @@ def column_sql_type(name: str) -> str:
     if name in TEXT_JOIN_COLUMNS:
         return "text"
     return "numeric"
+
+
+def read_census_csv(path: Path) -> list[dict[str, str]]:
+    rows = read_csv(path, census.BASE_COLUMNS)
+    for row in rows:
+        for name in census.ADDED_COLUMNS:
+            row.setdefault(name, "")
+    return rows
 
 
 def read_csv(path: Path, required: tuple[str, ...]) -> list[dict[str, str]]:
@@ -279,6 +290,11 @@ def replace_join_table(
                 f"ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS "
                 f"{quote_ident(dataset_stamp.COLUMN)} {dataset_stamp.SQL_TYPE}"
             )
+            for name in census.ADDED_COLUMNS:
+                cur.execute(
+                    f"ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS "
+                    f"{quote_ident(name)} {column_sql_type(name)}"
+                )
             cur.execute(DELETE_JOIN_SQL)
             cur.executemany(insert_sql, rows)
             cur.execute(f"SELECT COUNT(*) FROM {TABLE}")
@@ -295,14 +311,14 @@ def database_url() -> str:
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) == 2 and args[0] == "--print-acs-year":
-        year = loaded_acs_year(read_csv(Path(args[1]), census.COLUMNS))
+        year = loaded_acs_year(read_census_csv(Path(args[1])))
         print(year)
         return 0
     if len(args) != 2:
         raise SystemExit(
             "Usage: python join_census_redfin.py CENSUS_CSV REDFIN_CSV"
         )
-    census_rows = read_csv(Path(args[0]), census.COLUMNS)
+    census_rows = read_census_csv(Path(args[0]))
     redfin_rows = read_csv(Path(args[1]), load_california.LOAD_COLUMNS)
     year, month, joined = join_records(census_rows, redfin_rows)
     write_join_csv(joined)
