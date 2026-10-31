@@ -670,11 +670,38 @@ class MeasureColumnTests(unittest.TestCase):
         for row in rows:
             self.assertEqual(row.household_income, 146167)
             self.assertEqual(row.median_listing_price_per_square_foot, Decimal("857.5"))
-            self.assertEqual(row.sex, Decimal("53.8"))
-            self.assertIn(f"Women are {row.sex}% of residents.", row.insight)
+            self.assertEqual(row.sex, "woman")
+            self.assertIn("Women are 53.8% of residents.", row.insight)
             self.assertIn("median listing price per square foot $857.50", row.insight.lower())
         self.assertIn("Household income $146,167", rows[0].insight)
         self.assertTrue(rows[1].header.startswith("55 and older. "))
+
+    def test_sex_is_woman_at_fifty_percent_or_more(self):
+        self.assertEqual(rank.sex_label(Decimal("0.538")), "woman")
+        self.assertEqual(rank.sex_label(Decimal("0.5")), "woman")
+        self.assertEqual(rank.sex_label(Decimal("0.49951")), "woman")
+        self.assertEqual(rank.sex_label(Decimal("0.4994")), "man")
+        self.assertEqual(rank.sex_label(Decimal("0.3")), "man")
+        self.assertIsNone(rank.sex_label(None))
+
+    def test_mostly_male_zip_is_man_and_keeps_its_insight(self):
+        screens = rank.rank_personas(
+            [
+                join_row(
+                    "90012",
+                    zip_name="pasadena, ca",
+                    median_household_income="300000",
+                    population_35_44="40",
+                    adult_population="100",
+                    female_population="499",
+                    male_population="501",
+                )
+            ]
+        )
+        row = rank.bullet_rows("tummy tuck", screens, Decimal(10750))[0]
+        self.assertEqual(row.sex, "man")
+        self.assertIn("Women are 49.9% of residents.", row.insight)
+        self.assertEqual(rank.BULLET_LIST_COLUMNS[-1], ("sex", "text[]"))
 
     def test_blank_female_share_leaves_sex_blank(self):
         screens = rank.rank_personas(
@@ -702,8 +729,8 @@ class MeasureColumnTests(unittest.TestCase):
         self.assertEqual(
             tail,
             [
-                (146167, Decimal("857.5"), "35 to 44", Decimal("53.8")),
-                (146167, Decimal("857.5"), "55 and older", Decimal("53.8")),
+                (146167, Decimal("857.5"), "35 to 44", "woman"),
+                (146167, Decimal("857.5"), "55 and older", "woman"),
             ],
         )
         self.assertEqual(
@@ -1203,7 +1230,7 @@ class ProcedureFeeExportTests(unittest.TestCase):
             [146167, 98000],
             [Decimal("858"), Decimal("612.5")],
             ["18 to 34", "35 to 44"],
-            [Decimal("53.8"), None],
+            ["woman", None],
         )
         blank = (None,) * 9
         table_rows = [
@@ -1258,7 +1285,7 @@ class ProcedureFeeExportTests(unittest.TestCase):
             ],
             [
                 ("", "", "", ""),
-                ("146167", "858", "18 to 34", "53.8"),
+                ("146167", "858", "18 to 34", "woman"),
                 ("98000", "612.5", "35 to 44", ""),
                 ("", "", "", ""),
             ],

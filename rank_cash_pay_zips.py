@@ -64,7 +64,7 @@ BULLET_LIST_COLUMNS = (
     ("household_income", "integer[]"),
     ("median_listing_price_per_square_foot", "numeric[]"),
     ("age_range", "text[]"),
-    ("sex", "numeric[]"),
+    ("sex", "text[]"),
 )
 BULLET_LIST_NAMES = tuple(name for name, _sql_type in BULLET_LIST_COLUMNS)
 BULLET_CSV_COLUMNS = ("marketing_bullets",) + BULLET_LIST_NAMES
@@ -318,6 +318,14 @@ def percent_points(share: Decimal | None) -> Decimal | None:
     return (share * Decimal(100)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
 
 
+def sex_label(female_share: Decimal | None) -> str | None:
+    """"woman" when the female share the insight prints is 50.0% or more, else "man"."""
+    points = percent_points(female_share)
+    if points is None:
+        return None
+    return "woman" if points >= Decimal(50) else "man"
+
+
 def format_percent(share: Decimal) -> str:
     return f"{percent_points(share)}%"
 
@@ -514,7 +522,7 @@ class BulletRow:
     household_income: int | None = None
     median_listing_price_per_square_foot: Decimal | None = None
     age_range: str | None = None
-    sex: Decimal | None = None
+    sex: str | None = None
 
 
 def split_place(row: dict) -> tuple[str, str]:
@@ -634,7 +642,7 @@ def render_screen(screen: PersonaRank, price: Decimal | None = None) -> list[Bul
                 household_income=row["median_household_income"],
                 median_listing_price_per_square_foot=row["median_listing_price_per_square_foot"],
                 age_range=screen.persona.label,
-                sex=percent_points(row.get("female_share")),
+                sex=sex_label(row.get("female_share")),
             )
         )
     return rows
