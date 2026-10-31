@@ -13,6 +13,7 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
+import pull_census_zip_population as census
 import rank_cash_pay_zips as rank
 
 
@@ -456,6 +457,7 @@ class BulletTests(unittest.TestCase):
             "sex",
             "race_and_ethnicity",
             "education_level",
+            *rank.DESCRIPTIVE_LIST_NAMES,
         ]
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "procedure_surgeon_fees.csv"
@@ -464,7 +466,7 @@ class BulletTests(unittest.TestCase):
                 [
                     (2024, "facelift", 8000) + stored,
                     (2024, "custom procedure", 100) + rank.bullet_update([]),
-                    (2025, "facelift", None) + (None,) * 13,
+                    (2025, "facelift", None) + (None,) * len(rank.BULLET_CSV_COLUMNS),
                 ],
                 path,
             )
@@ -691,6 +693,173 @@ class AffordabilityTests(unittest.TestCase):
         self.assertEqual(by_name["liposuction"][1], [1])
 
 
+def profile_columns(**overrides) -> dict[str, str]:
+    """A ZIP with one value for every profile column, then the overrides."""
+    values = {name: "0" for name in census.PROFILE_COLUMNS}
+    brackets = [column for column, _code, _phrase, _low in census.HOUSEHOLD_INCOME_BRACKETS]
+    for column in brackets:
+        values[column] = "100"
+    values.update(
+        households=str(100 * len(brackets)),
+        female_population_35_44="52",
+        male_population_35_44="48",
+        female_population_55_64="30",
+        male_population_55_64="20",
+        female_population_65_plus="30",
+        male_population_65_plus="20",
+        mothers_with_children_under_18="1234",
+        mothers_with_children_under_6="456",
+        recent_births="78",
+        owner_occupied_households="621",
+        renter_occupied_households="379",
+        owner_occupied_householder_35_44="48",
+        renter_occupied_householder_35_44="52",
+        employed_women="1000",
+        women_management_business_science_arts="583",
+        women_arts_design_entertainment_sports_media="47",
+    )
+    values.update({key: "" if value is None else str(value) for key, value in overrides.items()})
+    return values
+
+
+class ProfileTests(unittest.TestCase):
+    def setUp(self):
+        self.row = join_row(
+            "90292",
+            zip_name="marina del rey, ca",
+            median_household_income="300000",
+            population_35_44="40",
+            population_55_64="10",
+            population_65_plus="10",
+            adult_population="100",
+            **profile_columns(),
+        )
+
+    def profile(self, **overrides):
+        return {name: rank.as_int(value, name) for name, value in profile_columns(**overrides).items()}
+
+    def test_linear_interpolation_inside_a_closed_bracket(self):
+        profile = self.profile()
+        self.assertEqual(rank.households_at_or_above(profile, Decimal(0)), Decimal(1600))
+        self.assertEqual(rank.households_at_or_above(profile, Decimal(100000)), Decimal(400))
+        self.assertEqual(rank.households_at_or_above(profile, Decimal(112500)), Decimal(350))
+        self.assertEqual(rank.households_at_or_above(profile, Decimal(5000)), Decimal(1550))
+        self.assertEqual(rank.households_at_or_above(profile, Decimal(175000)), Decimal(150))
+        self.assertIsNone(rank.households_at_or_above(self.profile(households_income_60000_74999=""), Decimal(1)))
+
+    def test_pareto_tail_only_in_the_open_bracket(self):
+        profile = self.profile()
+        self.assertEqual(rank.households_at_or_above(profile, Decimal(200000)), Decimal(100))
+        alpha = (Decimal(2).ln()) / (Decimal(200000) / Decimal(150000)).ln()
+        expected = Decimal(100) * (Decimal(200000) / Decimal(300000)) ** alpha
+        self.assertEqual(rank.households_at_or_above(profile, Decimal(300000)), expected)
+        self.assertLess(expected, Decimal(100))
+        none_between = self.profile(households_income_150000_199999="0")
+        self.assertIsNone(rank.households_at_or_above(none_between, Decimal(250000)))
+        none_on_top = self.profile(households_income_200000_plus="0")
+        self.assertEqual(rank.households_at_or_above(none_on_top, Decimal(250000)), Decimal(0))
+
+    def test_income_needed_is_the_fee_over_the_persona_share(self):
+        persona = rank.PERSONA_BY_LABEL["35 to 44"]
+        share = rank.DISCRETIONARY_SHARE["35 to 44"]
+        expected = int((Decimal(8250) / share).quantize(Decimal(1), rounding="ROUND_HALF_UP"))
+        self.assertEqual(rank.income_needed(Decimal(8250), persona), expected)
+
+    def test_row_metrics_and_insight_sentences(self):
+        screens = rank.rank_personas([self.row])
+        row = rank.bullet_rows("tummy tuck", screens, Decimal(10750))[0]
+        needed = rank.income_needed(Decimal(10750), rank.PERSONA_BY_LABEL["35 to 44"])
+        affordable = rank.households_at_or_above(self.profile(), Decimal(needed))
+        self.assertEqual(row.income_needed, needed)
+        self.assertEqual(row.affordable_households, int(affordable.quantize(Decimal(1), rounding="ROUND_HALF_UP")))
+        self.assertEqual(row.affordable_households_share, rank.percent_points(affordable / Decimal(1600)))
+        self.assertEqual((row.women_in_age_range, row.men_in_age_range), (52, 48))
+        self.assertEqual(row.women_share_of_age_range, Decimal("52.0"))
+        self.assertEqual((row.home_ownership, row.owner_occupied_share), ("own", Decimal("62.1")))
+        self.assertEqual(row.owner_occupied_share_age_range, Decimal("48.0"))
+        self.assertEqual(row.women_management_professional_share, Decimal("58.3"))
+        self.assertEqual(row.women_arts_entertainment_media_share, Decimal("4.7"))
+        self.assertEqual(
+            (row.mothers_with_children_under_18, row.mothers_with_children_under_6, row.recent_births),
+            (1234, 456, 78),
+        )
+        self.assertIn(
+            f"About {row.affordable_households_share}% of households here "
+            f"({row.affordable_households:,} households) earn at least ${needed:,}, "
+            "enough to cover the $10,750 fee.",
+            row.insight,
+        )
+        self.assertIn("Women are 60.0% of residents and 52.0% of adults ages 35 to 44.", row.insight)
+        self.assertIn(
+            "Here, 62.1% of households own their home, and 58.3% of employed women work in "
+            "management, business, science, or arts jobs.",
+            row.insight,
+        )
+        self.assertTrue(
+            row.insight.endswith(
+                "About 1,234 women ages 20 to 64 here are raising children under 18, "
+                "including 456 with a child under 6."
+            )
+        )
+        older = rank.bullet_rows("facelift", screens, Decimal(15500))
+        self.assertEqual([item.age_range for item in older], ["55 and older"])
+        self.assertEqual((older[0].women_in_age_range, older[0].men_in_age_range), (60, 40))
+        self.assertNotIn("raising children", older[0].insight)
+        self.assertIsNone(older[0].owner_occupied_share_age_range)
+
+    def test_mothers_sentence_only_for_body_and_breast_procedures(self):
+        screens = rank.rank_personas([self.row])
+        for procedure in rank.PROCEDURE_PERSONAS:
+            for item in rank.bullet_rows(procedure, screens, Decimal(1000)):
+                self.assertEqual(
+                    "raising children under 18" in item.insight,
+                    procedure in rank.MOTHER_PROCEDURES,
+                    procedure,
+                )
+                self.assertEqual(item.mothers_with_children_under_18, 1234)
+        self.assertEqual(
+            rank.MOTHER_PROCEDURES,
+            {"tummy tuck", "breast lift", "breast augmentation", "breast reduction", "liposuction"},
+        )
+
+    def test_no_fee_leaves_affordability_blank(self):
+        screens = rank.rank_personas([self.row])
+        for item in rank.bullet_rows("eyelid surgery", screens, None):
+            self.assertIsNone(item.income_needed)
+            self.assertIsNone(item.affordable_households)
+            self.assertIsNone(item.affordable_households_share)
+            self.assertNotIn("earn at least", item.insight)
+            self.assertEqual(item.home_ownership, "own")
+
+    def test_renter_majority_says_rent(self):
+        row = dict(self.row, owner_occupied_households="400", renter_occupied_households="600")
+        item = rank.bullet_rows("tummy tuck", rank.rank_personas([row]), Decimal(10750))[0]
+        self.assertEqual((item.home_ownership, item.owner_occupied_share), ("rent", Decimal("40.0")))
+        self.assertIn("Here, 60.0% of households rent their home, and ", item.insight)
+
+    def test_profile_never_changes_a_rank(self):
+        rows = []
+        for index, share in enumerate(("40", "35", "30")):
+            rows.append(
+                join_row(
+                    f"9000{index}",
+                    median_household_income="300000",
+                    population_35_44=share,
+                    adult_population="100",
+                    **profile_columns(households_income_200000_plus=str(10 + index * 500)),
+                )
+            )
+        plain = [{key: value for key, value in row.items() if key not in census.PROFILE_COLUMNS} for row in rows]
+        for procedure in rank.PROCEDURE_PERSONAS:
+            with_profile = rank.bullet_rows(procedure, rank.rank_personas(rows), Decimal(9000))
+            without = rank.bullet_rows(procedure, rank.rank_personas(plain), Decimal(9000))
+            self.assertEqual(
+                [(item.age_range, item.rank, item.zip_code) for item in with_profile],
+                [(item.age_range, item.rank, item.zip_code) for item in without],
+            )
+            self.assertTrue(all(item.affordable_households is None for item in without))
+
+
 class MeasureColumnTests(unittest.TestCase):
     def setUp(self):
         self.screens = rank.rank_personas(
@@ -833,9 +1002,28 @@ class MeasureColumnTests(unittest.TestCase):
         row = rank.bullet_rows("tummy tuck", screens, Decimal(10750))[0]
         self.assertEqual(row.sex, "man")
         self.assertIn("Women are 49.9% of residents.", row.insight)
+        names = list(rank.BULLET_LIST_NAMES)
         self.assertEqual(
-            rank.BULLET_LIST_COLUMNS[-3:],
-            (("sex", "text[]"), ("race_and_ethnicity", "text[]"), ("education_level", "text[]")),
+            names[names.index("sex") :],
+            [
+                "sex",
+                "race_and_ethnicity",
+                "education_level",
+                "women_in_age_range",
+                "men_in_age_range",
+                "women_share_of_age_range",
+                "income_needed",
+                "affordable_households_share",
+                "affordable_households",
+                "mothers_with_children_under_18",
+                "mothers_with_children_under_6",
+                "recent_births",
+                "home_ownership",
+                "owner_occupied_share",
+                "owner_occupied_share_age_range",
+                "women_management_professional_share",
+                "women_arts_entertainment_media_share",
+            ],
         )
 
     def test_blank_female_share_leaves_sex_blank(self):
@@ -860,7 +1048,8 @@ class MeasureColumnTests(unittest.TestCase):
         expanded = rank.expand_marketing_bullet_rows(
             columns, [(2024, "arm lift") + rank.bullet_update(found)]
         )
-        tail = [row[-7:] for row in expanded]
+        start = columns.index("household_income")
+        tail = [row[start : start + 7] for row in expanded]
         self.assertEqual(
             tail,
             [
@@ -869,7 +1058,7 @@ class MeasureColumnTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            list(rank.BULLET_CSV_COLUMNS[-8:]),
+            list(rank.BULLET_CSV_COLUMNS[5:13]),
             [
                 "insight",
                 "household_income",
@@ -1027,9 +1216,11 @@ class BulletYearTests(unittest.TestCase):
             sexes,
             races,
             educations,
+            *descriptive,
             report_year,
             name,
         ) = updates[0]
+        self.assertEqual(len(descriptive), len(rank.DESCRIPTIVE_LIST_NAMES))
         self.assertEqual((races, educations), ([None], [None]))
         self.assertEqual(incomes, [300000])
         self.assertEqual(individual_incomes, [80000])
@@ -1386,6 +1577,7 @@ class ProcedureFeeExportTests(unittest.TestCase):
             "sex",
             "race_and_ethnicity",
             "education_level",
+            *rank.DESCRIPTIVE_LIST_NAMES,
         ]
         moment = datetime(2026, 10, 27, 17, 0, tzinfo=timezone.utc)
         headers = "18 to 34. Ranked.\n35 to 44. Ranked."
@@ -1402,8 +1594,8 @@ class ProcedureFeeExportTests(unittest.TestCase):
             ["woman", None],
             ["Hispanic or Latino", None],
             ["Bachelor's degree", None],
-        )
-        blank = (None,) * 12
+        ) + tuple([None, None] for _name in rank.DESCRIPTIVE_LIST_NAMES)
+        blank = (None,) * (len(rank.BULLET_CSV_COLUMNS) - 1)
         table_rows = [
             (2024, "facelift", 10, 1000, 2000, "national", "https://example.test/2024", moment, None, "older") + blank,
             (2024, "rhinoplasty", 11, 1100, 2100, "national", "https://example.test/2024", moment, headers, "older") + lists,
@@ -1432,6 +1624,7 @@ class ProcedureFeeExportTests(unittest.TestCase):
                         "sex",
                         "race_and_ethnicity",
                         "education_level",
+                        *rank.DESCRIPTIVE_LIST_NAMES,
                     ],
                 )
                 written = list(reader)
