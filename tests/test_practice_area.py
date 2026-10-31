@@ -207,13 +207,13 @@ class JoinTests(unittest.TestCase):
 class RankTests(unittest.TestCase):
     def test_outside_rows_never_rank_or_move_the_medians(self):
         rows = [
-            join_row("90210", median_household_income="100000", population_18_34="400"),
+            join_row("90210", median_household_income="100000", population_25_44="400"),
             join_row(
                 "92618",
                 county="Orange",
                 distance_from_practice_miles="49.21",
                 median_household_income="300000",
-                population_18_34="300",
+                population_25_44="300",
             ),
         ]
         far = join_row(
@@ -221,11 +221,11 @@ class RankTests(unittest.TestCase):
             county="Orange",
             distance_from_practice_miles="51.79",
             median_household_income="900000",
-            population_18_34="900",
+            population_25_44="900",
         )
         inside = rank.rank_personas(rows)
         with_far = rank.rank_personas(rows + [far])
-        young = next(screen for screen in with_far if screen.persona.label == "18 to 34")
+        young = next(screen for screen in with_far if screen.persona.label == "25–44")
         self.assertEqual(young.household_income_middle, Decimal(200000))
         self.assertEqual([row["zip"] for row in young.rows], ["92618"])
         self.assertEqual(young.rows[0]["county"], "Orange")
@@ -247,16 +247,16 @@ class RankTests(unittest.TestCase):
 class DistanceRuleTests(unittest.TestCase):
     def rows(self):
         return [
-            join_row("90210", distance_from_practice_miles="0.00", population_18_34="400", population_45_54="200"),
+            join_row("90210", distance_from_practice_miles="0.00", population_25_44="400", population_45_64="200"),
             join_row(
                 "92618", county="Orange", distance_from_practice_miles="49.21",
-                median_household_income="300000", population_18_34="300", population_45_54="300",
+                median_household_income="300000", population_25_44="300", population_45_64="300",
             ),
-            join_row("92602", county="Orange", distance_from_practice_miles="50.00", population_18_34="350"),
-            join_row("93535", distance_from_practice_miles="51.00", population_18_34="900", population_45_54="900"),
-            join_row("92676", county="Orange", distance_from_practice_miles="63.49", population_18_34="900"),
-            join_row("92001", county="Orange", distance_from_practice_miles="", population_18_34="900"),
-            join_row("91766", county="San Bernardino", distance_from_practice_miles="20.00", population_18_34="900"),
+            join_row("92602", county="Orange", distance_from_practice_miles="50.00", population_25_44="350"),
+            join_row("93535", distance_from_practice_miles="51.00", population_25_44="900", population_45_64="900"),
+            join_row("92676", county="Orange", distance_from_practice_miles="63.49", population_25_44="900"),
+            join_row("92001", county="Orange", distance_from_practice_miles="", population_25_44="900"),
+            join_row("91766", county="San Bernardino", distance_from_practice_miles="20.00", population_25_44="900"),
         ]
 
     def test_constant_and_reason(self):

@@ -409,8 +409,9 @@ class CensusTests(unittest.TestCase):
         base = (None,) * (len(census.BASE_COLUMNS) - 2)
         race = tuple(range(1, len(census.RACE_EDUCATION_COLUMNS) + 1))
         profile = tuple(range(100, 100 + len(census.PROFILE_COLUMNS)))
-        stored = (2024, "90001") + base + race + profile
-        already_filled = (2024, "90002") + base + race + profile
+        householder = tuple(range(1000, 1000 + len(census.HOUSEHOLDER_AGE_COLUMNS)))
+        stored = (2024, "90001") + base + race + profile + householder
+        already_filled = (2024, "90002") + base + race + profile + householder
         blank = (2024, "90003") + base + (None,) * len(census.ADDED_COLUMNS)
         conn = Connection()
         inserted, filled, total = census.insert_new_years(
@@ -420,9 +421,13 @@ class CensusTests(unittest.TestCase):
         self.assertEqual(conn.cursor_obj.inserted, [blank + (stamp,)])
         updates = [(sql, params) for sql, params in conn.cursor_obj.statements if sql.startswith("UPDATE")]
         self.assertEqual(updates[0][1], race + (stamp, 2024, "90001"))
-        self.assertEqual(len(updates), 4)
+        self.assertEqual(len(updates), 6)
         self.assertEqual(updates[1][1], race + (stamp, 2024, "90002"))
         self.assertEqual(updates[2][1], profile + (stamp, 2024, "90001"))
+        self.assertEqual(updates[4][1], householder + (stamp, 2024, "90001"))
+        for name in census.HOUSEHOLDER_AGE_COLUMNS:
+            self.assertIn(f"{name} IS NULL", updates[4][0])
+            self.assertNotIn(f"{name} IS NULL", updates[2][0])
         sql = updates[0][0]
         for name in census.RACE_EDUCATION_COLUMNS:
             self.assertIn(f"{name} IS NULL", sql)
@@ -489,7 +494,7 @@ class CensusTests(unittest.TestCase):
         conn = Connection()
         stamp = datetime(2026, 10, 31, 17, 0, tzinfo=timezone.utc)
         self.assertEqual(census.insert_new_years(conn, [row], stamp), (0, 1, 1))
-        self.assertEqual(len(conn.cursor_obj.updates), 2)
+        self.assertEqual(len(conn.cursor_obj.updates), 3)
 
     def test_profile_groups_sum_their_codes(self):
         estimates = {code: Decimal(1) for _name, codes in census.field_groups() for code in codes}
@@ -511,7 +516,22 @@ class CensusTests(unittest.TestCase):
         self.assertEqual(len(bounds), 16)
         self.assertIn("B01001_037E", dict(census.SEX_BY_AGE_GROUPS["female_population_35_44"]))
         self.assertTrue(all(len(codes) <= 50 for _name, codes in census.field_groups()))
-        self.assertEqual(census.ADDED_COLUMNS, census.RACE_EDUCATION_COLUMNS + census.PROFILE_COLUMNS)
+        self.assertEqual(
+            census.ADDED_COLUMNS,
+            census.RACE_EDUCATION_COLUMNS + census.PROFILE_COLUMNS + census.HOUSEHOLDER_AGE_COLUMNS,
+        )
+        self.assertEqual(row["population_25_44"], 8)
+        self.assertEqual(row["population_45_64"], 10)
+        self.assertEqual(row["female_population_25_44"], 4)
+        self.assertEqual(row["male_population_45_64"], 5)
+        self.assertEqual(row["owner_occupied_householder_25_44"], 2)
+        self.assertEqual(row["renter_occupied_householder_45_64"], 3)
+        self.assertEqual(row["owner_occupied_householder_65_plus"], 3)
+        self.assertEqual(row["householder_65_plus_households_income_200000_plus"], 1)
+        self.assertEqual(dict(census.HOUSEHOLDER_INCOME_GROUPS["householder_25_44_households_income_under_10000"]), {"B19037_020E": "Householder 25 to 44 years:!!Less than $10,000"})
+        self.assertEqual(dict(census.HOUSEHOLDER_INCOME_GROUPS["householder_65_plus_households_income_200000_plus"]), {"B19037_069E": "Householder 65 years and over:!!$200,000 or more"})
+        self.assertNotIn("householder_under_25_households_income_under_10000", census.COLUMNS)
+        self.assertEqual(len(census.COLUMNS), len(set(census.COLUMNS)))
 
     def test_race_and_education_groups_sum_their_codes(self):
         estimates = {code: Decimal(1) for _name, codes in census.field_groups() for code in codes}
@@ -972,8 +992,12 @@ class CensusTests(unittest.TestCase):
                 "mothers",
                 "tenure",
                 "occupation",
+                "householder_income",
             ],
         )
+        self.assertEqual(len(groups["householder_income"]), 48)
+        self.assertEqual(groups["householder_income"][0], "B19037_020E")
+        self.assertEqual(groups["householder_income"][-1], "B19037_069E")
         self.assertEqual(len(groups["race_ethnicity"]), 8)
         self.assertEqual(len(groups["education"]), 24)
         self.assertEqual(groups["income"], ("B19013_001E", "B19301_001E"))
