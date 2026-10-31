@@ -195,3 +195,60 @@ It upserts the years it can read and does not delete other years in `public.proc
 2024 publishes separate upper and lower blepharoplasty fee ranges. Those two ranges are not combined into one eyelid-surgery fee, so `eyelid surgery` keeps its published count and null fee columns.
 
 The CSV `procedure_surgeon_fees.csv` is written even when `DATABASE_URL` is unset. It is not committed. That file from this load does not include `marketing_bullets`. `.github/workflows/pull-procedure-surgeon-fees.yml` runs at 16:00 UTC on January 1 and on `workflow_dispatch`. The job installs `poppler-utils` for `pdftotext`. After success it uploads `procedure_surgeon_fees.csv` as the `procedure-surgeon-fees` artifact for 90 days. If the load fails, it exports the current table to that same CSV and uploads the same artifact. The job passes `DATABASE_URL` and the refresh-review webhook secrets. The census-year rank writes a separate `procedure_surgeon_fees.csv` that does include `marketing_bullets`, and every California load uploads it.
+
+## Competition and search trends
+
+`pull_competition_trends.py` writes one row per ZIP in `zip_census_redfin_join` for each `procedure` in `procedure_surgeon_fees`, Los Angeles and Orange County ZIPs within 50 miles of the practice (see [Practice area](#practice-area)). A join row whose `practice_zip_code`, `county`, or `distance_from_practice_miles` puts it outside that area is left out. Those three columns follow `city` and are copied from the join. In Tableau, join it to `procedure_surgeon_fees.csv` on `zip_code` and `procedure`. Both are text, and the procedure names are the same lowercase names, such as `facelift`. The file is `competition_trends.csv`. When `DATABASE_URL` is set, the same rows replace `public.competition_trends`, primary key (`zip_code`, `procedure`). No other table is modified.
+
+### Competitors
+
+Competitor counts come from the free [CMS NPPES NPI Registry API](https://npiregistry.cms.hhs.gov/api-page). A competitor is an active individual NPI (type NPI-1, status `A`) counted at the ZIP of its primary practice location address. The mailing address and secondary practice locations are not used. A provider counts in a specialty when any taxonomy on its record matches:
+
+| Column prefix | Taxonomy codes |
+| --- | --- |
+| `plastic_surgeon` | every code starting `2082` (plastic surgery, head and neck, hand) |
+| `dermatologist` | every code starting `207N` (dermatology and its subspecialties) |
+| `facial_plastic_surgeon` | `207YS0123X` otolaryngology facial plastic surgery, plus `207YX0905X` and `207YX0007X`, the other otolaryngology facial plastic codes |
+| `oculoplastic_surgeon` | `207WX0200X` ophthalmic plastic and reconstructive surgery |
+
+`2086S0122X` (general surgery, plastic and reconstructive) and registered nurses with a plastic surgery taxonomy are not counted. One doctor with two matching taxonomies counts once in each of those specialties.
+
+`*_count` is the number in the ZIP. `*_count_5mi` adds every Census ZCTA whose internal point (2024 Census Gazetteer) is within 5 miles of this ZIP's point, this ZIP included, using the same haversine distance as `distance_from_practice_miles`. That includes ZCTAs in any county and ZCTAs not in the join, such as across the Ventura or San Bernardino county line or beyond the 50-mile cutoff, and NPPES is read for every 3-digit prefix those ZCTAs use. `adult_population` is the join's ACS adults 18 and older. `adult_population_5mi` is the sum over those same ZCTAs; for a ZCTA outside the join, the adults come from the ACS 5-year table B01001 for the join's `acs_year`, summed over the same age bands. When any of those ZCTAs has no adult count, or the ACS request fails, `adult_population_5mi` and the 5-mile densities are blank while the 5-mile counts are kept. `*_per_10k_adults` is the count times 10,000 divided by the adults, rounded to two decimals. It is blank when the adults are blank or zero. A ZIP with few residents, such as a campus ZIP, can show a very high ZIP density; the 5-mile density is steadier.
+
+`procedure_competitor_count`, `procedure_competitor_count_5mi`, and `procedure_competitors_per_10k_adults_5mi` count the specialties named in `procedure_competitor_specialties`, once per NPI. Body and breast procedures use plastic surgeons. Facelift, neck lift, and rhinoplasty add facial plastic surgeons. Eyelid surgery and forehead lift also add ophthalmic plastic surgeons. Dermatologists are shown in their own columns and are not in the procedure count.
+
+Med spas, nurse injectors, and other businesses without a physician NPI are not in NPPES and are not counted. NPPES addresses are self-reported and can be stale. Search interest stays on the Los Angeles DMA 803, which includes Orange County. `competition_limitations` repeats this on every row.
+
+### Search interest
+
+Search interest comes from Google Trends through `pytrends`, web search, the Los Angeles CA market (DMA 803, `US-CA-803`), over the past five years. `trends_search_term` is the phrase used for that procedure: the procedure name, except `brazilian butt lift` for buttock augmentation with fat grafting, `blepharoplasty` for eyelid surgery, and `brow lift` for forehead lift.
+
+- `trends_dma_interest_12mo_avg` is the average weekly index over the latest 52 complete weeks. `trends_dma_interest_prior_12mo_avg` is the 52 weeks before that. Google scales each request so its busiest week is 100. Every request includes `liposuction`, and the other requests are rescaled to the first one through that term, so procedures in the same run compare with each other.
+- `trends_dma_interest_change_vs_prior_12mo` is the change between those two averages on the ratio scale. `0.25` is 25 percent. Tableau's percentage format shows it as a percent.
+- `trends_city_interest_5yr` is Google's city index for this ZIP's city, over five years: 100 is the city in the Los Angeles market with the most interest for that term. The ZIP's city is the `city` column from the Realtor.com `zip_name`, matched to Google's city name ignoring case and hyphens; `trends_city_name` is the Google name that matched. Google shows a city only when it has enough searches. A 12-month window was empty for every procedure tried, which is why this is five years, and on the October 2026 pull only breast augmentation and rhinoplasty had city values; the other procedures are blank in these columns. A neighborhood the Realtor name lists separately, such as a part of the City of Los Angeles, often has no Google city and stays blank. A blank is not zero interest.
+- `trends_pulled_at` and `trends_city_pulled_at` are when those values were pulled from Google. `trends_status` and `trends_city_status` say `new` (pulled this run), `reused recent pull` (pulled under six and a half days ago, so Google was not asked again), `kept last good value` (this run's pull failed), or `unavailable`.
+
+Google Trends is unofficial and rate-limited. Requests are spaced 12 to 20 seconds apart, a failed request waits about one, two, then four minutes before it tries again, and the whole Trends step stops after 25 minutes. A Trends error never fails the run. The last good values, with the `trends_pulled_at` and `trends_city_pulled_at` of the pull they came from, are read back from `public.competition_trends`, or from `competition_trends_cache.json` when a local run has that file. A value pulled under six and a half days ago is reused without asking Google. The California run is daily and starts at a slightly different time each day, so that window makes Google be asked on about every seventh run rather than drifting to the eighth.
+
+NPPES is read on every run. If the NPPES or gazetteer download fails, each ZIP and procedure keeps its last good competition columns from `public.competition_trends`, including their original `competition_pulled_at`, and the run still writes the CSV. `competition_status` says `new` (read this run), `kept last good value`, or `unavailable` (no stored row, such as a ZIP new to the join; its competition columns are blank).
+
+`competition_pulled_at` is when NPPES was read. `dataset_updated_at` is the same on every row of a run. `competition_source`, `centroid_source`, and `trends_source` name the sources on every row.
+
+### Schedule
+
+Every `Load California ZIP inventory` run (`.github/workflows/load-california.yml`: the daily `workflow_run` after Census, `workflow_dispatch`, and the January and July schedule) builds `competition_trends` in its last job, `competition_trends`, after the join and rank jobs. It reads `zip-census-redfin-join` and `procedure-surgeon-fees` from that same run, so it covers the same 50-mile ZIP set. When an earlier job failed and the join artifact is missing, it reads `public.zip_census_redfin_join` instead, and the procedure names fall back to `public.procedure_surgeon_fees`, then `seeds/procedure_surgeon_fees_2024.csv`. It uploads `competition_trends.csv` as the artifact `competition-trends`, kept 90 days, next to the run's other four artifacts.
+
+That job cannot fail the California run. The job and its build step are `continue-on-error`. Google Trends and NPPES failures keep the last good values inside the script. If the script stops before writing the CSV, the job exports the current `public.competition_trends` rows with `export_supabase_backup.py` and uploads that as `competition-trends`. Only when Supabase is also unreachable is there no file to upload, and the upload step then warns instead of failing.
+
+NPPES is read on every run rather than cached. The October 2026 pull of the 341 join ZIPs and their 5-mile neighbors took about 22 seconds and 49 requests over 23 three-digit prefixes. That is cheap enough to run daily, and it keeps new or moved providers and new join ZIPs current without a second cache to keep in step. Google Trends is the slow, rate-limited part. A pull with retries can take ten minutes, which is why it is reused for six and a half days.
+
+`.github/workflows/pull-competition-trends.yml` is kept for manual refreshes only (`workflow_dispatch`, no schedule). It rebuilds `competition_trends` from the latest successful California run's artifacts without rerunning that load, which on `workflow_dispatch` is a full Realtor history replace. It follows the same Trends rule and reads the last good values from Supabase. The California job and the manual workflow both use `DATABASE_URL` and `CENSUS_API_KEY`, the same key as the Census pull, for the adults of ZCTAs outside the join. Neither posts the refresh review webhook.
+
+Run it by hand:
+
+```
+pip install -r requirements.txt
+python pull_competition_trends.py --join zip_census_redfin_join.csv --procedures procedure_surgeon_fees.csv
+```
+
+`--skip-trends` keeps the last good Trends values without asking Google.
