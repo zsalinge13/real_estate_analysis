@@ -296,8 +296,9 @@ class JoinTests(unittest.TestCase):
         self.assertEqual(join.column_sql_type("zip"), "text")
         self.assertEqual(join.column_sql_type("postal_code"), "text")
         for name in census.ADDED_COLUMNS:
-            self.assertEqual(join.column_sql_type(name), "integer")
-            self.assertIn(f"    {name} integer,", schema)
+            expected = "numeric" if name == "average_household_size" else "integer"
+            self.assertEqual(join.column_sql_type(name), expected)
+            self.assertIn(f"    {name} {expected},", schema)
 
     def test_race_and_education_carry_through_the_join(self):
         left = census_row("90001", 2024, "10")
@@ -371,7 +372,8 @@ class JoinTests(unittest.TestCase):
         delete_at = statements.index(join.DELETE_JOIN_SQL)
         for name in census.ADDED_COLUMNS:
             alter = (
-                f"ALTER TABLE public.zip_census_redfin_join ADD COLUMN IF NOT EXISTS {name} integer"
+                f"ALTER TABLE public.zip_census_redfin_join ADD COLUMN IF NOT EXISTS {name} "
+                f"{join.column_sql_type(name)}"
             )
             self.assertIn(alter, statements)
             self.assertLess(statements.index(alter), delete_at)

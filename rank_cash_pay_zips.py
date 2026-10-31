@@ -15,19 +15,24 @@ there. Otherwise they are written only on the most recent report year that
 qualifies. Every other report year is left blank in that column. Fees are
 not copied from another year. The fee load owns the column and does not
 fill it. Each procedure then gets an affordability screen: a ZIP stays on
-that procedure's list only when its estimated yearly discretionary spending
-(the BLS Consumer Expenditure Surveys 2025 share for the persona's age, times
-the ZIP's median household income for every persona) is at least the midpoint of that
-procedure's surgeon fee range. The survivors are re-ranked, so lists differ by
-procedure. A procedure with a blank fee is not screened. cash_pay_zip_rank
-keeps the persona ranking without this screen.
+that procedure's list only when its discretionary_income (discretionary.py)
+is at least the midpoint of that procedure's surgeon fee range. That is the
+money a typical household headed by someone in the persona's age band has
+left after estimated taxes and the ZIP's cost of living, times the share
+such a household spends on discretionary items. The household income is the
+median of the B19037 brackets for that householder band, or the ZIP's median
+household income when those brackets are blank. The survivors are
+re-ranked, so lists differ by procedure. A procedure with a blank fee is not
+screened. cash_pay_zip_rank keeps the persona ranking without this screen
+and carries the discretionary fields for each ZIP and persona.
 The stored form is one entry per ranked ZIP, in persona-list order:
 marketing_bullets has one line per ZIP holding that ZIP's age-group header
 sentence, and rank, city, state, zip_code, insight, household_income,
 individual_income (ACS per-capita income),
 median_listing_price_per_square_foot, age_range, sex, and the descriptive
-columns after it are same-order lists. Those descriptive columns, including
-the households that can afford the fee, never change a screen or a rank.
+columns after it are same-order lists. Apart from discretionary_income, which
+is the affordability screen, those descriptive columns, including the
+households that can afford the fee, never change a screen or a rank.
 A group with no ranked ZIP adds no entry.
 After that write succeeds, the same run exports every column of
 procedure_surgeon_fees for the chosen report year and every other report
@@ -47,6 +52,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 import dataset_stamp
+import discretionary
 import load_california
 import practice
 import pull_census_zip_population as census
@@ -83,6 +89,13 @@ BULLET_LIST_COLUMNS = (
     ("women_in_age_range", "integer[]"),
     ("men_in_age_range", "integer[]"),
     ("women_share_of_age_range", "numeric[]"),
+    ("household_income_for_age_range", "integer[]"),
+    ("estimated_taxes", "integer[]"),
+    ("average_cost_of_living", "integer[]"),
+    ("money_left_after_essentials", "integer[]"),
+    ("income_bracket", "text[]"),
+    ("discretionary_share_of_remaining", "numeric[]"),
+    ("discretionary_income", "integer[]"),
     ("income_needed", "integer[]"),
     ("affordable_households_share", "numeric[]"),
     ("affordable_households", "integer[]"),
@@ -124,46 +137,6 @@ PERSONAS = (
     Persona("65+", ("population_65_plus",), "older", "ages 65 and older", "65_plus", "65 or older"),
 )
 PERSONA_BY_LABEL = {persona.label: persona for persona in PERSONAS}
-
-# Affordability screen. BLS Consumer Expenditure Surveys, calendar year 2025,
-# Table 1300 "Age of reference person: Annual expenditure means, shares,
-# standard errors, and relative standard errors". BLS has no "discretionary"
-# line, so discretionary spending here is the sum of the mean annual spending
-# on food away from home, alcoholic beverages, apparel and services,
-# entertainment, personal care products and services, and reading. The share
-# is that sum over mean income before taxes for the age band. Personas that
-# span two BLS bands are weighted by the number of consumer units in each band.
-DISCRETIONARY_SOURCE_YEAR = 2025
-DISCRETIONARY_SOURCE_URL = (
-    "https://www.bls.gov/cex/tables/calendar-year/mean-item-share-average-standard-error/"
-    "reference-person-age-ranges-2025.xlsx"
-)
-# BLS age band: (consumer units in thousands, mean income before taxes,
-# food away + alcohol + apparel + entertainment + personal care + reading).
-BLS_AGE_BANDS = {
-    "under 25": (5941, 52178, 3580 + 301 + 1375 + 1629 + 562 + 157),
-    "25 to 34": (20969, 115828, 4529 + 617 + 1702 + 3965 + 903 + 77),
-    "35 to 44": (24771, 139176, 4978 + 701 + 2273 + 4071 + 1136 + 128),
-    "45 to 54": (22516, 148365, 5749 + 871 + 3248 + 6909 + 1341 + 113),
-    "55 to 64": (23919, 125333, 3800 + 551 + 2060 + 3998 + 1057 + 110),
-    "65 and older": (39878, 69497, 2818 + 556 + 1383 + 2975 + 757 + 121),
-}
-PERSONA_BLS_BANDS = {
-    "25–44": ("25 to 34", "35 to 44"),
-    "45–64": ("45 to 54", "55 to 64"),
-    "65+": ("65 and older",),
-}
-
-
-def bls_discretionary_share(bands: tuple[str, ...]) -> Decimal:
-    spent = sum(Decimal(BLS_AGE_BANDS[band][0] * BLS_AGE_BANDS[band][2]) for band in bands)
-    earned = sum(Decimal(BLS_AGE_BANDS[band][0] * BLS_AGE_BANDS[band][1]) for band in bands)
-    return spent / earned
-
-
-DISCRETIONARY_SHARE = {
-    label: bls_discretionary_share(bands) for label, bands in PERSONA_BLS_BANDS.items()
-}
 
 # The ZIP rank does not change by procedure. A procedure uses these persona
 # lists, and procedures that use the same lists get the same bullet text.
@@ -229,6 +202,7 @@ RANK_COLUMNS = (
     "acs_year",
     "month_date_yyyymm",
     "date_pulled_yyyymmdd",
+    *discretionary.FIELD_TYPES,
 )
 COLUMN_TYPES = {
     "persona": "text",
@@ -254,6 +228,7 @@ COLUMN_TYPES = {
     "acs_year": "integer",
     "month_date_yyyymm": "text",
     "date_pulled_yyyymmdd": "text",
+    **discretionary.FIELD_TYPES,
 }
 NOT_NULL_COLUMNS = {
     "persona",
@@ -299,8 +274,8 @@ INTEGER_RANK_COLUMNS = {
 
 if set(PROCEDURE_PERSONAS) != set(procedures.PROCEDURES):
     raise SystemExit("Every procedure needs a persona list.")
-if set(DISCRETIONARY_SHARE) != set(PERSONA_BY_LABEL):
-    raise SystemExit("Every persona needs a BLS discretionary share.")
+if any(persona.householder_band not in discretionary.AGE_ADJUSTMENTS for persona in PERSONAS):
+    raise SystemExit("Every persona needs a BLS age adjustment.")
 if any(label not in PERSONA_BY_LABEL for labels in PROCEDURE_PERSONAS.values() for label in labels):
     raise SystemExit("A procedure lists an unknown persona.")
 if "DELETE" in DELETE_RANK_SQL.upper() and "redfin_real_estate_value" in DELETE_RANK_SQL:
@@ -492,6 +467,21 @@ def screen_row(row: dict[str, str], persona: Persona) -> dict | None:
     pulled = str(row.get("date_pulled_yyyymmdd") or "").strip()
     if year is None or not month or not pulled:
         raise SystemExit(f"ZIP {zip_code} is missing the join freshness fields.")
+    profile = {
+        name: as_int(row.get(name), name)
+        for name in census.PROFILE_COLUMNS + census.HOUSEHOLDER_AGE_COLUMNS
+    }
+    band = persona.householder_band
+    band_median = median_from_brackets(
+        [profile.get(name) for name in census.householder_income_columns(band)]
+    )
+    income = household if band_median is None else discretionary.whole_dollars(band_median)
+    living = discretionary.cost_of_living(
+        as_int(row.get("median_gross_rent"), "median_gross_rent"),
+        as_int(row.get("median_owner_costs"), "median_owner_costs"),
+        owner_fraction(profile),
+        as_decimal(row.get("average_household_size")),
+    )
     return {
         "zip": zip_code,
         "zip_name": str(row.get("zip_name") or "").strip(),
@@ -514,11 +504,50 @@ def screen_row(row: dict[str, str], persona: Persona) -> dict | None:
         "month_date_yyyymm": month,
         "date_pulled_yyyymmdd": pulled,
         **describe_zip(row),
-        "profile": {
-            name: as_int(row.get(name), name)
-            for name in census.PROFILE_COLUMNS + census.HOUSEHOLDER_AGE_COLUMNS
-        },
+        "profile": profile,
+        "cost_of_living": living,
+        **discretionary.household_fields(income, living, band),
     }
+
+
+MEDIAN_INCOME_CEILING = Decimal(250001)
+
+
+def owner_fraction(profile: dict) -> Decimal | None:
+    owners = profile.get("owner_occupied_households")
+    renters = profile.get("renter_occupied_households")
+    if owners is None or renters is None or owners + renters <= 0:
+        return None
+    return Decimal(owners) / Decimal(owners + renters)
+
+
+def median_from_brackets(counts: list[int | None]) -> Decimal | None:
+    """Median household income from the 16 bracket counts in HOUSEHOLD_INCOME_BRACKETS order.
+
+    Inside a closed bracket the households are spread evenly. A median at or
+    above $200,000 follows the Pareto tail that households_at_or_above uses,
+    capped at MEDIAN_INCOME_CEILING, the value ACS publishes for a median
+    household income of $250,000 or more. Blank when a count is missing or
+    there are no households.
+    """
+    if any(count is None for count in counts):
+        return None
+    total = sum(counts)
+    if total <= 0:
+        return None
+    half = Decimal(total) / 2
+    lows = [Decimal(low) for _column, _code, _phrase, low in census.HOUSEHOLD_INCOME_BRACKETS]
+    below = Decimal(0)
+    for index in range(len(lows) - 1):
+        count = counts[index]
+        if count and below + count >= half:
+            return lows[index] + (half - below) / count * (lows[index + 1] - lows[index])
+        below += count
+    at_or_above_lower = counts[-2] + counts[-1]
+    if at_or_above_lower <= counts[-1]:
+        return MEDIAN_INCOME_CEILING
+    alpha = (Decimal(at_or_above_lower) / Decimal(counts[-1])).ln() / (lows[-1] / lows[-2]).ln()
+    return min(MEDIAN_INCOME_CEILING, lows[-1] * (Decimal(counts[-1]) / half) ** (1 / alpha))
 
 
 def passes_cash(row: dict, persona: Persona, income_middle, per_capita_middle, price_middle) -> bool:
@@ -535,12 +564,10 @@ def passes_cash(row: dict, persona: Persona, income_middle, per_capita_middle, p
     raise SystemExit(f"Unknown cash test {persona.cash!r}.")
 
 
-def discretionary_income(row: dict, persona: Persona) -> Decimal:
-    """BLS shares are per household, so every persona uses median household income.
-
-    The 65-and-older cash screen still uses per-person income.
-    """
-    return DISCRETIONARY_SHARE[persona.label] * Decimal(row["median_household_income"])
+def covers_price(row: dict, price: Decimal) -> bool:
+    """The affordability screen. A ZIP without discretionary income does not pass."""
+    spending = row.get("discretionary_income")
+    return spending is not None and spending >= price
 
 
 def cash_signal(row: dict, persona: Persona) -> Decimal:
@@ -606,6 +633,13 @@ def rank_personas(rows: list[dict[str, str]]) -> list[PersonaRank]:
     if len(zips) != len(set(zips)):
         raise SystemExit("The join has more than one row for a ZIP.")
     rows = practice_area_rows(rows)
+    if rows and all(
+        blank(row.get(name)) for row in rows for name in ("median_gross_rent", "median_owner_costs")
+    ):
+        raise SystemExit(
+            "The join has no ACS housing costs (B25064 and B25088), so no ZIP could pass the "
+            "affordability screen. Run Pull Census ZIP population to fill them, then rerun."
+        )
     return [rank_persona(rows, persona) for persona in PERSONAS]
 
 
@@ -651,6 +685,13 @@ class BulletRow:
     women_in_age_range: int | None = None
     men_in_age_range: int | None = None
     women_share_of_age_range: Decimal | None = None
+    household_income_for_age_range: int | None = None
+    estimated_taxes: int | None = None
+    average_cost_of_living: int | None = None
+    money_left_after_essentials: int | None = None
+    income_bracket: str | None = None
+    discretionary_share_of_remaining: Decimal | None = None
+    discretionary_income: int | None = None
     income_needed: int | None = None
     affordable_households_share: Decimal | None = None
     affordable_households: int | None = None
@@ -723,9 +764,10 @@ def screen_header(procedure: str, screen: PersonaRank, price: Decimal | None = N
         )
     else:
         why = (
-            f"Why: {screen_reasons(screen)}, and a typical household's discretionary spending "
-            f"of about {format_percent(DISCRETIONARY_SHARE[persona.label])} of household income "
-            f"covers the {format_money(price)} midpoint surgeon fee."
+            f"Why: {screen_reasons(screen)}. After estimated taxes, housing, and other essential "
+            f"costs, a typical household headed by someone {persona.householder_phrase} in each "
+            "ZIP code has enough left for discretionary spending to cover the "
+            f"{format_money(price)} midpoint surgeon fee."
         )
     sentences = [
         f"Market {procedure} to {group} in the ZIP codes below.",
@@ -735,7 +777,10 @@ def screen_header(procedure: str, screen: PersonaRank, price: Decimal | None = N
         "Race, ethnicity and education describe these ZIP codes and are not used to rank them.",
     ]
     if price is not None:
-        sentences.append(f"Source: BLS Consumer Expenditure Surveys, {DISCRETIONARY_SOURCE_YEAR}.")
+        sentences.append(
+            f"Sources: {discretionary.TAX_YEAR} federal and California tax rules, ACS housing costs, "
+            "and the BLS Consumer Expenditure Surveys."
+        )
     return " ".join(sentences)
 
 
@@ -769,17 +814,10 @@ def zip_insight(
             f"{format_money(Decimal(row['per_capita_income']))}, both at or above the median of "
             f"{practice.AREA_PHRASE}."
         )
+    money = money_sentence(row, screen.persona)
+    if money:
+        sentences.append(money)
     if price is not None:
-        spending = format_money(discretionary_income(row, screen.persona))
-        if screen.persona.cash == "working":
-            sentences.append(
-                f"About {spending} a year in discretionary spending covers the {format_money(price)} fee."
-            )
-        else:
-            sentences.append(
-                f"With median household income of {household}, about {spending} a year in "
-                f"discretionary spending covers the {format_money(price)} fee."
-            )
         if metrics["affordable_households"] is not None:
             count = metrics["affordable_households"]
             noun = "household" if count == 1 else "households"
@@ -813,6 +851,26 @@ def zip_insight(
     return " ".join(sentences)
 
 
+def money_sentence(row: dict, persona: Persona) -> str:
+    """Taxes, essentials, and discretionary spending in one sentence. Nothing when they are blank."""
+    if row.get("discretionary_income") is None:
+        return ""
+    household = f"a typical household headed by someone {persona.householder_phrase} here"
+    costs = (
+        f"After an estimated {format_money(row['estimated_taxes'])} in taxes and "
+        f"{format_money(row['average_cost_of_living'])} in essential costs"
+    )
+    income = format_money(row["household_income_for_age_range"])
+    left = row["money_left_after_essentials"]
+    if left <= 0:
+        return f"{costs}, {household} has nothing left of its {income} income for discretionary items."
+    return (
+        f"{costs}, {household} has about {format_money(left)} left of its {income} income "
+        f"and spends about {row['discretionary_share_of_remaining']}% of that, roughly "
+        f"{format_money(row['discretionary_income'])} a year, on discretionary items."
+    )
+
+
 def housing_work_sentence(metrics: dict) -> str:
     """Home ownership and women's management and professional jobs. Nothing when both are blank."""
     clauses = []
@@ -844,9 +902,12 @@ def percent_of(part: int | Decimal | None, total: int | Decimal | None) -> Decim
     return percent_points(Decimal(part) / Decimal(total))
 
 
-def income_needed(price: Decimal, persona: Persona) -> int:
-    """Household income whose discretionary share covers the fee, in whole dollars."""
-    return int((price / DISCRETIONARY_SHARE[persona.label]).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+def income_needed(row: dict, price: Decimal, persona: Persona) -> int | None:
+    """Household income whose discretionary income covers the fee with this ZIP's costs."""
+    living = row.get("cost_of_living")
+    if living is None:
+        return None
+    return discretionary.income_needed(price, living, persona.householder_band)
 
 
 def households_at_or_above(
@@ -897,7 +958,7 @@ def pareto_tail(
 
 
 def zip_metrics(row: dict, persona: Persona, price: Decimal | None) -> dict:
-    """Descriptive values for one ZIP row. None of them changes a screen or a rank."""
+    """List values for one ZIP row. Only discretionary_income, copied from the row, is a screen."""
     profile = row.get("profile") or {}
     women = count_sum(profile, [f"female_{column}" for column in persona.age_columns])
     men = count_sum(profile, [f"male_{column}" for column in persona.age_columns])
@@ -933,8 +994,10 @@ def zip_metrics(row: dict, persona: Persona, price: Decimal | None) -> dict:
             profile.get("women_arts_design_entertainment_sports_media"), employed
         ),
     }
-    if price is not None:
-        needed = income_needed(price, persona)
+    for name in discretionary.FIELD_TYPES:
+        metrics[name] = row.get(name)
+    needed = None if price is None else income_needed(row, price, persona)
+    if needed is not None:
         metrics["income_needed"] = needed
         columns = census.householder_income_columns(persona.householder_band)
         affordable = households_at_or_above(profile, Decimal(needed), columns)
@@ -973,9 +1036,7 @@ def affordable_rows(screen: PersonaRank, price: Decimal | None) -> list[dict]:
     candidates = screen.passed if screen.passed else screen.rows
     if price is None:
         return candidates[:TOP_N]
-    return [row for row in candidates if discretionary_income(row, screen.persona) >= price][
-        :TOP_N
-    ]
+    return [row for row in candidates if covers_price(row, price)][:TOP_N]
 
 
 def render_screen(
