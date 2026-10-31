@@ -14,6 +14,7 @@ from pathlib import Path
 
 import join_census_redfin as join
 import load_california
+import practice
 import pull_census_zip_population as census
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +41,9 @@ def redfin_row(
     row["zip_name"] = name
     row["median_listing_price"] = price
     row["date_pulled_yyyymmdd"] = "2026_10_27"
+    row["practice_zip_code"] = practice.PRACTICE_ZIP_CODE
+    row["county"] = "Los Angeles"
+    row["distance_from_practice_miles"] = "8.50"
     return row
 
 
@@ -68,7 +72,7 @@ class CensusYearLoadTests(unittest.TestCase):
         source = inspect.getsource(load_california.load_history)
         self.assertIn("if census_year is None:", source)
         self.assertIn("return replace_table(conn)", source)
-        self.assertIn("return upsert_census_year(conn, census_year)", source)
+        self.assertIn("return upsert_census_year(conn, census_year, area, updated_at)", source)
         replace = inspect.getsource(load_california.replace_table)
         self.assertIn("DELETE FROM {TABLE}", replace)
 
@@ -118,13 +122,20 @@ class CensusYearLoadTests(unittest.TestCase):
             ]
         )
         kept = list(
-            load_california.iter_los_angeles_rows(
-                reader, "2026_10_27", {"90001", "90002"}, 2024
+            load_california.iter_area_rows(
+                reader,
+                "2026_10_27",
+                {
+                    "90001": practice.AreaZip("Los Angeles", Decimal("12.34")),
+                    "90002": practice.AreaZip("Los Angeles", Decimal("13.00")),
+                },
+                2024,
             )
         )
         self.assertEqual([row[0] for row in kept], ["2024_12", "2024_01"])
         self.assertEqual([row[1] for row in kept], ["90001", "90002"])
         self.assertEqual(kept[0][3], Decimal("10"))
+        self.assertEqual(kept[0][-3:], ("90210", "Los Angeles", Decimal("12.34")))
 
     def test_scheduled_iterator_still_yields_every_year(self):
         reader = history_reader(
@@ -134,8 +145,8 @@ class CensusYearLoadTests(unittest.TestCase):
             ]
         )
         kept = list(
-            load_california.iter_los_angeles_rows(
-                reader, "2026_10_27", {"90001"}
+            load_california.iter_area_rows(
+                reader, "2026_10_27", {"90001": practice.AreaZip("Los Angeles", Decimal("12.34"))}
             )
         )
         self.assertEqual([row[0] for row in kept], ["2024_12", "2025_09"])
@@ -436,11 +447,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("zip%20code%20tabulation%20area:90001,90002", url)
         self.assertNotIn("in=", url)
         self.assertNotIn("state", url)
-        self.assertIn('cron: "0 17 * * *"', workflow)
+        self.assertIn('cron: "17 17 * * *"', workflow)
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("GitHub cron is UTC and does not follow daylight saving.", workflow)
-        self.assertIn("10:00 AM Pacific Daylight Time", workflow)
-        self.assertIn("9:00 AM Pacific Standard Time", workflow)
+        self.assertIn("10:17 AM Pacific Daylight Time", workflow)
+        self.assertIn("9:17 AM Pacific Standard Time", workflow)
         self.assertNotIn("0 16 1 1,7 *", workflow)
 
 

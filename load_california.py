@@ -1,14 +1,16 @@
-"""Load Los Angeles County ZIP months from Realtor.com inventory history.
+"""Load practice-area ZIP months from Realtor.com inventory history.
 
 The research page at https://www.realtor.com/research/data/ publishes the
 Monthly Housing Inventory downloads. This script reads the Zip row's
 Historical Data href and loads that CSV. It does not read values out of the
 page HTML, and it does not use the current-month snapshot.
 
-The file is already one row per ZIP per month. A ZIP is kept when the Census
-ZCTA-to-county relationship file says Los Angeles County (FIPS 06037) is its
-majority county by land area. The place name is not used. Only the
-listing-price and active-count columns below are loaded.
+The file is already one row per ZIP per month and covers every state. A ZIP
+is kept only when it is in the practice area in practice.py: its majority
+county by land area is Los Angeles (06037) or Orange (06059), and it is
+within 50 miles of the practice ZIP. The place name is not used. Only the
+listing-price and active-count columns below are loaded, plus
+practice_zip_code, county, and distance_from_practice_miles.
 
 A scheduled or manual run replaces public.redfin_real_estate_value. Existing
 rows in that table are deleted, then the current extract is inserted, so a
@@ -19,7 +21,9 @@ change from run to run.
 
 python load_california.py --census-year YYYY keeps only months in that
 calendar year. Those rows are inserted or updated. Months already stored
-are not deleted. The CSV from that run contains that year only. The chained
+for a practice-area ZIP are not deleted, and their practice fields are
+brought up to date. Every stored month of a ZIP outside the practice area
+is deleted. The CSV from that run contains that year only. The chained
 Census workflow uses this so older Redfin months stay in Supabase.
 
 Every row this run inserts or updates gets the same dataset_updated_at.
@@ -43,6 +47,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import dataset_stamp
+import practice
 
 RESEARCH_PAGE = "https://www.realtor.com/research/data/"
 DATABASE_URL_ENV = "DATABASE_URL"
@@ -51,11 +56,7 @@ TABLE_NAME = "redfin_real_estate_value"
 TABLE = "public.redfin_real_estate_value"
 # Census Bureau 2020 ZIP Code Tabulation Area to county relationship file.
 # https://www2.census.gov/geo/docs/maps-data/data/rel2020/zcta520/tab20_zcta520_county20_natl.txt
-CROSSWALK_URL = (
-    "https://www2.census.gov/geo/docs/maps-data/data/rel2020/zcta520/"
-    "tab20_zcta520_county20_natl.txt"
-)
-LA_COUNTY_FIPS = "06037"
+CROSSWALK_URL = practice.CROSSWALK_URL
 OUTPUT_CSV_NAME = "california_zip_inventory.csv"
 OUTPUT_CSV = Path(__file__).resolve().parent / OUTPUT_CSV_NAME
 PACIFIC = ZoneInfo("America/Los_Angeles")
@@ -80,7 +81,7 @@ KEPT_COLUMNS = (
     "median_listing_price_per_square_foot_yy",
 )
 MEASURE_COLUMNS = KEPT_COLUMNS[3:]
-LOAD_COLUMNS = KEPT_COLUMNS + ("date_pulled_yyyymmdd",)
+LOAD_COLUMNS = KEPT_COLUMNS + ("date_pulled_yyyymmdd",) + practice.FIELDS
 # Stored with each load. Not part of the Realtor CSV or the join's source columns.
 STORED_COLUMNS = LOAD_COLUMNS + (dataset_stamp.COLUMN,)
 STAGING_COLUMNS = STORED_COLUMNS + ("load_seq",)
@@ -98,6 +99,9 @@ COLUMN_TYPES = {
     "median_listing_price_per_square_foot_mm": "numeric",
     "median_listing_price_per_square_foot_yy": "numeric",
     "date_pulled_yyyymmdd": "text",
+    "practice_zip_code": "text",
+    "county": "text",
+    "distance_from_practice_miles": "numeric",
     dataset_stamp.COLUMN: dataset_stamp.SQL_TYPE,
 }
 NOT_NULL_COLUMNS = {
@@ -296,68 +300,9 @@ def postal_code_key(raw: str | None) -> str | None:
     return "".join(digits[:5])
 
 
-def los_angeles_postal_codes() -> set[str]:
-    """ZIPs whose majority county in the Census crosswalk is 06037.
-
-    Parts of one ZCTA are summed by county. Los Angeles County must have
-    strictly more land area than every other county. Water area is used only
-    when land area ties. A tie on both is not a majority, so that ZIP is
-    left out. A place name that contains Los Angeles is not consulted.
-    """
-    request = urllib.request.Request(
-        CROSSWALK_URL,
-        headers={"User-Agent": USER_AGENT, "Accept": "text/plain,*/*"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            text = response.read().decode("utf-8-sig")
-    except urllib.error.HTTPError as exc:
-        raise SystemExit(
-            f"Census ZCTA-county crosswalk returned HTTP {exc.code}: {CROSSWALK_URL}"
-        ) from exc
-    reader = csv.DictReader(io.StringIO(text), delimiter="|")
-    required = {
-        "GEOID_ZCTA5_20",
-        "GEOID_COUNTY_20",
-        "AREALAND_PART",
-        "AREAWATER_PART",
-    }
-    missing = required.difference(reader.fieldnames or [])
-    if missing:
-        raise SystemExit(f"Census crosswalk is missing columns: {sorted(missing)}")
-    parts: dict[str, dict[str, list[int]]] = {}
-    for row in reader:
-        zcta = (row.get("GEOID_ZCTA5_20") or "").strip()
-        county = (row.get("GEOID_COUNTY_20") or "").strip()
-        if len(zcta) != 5 or not zcta.isdigit():
-            continue
-        if len(county) != 5 or not county.isdigit():
-            continue
-        try:
-            land = int(row.get("AREALAND_PART") or 0)
-            water = int(row.get("AREAWATER_PART") or 0)
-        except ValueError:
-            continue
-        county_area = parts.setdefault(zcta, {}).setdefault(county, [0, 0])
-        county_area[0] += land
-        county_area[1] += water
-    kept: set[str] = set()
-    for zcta, counties in parts.items():
-        los_angeles = counties.get(LA_COUNTY_FIPS)
-        if los_angeles is None or los_angeles == [0, 0]:
-            continue
-        if any(
-            area >= los_angeles
-            for county, area in counties.items()
-            if county != LA_COUNTY_FIPS
-        ):
-            continue
-        kept.add(zcta)
-    if not kept:
-        raise SystemExit(
-            f"Census crosswalk did not identify any {LA_COUNTY_FIPS} ZIPs."
-        )
-    return kept
+def area_postal_codes() -> dict[str, practice.AreaZip]:
+    """Practice-area ZIPs with their county and distance. See practice.py."""
+    return practice.practice_area()
 
 
 def require_header(fieldnames: list[str] | None) -> list[str]:
@@ -368,16 +313,16 @@ def require_header(fieldnames: list[str] | None) -> list[str]:
     return names
 
 
-def iter_los_angeles_rows(
+def iter_area_rows(
     reader: csv.DictReader,
     pull_date: str,
-    postal_codes: set[str],
+    area: dict[str, practice.AreaZip],
     census_year: int | None = None,
 ):
     require_header(reader.fieldnames)
     for row in reader:
         postal_code = postal_code_key(row.get("postal_code"))
-        if postal_code is None or postal_code not in postal_codes:
+        if postal_code is None or postal_code not in area:
             continue
         zip_name = (row.get("zip_name") or "").strip()
         month = month_text((row.get("month_date_yyyymm") or "").strip())
@@ -392,7 +337,7 @@ def iter_los_angeles_rows(
                 measures.append(parse_count(raw))
             else:
                 measures.append(parse_number(raw))
-        yield (month, postal_code, zip_name, *measures, pull_date)
+        yield (month, postal_code, zip_name, *measures, pull_date, *area[postal_code].fields())
 
 
 def open_csv(url: str):
@@ -671,14 +616,39 @@ def replace_table(conn) -> int:
     return count
 
 
+def prune_and_refresh_area(cur, area: dict[str, practice.AreaZip], updated_at: datetime) -> tuple[int, int]:
+    """Delete stored months of ZIPs outside the area. Bring the practice fields up to date.
+
+    Months of a practice-area ZIP are never deleted here.
+    """
+    codes = sorted(area)
+    cur.execute(f"DELETE FROM {TABLE} WHERE NOT (postal_code = ANY(%s))", (codes,))
+    removed = max(cur.rowcount or 0, 0)
+    refreshed = 0
+    for code in codes:
+        fields = area[code].fields()
+        cur.execute(
+            f"UPDATE {TABLE} SET practice_zip_code = %s, county = %s, "
+            f"distance_from_practice_miles = %s, {dataset_stamp.COLUMN} = %s "
+            "WHERE postal_code = %s AND (practice_zip_code IS DISTINCT FROM %s "
+            "OR county IS DISTINCT FROM %s OR distance_from_practice_miles IS DISTINCT FROM %s)",
+            (*fields, updated_at, code, *fields),
+        )
+        refreshed += max(cur.rowcount or 0, 0)
+    return removed, refreshed
+
+
 class CensusYearRejected(Exception):
     """The census-year load stopped before changing stored Redfin months."""
 
 
-def upsert_census_year(conn, year: int) -> int:
+def upsert_census_year(
+    conn, year: int, area: dict[str, practice.AreaZip] | None = None, updated_at: datetime | None = None
+) -> int:
     """Insert or update one census calendar year and write that year to the CSV.
 
-    Months already stored outside this load stay in the table.
+    Months already stored for a practice-area ZIP stay in the table. Stored
+    months of a ZIP outside the area are deleted.
     """
     pattern = census_year_month_pattern(year)
     sql = census_year_upsert_sql()
@@ -711,6 +681,14 @@ def upsert_census_year(conn, year: int) -> int:
                         f"Refusing to load {outside} Redfin rows outside {year}."
                     )
                 cur.execute(sql)
+                if area is not None:
+                    removed, refreshed = prune_and_refresh_area(
+                        cur, area, dataset_stamp.stamp(updated_at)
+                    )
+                    print(
+                        f"Deleted {removed} stored months outside the practice area. "
+                        f"Updated practice fields on {refreshed} stored months."
+                    )
                 cur.execute(
                     """
                     SELECT COUNT(*)
@@ -756,9 +734,14 @@ def load_history(
     updated_at: datetime | None = None,
 ) -> int:
     updated_at = dataset_stamp.stamp(updated_at)
-    postal_codes = los_angeles_postal_codes()
+    area = area_postal_codes()
+    counts = ", ".join(
+        f"{sum(1 for zip_area in area.values() if zip_area.county == name)} {name}"
+        for name in practice.COUNTIES.values()
+    )
     print(
-        f"Majority Los Angeles County ZIPs in {CROSSWALK_URL}: {len(postal_codes)}"
+        f"Practice-area ZIPs within {practice.MAX_DISTANCE_MILES} miles of "
+        f"{practice.PRACTICE_ZIP_CODE}: {len(area)} ({counts})."
     )
     if census_year is not None:
         print(
@@ -771,8 +754,8 @@ def load_history(
     seq = 0
     batch: list[tuple] = []
     try:
-        for row in iter_los_angeles_rows(
-            reader, pull_date, postal_codes, census_year
+        for row in iter_area_rows(
+            reader, pull_date, area, census_year
         ):
             seq += 1
             batch.append((*row, updated_at, seq))
@@ -789,7 +772,7 @@ def load_history(
         return 0
     if census_year is None:
         return replace_table(conn)
-    return upsert_census_year(conn, census_year)
+    return upsert_census_year(conn, census_year, area, updated_at)
 
 
 def connect():
@@ -853,7 +836,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"date_pulled_yyyymmdd: {pull_date}")
     print(f"dataset_updated_at: {updated_at.isoformat()}")
     if census_year is None:
-        print(f"Replacing {TABLE} with every Los Angeles County month in the file.")
+        print(f"Replacing {TABLE} with every practice-area month in the file.")
     else:
         print(
             f"Census year {census_year}: upserting that Redfin year only. "
@@ -865,21 +848,21 @@ def main(argv: list[str] | None = None) -> int:
         count = load_history(conn, url, pull_date, census_year, updated_at)
     if count == 0:
         if census_year is None:
-            print("No Los Angeles County ZIP rows were loaded.", file=sys.stderr)
+            print("No practice-area ZIP rows were loaded.", file=sys.stderr)
         else:
             print(
-                f"No Los Angeles County ZIP rows were loaded for {census_year}.",
+                f"No practice-area ZIP rows were loaded for {census_year}.",
                 file=sys.stderr,
             )
         return 1
     if census_year is None:
         print(
-            f"Replaced {TABLE} with {count} Los Angeles County ZIP months "
+            f"Replaced {TABLE} with {count} practice-area ZIP months "
             f"and overwrote {OUTPUT_CSV_NAME}."
         )
     else:
         print(
-            f"Upserted {count} Los Angeles County ZIP months for {census_year} "
+            f"Upserted {count} practice-area ZIP months for {census_year} "
             f"into {TABLE}. Other months already stored were kept. "
             f"Overwrote {OUTPUT_CSV_NAME} with {census_year} only."
         )
