@@ -15,6 +15,9 @@
       <map key='[median_listing_price_per_square_foot_mm]' value='[redfin_real_estate_value].[median_listing_price_per_square_foot_mm]' />
       <map key='[median_listing_price_per_square_foot_yy]' value='[redfin_real_estate_value].[median_listing_price_per_square_foot_yy]' />
       <map key='[date_pulled_yyyymmdd]' value='[redfin_real_estate_value].[date_pulled_yyyymmdd]' />
+      <map key='[practice_zip_code]' value='[redfin_real_estate_value].[practice_zip_code]' />
+      <map key='[county]' value='[redfin_real_estate_value].[county]' />
+      <map key='[distance_from_practice_miles]' value='[redfin_real_estate_value].[distance_from_practice_miles]' />
     </cols>
   </connection>
   <aliases enabled='yes' />
@@ -33,4 +36,8 @@
   <column datatype='real' default-format='p0.00%' name='[median_listing_price_per_square_foot_yy]' role='measure' type='quantitative' />
   <!-- Text yyyy_mm_dd, for example 2026_10_23. No date role. -->
   <column datatype='string' name='[date_pulled_yyyymmdd]' role='dimension' type='nominal' />
+  <column datatype='string' name='[practice_zip_code]' role='dimension' type='nominal' />
+  <column datatype='string' name='[county]' role='dimension' type='nominal' />
+  <!-- Miles from the practice ZIP, two decimals. -->
+  <column datatype='real' default-format='n#,##0.00' name='[distance_from_practice_miles]' role='measure' type='quantitative' />
 </datasource>
