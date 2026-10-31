@@ -1,16 +1,18 @@
-"""Load ACS 5-year demographics, income, housing, and occupation for Los Angeles County home-value ZIPs.
+"""Load ACS 5-year demographics, income, housing, and occupation for practice-area home-value ZIPs.
 
-The Census download requests California ZCTAs. Those codes come from the
-ZCTA-to-county relationship file (any area in a county whose FIPS starts
-with 06). The data query lists those ZCTAs and does not send in=state.
+The practice area is in practice.py: ZIPs whose majority county by land
+area is Los Angeles (06037) or Orange (06059) and that are within 50 miles
+of the practice ZIP. The Census download requests the California ZCTAs
+that are in that area and in the home-value extract. California ZCTAs come
+from the ZCTA-to-county relationship file (any area in a county whose FIPS
+starts with 06). The data query lists those ZCTAs and does not send in=state.
 ZCTAs are not nested in a state, and in=state:06 is an unsupported hierarchy.
 Census reports that as "unknown/unsupported geography hierarchy" (sometimes
 spelled "heirarchy"). That is not a missing ZIP.
 
 After each batch is downloaded, the rows go into a dataframe. The dataframe
-keeps California ZCTAs, then the Los Angeles County ZIP codes that are in
-the home-value extract and whose majority land area is Los Angeles County
-(FIPS 06037). ZCTAs are stored in the zip column. This script does not read
+keeps California ZCTAs, then the practice-area ZIP codes that are in the
+home-value extract. ZCTAs are stored in the zip column. This script does not read
 office, dermatology, or NPI locations.
 
 A run fetches only the latest published ACS 5-year vintage. Income, age,
@@ -56,6 +58,7 @@ import pandas as pd
 
 import dataset_stamp
 import load_california
+import practice
 
 DATABASE_URL_ENV = "DATABASE_URL"
 CENSUS_API_KEY_ENV = "CENSUS_API_KEY"
@@ -136,7 +139,7 @@ def female_code(male_code: str) -> str:
 # B03002. Hispanic or Latino of any race is one group. The rest are
 # non-Hispanic single races. American Indian and Alaska Native, Native
 # Hawaiian and Other Pacific Islander, some other race, and two or more races
-# are each small in Los Angeles County ZIPs, so they share one group.
+# are each small in practice-area ZIPs, so they share one group.
 RACE_ETHNICITY_GROUPS = {
     "hispanic_or_latino_population": (("B03002_012E", "Hispanic or Latino:"),),
     "non_hispanic_white_population": (("B03002_003E", "Not Hispanic or Latino:!!White alone"),),
@@ -423,8 +426,8 @@ def estimate_variables() -> tuple[str, ...]:
     return tuple(variables)
 
 
-def select_zips(home_value_zips: set[str], county_zips: set[str]) -> set[str]:
-    """ZIPs that are both in the home-value output and majority Los Angeles County."""
+def select_zips(home_value_zips: set[str], county_zips) -> set[str]:
+    """ZIPs that are both in the home-value output and in the practice area."""
     return {zip_code for zip_code in home_value_zips if zip_code in county_zips}
 
 
@@ -432,7 +435,7 @@ def home_value_postal_codes() -> set[str]:
     path = load_california.OUTPUT_CSV
     if not path.exists():
         raise SystemExit(
-            f"{path.name} is missing, so the Los Angeles County ZIP list "
+            f"{path.name} is missing, so the practice-area ZIP list "
             "cannot be read."
         )
     codes: set[str] = set()
@@ -449,20 +452,18 @@ def home_value_postal_codes() -> set[str]:
     return codes
 
 
-def los_angeles_home_value_zips() -> set[str]:
+def area_home_value_zips() -> set[str]:
     home_value = home_value_postal_codes()
-    county = load_california.los_angeles_postal_codes()
-    kept = select_zips(home_value, county)
+    area = practice.practice_area()
+    kept = select_zips(home_value, area)
     print(
         f"Home-value file ZIPs: {len(home_value)}. "
-        f"Majority Los Angeles County ZIPs: {len(county)}. "
-        f"Kept: {len(kept)}.",
+        f"Practice-area ZIPs within {practice.MAX_DISTANCE_MILES} miles of "
+        f"{practice.PRACTICE_ZIP_CODE}: {len(area)}. Kept: {len(kept)}.",
         flush=True,
     )
     if not kept:
-        raise SystemExit(
-            "No home-value ZIP passed the Los Angeles County majority-land filter."
-        )
+        raise SystemExit("No home-value ZIP is in the practice area.")
     return kept
 
 
@@ -540,9 +541,9 @@ def records_to_frame(records: list[dict[str, str]]) -> pd.DataFrame:
 def filter_downloaded_zips(
     frame: pd.DataFrame,
     california_zips: set[str],
-    la_zips: set[str],
+    area_zips: set[str],
 ) -> pd.DataFrame:
-    """Keep California ZCTAs, then the Los Angeles County home-value set.
+    """Keep California ZCTAs, then the practice-area home-value set.
 
     The Census response is already in a dataframe. This does not change the
     request that downloaded it.
@@ -556,7 +557,7 @@ def filter_downloaded_zips(
     if california.empty:
         return california
     normalized = california[GEO_COLUMN].map(normalize_zip)
-    return california.loc[normalized.isin(la_zips)].copy()
+    return california.loc[normalized.isin(area_zips)].copy()
 
 
 def quote_census(value: str, safe: str = "", encoding: str | None = None, errors: str | None = None) -> str:
@@ -1080,18 +1081,18 @@ def rows_from_download(
     records: list[dict[str, str]],
     variables: tuple[str, ...],
     california_zips: set[str],
-    la_zips: set[str],
+    area_zips: set[str],
     seen: set[str],
 ) -> list[tuple]:
-    """Turn one downloaded batch into rows, then keep Los Angeles County."""
+    """Turn one downloaded batch into rows, then keep the practice area."""
     frame = records_to_frame(records)
-    kept = filter_downloaded_zips(frame, california_zips, la_zips)
+    kept = filter_downloaded_zips(frame, california_zips, area_zips)
     if kept.empty:
         return []
     rows: list[tuple] = []
     for record in kept.to_dict(orient="records"):
         zip_code = normalize_zip(record.get(GEO_COLUMN))
-        if zip_code not in la_zips or zip_code in seen:
+        if zip_code not in area_zips or zip_code in seen:
             continue
         seen.add(zip_code)
         estimates = {
@@ -1105,7 +1106,7 @@ def rows_from_download(
 def rows_for_vintage(
     year: int,
     california_zips: list[str],
-    la_zips: set[str],
+    area_zips: set[str],
     on_batch,
 ) -> list[tuple]:
     """Download California ZCTAs in batches and checkpoint after each one."""
@@ -1124,17 +1125,17 @@ def rows_for_vintage(
         )
         records = fetch_zip_batch(year, list(batch))
         new_rows = rows_from_download(
-            year, records, variables, california, la_zips, seen
+            year, records, variables, california, area_zips, seen
         )
         rows.extend(new_rows)
         on_batch(list(rows), new_rows)
     print(
-        f"ACS {year}: {len(rows)} of {len(la_zips)} Los Angeles County home-value ZIPs.",
+        f"ACS {year}: {len(rows)} of {len(area_zips)} practice-area home-value ZIPs.",
         flush=True,
     )
-    if len(rows) < max(1, len(la_zips) // 2):
+    if len(rows) < max(1, len(area_zips) // 2):
         raise SystemExit(
-            f"ACS {year} returned too few Los Angeles County home-value ZIPs."
+            f"ACS {year} returned too few practice-area home-value ZIPs."
         )
     rows.sort(key=lambda row: (row[0], row[1]))
     return rows
@@ -1289,7 +1290,7 @@ def checkpoint_download(holder: dict, rows_so_far: list[tuple], new_rows: list[t
     ordered = sorted(rows_so_far, key=lambda row: (row[0], row[1]))
     write_csv(ordered)
     print(
-        f"Saved {len(ordered)} Los Angeles County rows to {OUTPUT_CSV_NAME}.",
+        f"Saved {len(ordered)} practice-area rows to {OUTPUT_CSV_NAME}.",
         flush=True,
     )
     if not database_url() or not new_rows:
@@ -1351,8 +1352,8 @@ def main() -> int:
     print(f"dataset_updated_at: {updated_at.isoformat()}")
     rows: list[tuple] | None = None
     try:
-        california = california_zctas()
-        la_zips = los_angeles_home_value_zips()
+        area_zips = area_home_value_zips()
+        california = [zip_code for zip_code in california_zctas() if zip_code in area_zips]
         print(f"California ZCTAs to request: {len(california)}.", flush=True)
         vintage = latest_vintage(datetime.now(timezone.utc).year)
         print(f"ACS 5-year vintage: {vintage}.", flush=True)
@@ -1361,7 +1362,7 @@ def main() -> int:
         def on_batch(rows_so_far: list[tuple], new_rows: list[tuple]) -> None:
             checkpoint_download(holder, rows_so_far, new_rows)
 
-        rows = rows_for_vintage(vintage, california, la_zips, on_batch)
+        rows = rows_for_vintage(vintage, california, area_zips, on_batch)
     except SystemExit as exc:
         print(public_error(exc), file=sys.stderr)
         rows = None
@@ -1393,7 +1394,7 @@ def main() -> int:
             return 1
     print(
         f"Inserted {inserted} new rows into {TABLE}. "
-        f"Filled race, ethnicity, and education on {filled} stored rows. "
+        f"Filled blank added columns on {filled} stored rows. "
         f"The table has {total} rows. Older vintages were kept."
     )
     return notify_refresh_review(TABLE_NAME)

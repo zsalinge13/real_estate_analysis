@@ -5,6 +5,11 @@ for the chained run has only that calendar year. The join keeps the latest
 `month_date_yyyymm` in that year. A ZIP is kept only when `postal_code`
 equals `zip`. The grain is one row per ZIP.
 
+Only practice-area ZIPs are joined: the Redfin row's practice_zip_code
+must be the practice ZIP in practice.py, its county must be Los Angeles or
+Orange, and distance_from_practice_miles must be 50 or less. A Redfin file
+without those fields is refused.
+
 Prices and census values are copied from those rows. A blank cell stays
 blank. This script does not fill a price from an earlier month. A Census
 file from before the race, ethnicity, and education columns were added is
@@ -27,6 +32,7 @@ from pathlib import Path
 
 import dataset_stamp
 import load_california
+import practice
 import pull_census_zip_population as census
 
 TABLE_NAME = "zip_census_redfin_join"
@@ -56,6 +62,8 @@ TEXT_JOIN_COLUMNS = {
     "postal_code",
     "zip_name",
     "date_pulled_yyyymmdd",
+    "practice_zip_code",
+    "county",
 }
 NOT_NULL_JOIN_COLUMNS = {
     "acs_year",
@@ -179,6 +187,10 @@ def join_records(
         key = load_california.postal_code_key(cell(row, "postal_code"))
         if not key:
             raise SystemExit(f"Redfin month {month} has a row without a ZIP.")
+        if not practice.in_area(
+            cell(row, "practice_zip_code"), cell(row, "county"), cell(row, "distance_from_practice_miles")
+        ):
+            continue
         if key in redfin_by_zip:
             raise SystemExit(
                 f"Redfin has more than one row for ZIP {key} in {month}."
@@ -290,7 +302,7 @@ def replace_join_table(
                 f"ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS "
                 f"{quote_ident(dataset_stamp.COLUMN)} {dataset_stamp.SQL_TYPE}"
             )
-            for name in census.ADDED_COLUMNS:
+            for name in census.ADDED_COLUMNS + practice.FIELDS:
                 cur.execute(
                     f"ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS "
                     f"{quote_ident(name)} {column_sql_type(name)}"

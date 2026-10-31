@@ -1,4 +1,8 @@
-"""Rank Los Angeles County ZIPs from the Census-Redfin join.
+"""Rank practice-area ZIPs from the Census-Redfin join.
+
+The practice area is in practice.py: Los Angeles and Orange County ZIPs
+within 50 miles of the practice ZIP. A join row outside it is skipped. The
+screen medians are taken over the eligible ZIPs in that area.
 
 The input is the join that just succeeded. This script does not rebuild
 that join and does not delete Redfin months. Each persona keeps the top 25
@@ -44,6 +48,7 @@ from pathlib import Path
 
 import dataset_stamp
 import load_california
+import practice
 import pull_census_zip_population as census
 import pull_procedure_surgeon_fees as procedures
 
@@ -64,6 +69,9 @@ BULLET_LIST_COLUMNS = (
     ("city", "text[]"),
     ("state", "text[]"),
     ("zip_code", "text[]"),
+    ("practice_zip_code", "text[]"),
+    ("county", "text[]"),
+    ("distance_from_practice_miles", "numeric[]"),
     ("insight", "text[]"),
     ("household_income", "integer[]"),
     ("individual_income", "integer[]"),
@@ -211,6 +219,9 @@ RANK_COLUMNS = (
     "rank",
     "zip",
     "zip_name",
+    "practice_zip_code",
+    "county",
+    "distance_from_practice_miles",
     "age_share",
     "median_household_income",
     "per_capita_income",
@@ -233,6 +244,9 @@ COLUMN_TYPES = {
     "rank": "integer",
     "zip": "text",
     "zip_name": "text",
+    "practice_zip_code": "text",
+    "county": "text",
+    "distance_from_practice_miles": "numeric",
     "age_share": "numeric",
     "median_household_income": "integer",
     "per_capita_income": "integer",
@@ -288,6 +302,7 @@ JOIN_FIELDS = (
     "acs_year",
     "month_date_yyyymm",
     "date_pulled_yyyymmdd",
+    *practice.FIELDS,
 )
 INTEGER_RANK_COLUMNS = {
     name for name, sql_type in COLUMN_TYPES.items() if sql_type == "integer"
@@ -456,6 +471,10 @@ def age_count(row: dict[str, str], persona: Persona) -> int | None:
 
 def screen_row(row: dict[str, str], persona: Persona) -> dict | None:
     """Return the measures used for one persona, or None when the ZIP is skipped."""
+    if not practice.in_area(
+        row.get("practice_zip_code"), row.get("county"), row.get("distance_from_practice_miles")
+    ):
+        return None
     counted = age_count(row, persona)
     adults = as_int(row.get("adult_population"), "adult_population")
     household = as_int(row.get("median_household_income"), "median_household_income")
@@ -487,6 +506,9 @@ def screen_row(row: dict[str, str], persona: Persona) -> dict | None:
     return {
         "zip": zip_code,
         "zip_name": str(row.get("zip_name") or "").strip(),
+        "practice_zip_code": str(row["practice_zip_code"]).strip(),
+        "county": str(row["county"]).strip(),
+        "distance_from_practice_miles": Decimal(str(row["distance_from_practice_miles"]).strip()),
         "age_count": counted,
         "adult_population": adults,
         "age_share": Decimal(counted) / Decimal(adults),
@@ -604,6 +626,9 @@ class BulletRow:
     state: str
     zip_code: str
     insight: str
+    practice_zip_code: str | None = None
+    county: str | None = None
+    distance_from_practice_miles: Decimal | None = None
     household_income: int | None = None
     individual_income: int | None = None
     median_listing_price_per_square_foot: Decimal | None = None
@@ -658,12 +683,12 @@ def screen_reasons(screen: PersonaRank) -> str:
     if screen.persona.cash == "working":
         return (
             "median household income and median listing price per square foot in these ZIP codes "
-            "are at or above the Los Angeles County medians of "
+            f"are at or above the medians of {practice.AREA_PHRASE}, "
             f"{format_money(screen.household_income_middle)} and {listing}"
         )
     return (
         "median listing price per square foot and per-person income in these ZIP codes "
-        f"are at or above the Los Angeles County medians of {listing} and "
+        f"are at or above the medians of {practice.AREA_PHRASE}, {listing} and "
         f"{format_money(screen.per_capita_income_middle)}"
     )
 
@@ -673,9 +698,10 @@ def screen_header(procedure: str, screen: PersonaRank, price: Decimal | None = N
     group = f"adults {persona.age_phrase}"
     if screen.household_income_middle is None or not screen.rows:
         return (
-            f"No Los Angeles County ZIP code qualified for marketing {procedure} to {group}. "
+            f"No ZIP code within {practice.MAX_DISTANCE_MILES} miles of the practice qualified "
+            f"for marketing {procedure} to {group}. "
             "Each ZIP code needs income and median listing price per square foot at or above "
-            f"the county median, plus at least {MIN_ACTIVE_LISTINGS} active listings."
+            f"the median of {practice.AREA_PHRASE}, plus at least {MIN_ACTIVE_LISTINGS} active listings."
         )
     if price is None:
         why = (
@@ -721,12 +747,13 @@ def zip_insight(
     if screen.persona.cash == "working":
         sentences.append(
             f"Median household income is {household} and median listing price per square foot "
-            f"is {listing}, both at or above the county median."
+            f"is {listing}, both at or above the median of {practice.AREA_PHRASE}."
         )
     else:
         sentences.append(
             f"Median listing price per square foot is {listing} and per-person income is "
-            f"{format_money(Decimal(row['per_capita_income']))}, both at or above the county median."
+            f"{format_money(Decimal(row['per_capita_income']))}, both at or above the median of "
+            f"{practice.AREA_PHRASE}."
         )
     if price is not None:
         spending = format_money(discretionary_income(row, screen.persona))
@@ -945,6 +972,9 @@ def render_screen(
                 city=city,
                 state=state,
                 zip_code=str(row["zip"]),
+                practice_zip_code=row.get("practice_zip_code"),
+                county=row.get("county"),
+                distance_from_practice_miles=row.get("distance_from_practice_miles"),
                 insight=zip_insight(screen, row, position, price, metrics, procedure),
                 household_income=row["median_household_income"],
                 individual_income=row["per_capita_income"],

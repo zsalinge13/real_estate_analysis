@@ -39,6 +39,9 @@ def join_row(zip_code: str, **overrides) -> dict[str, str]:
         "acs_year": "2024",
         "month_date_yyyymm": "2024_09",
         "date_pulled_yyyymmdd": "2026_10_27",
+        "practice_zip_code": "90210",
+        "county": "Los Angeles",
+        "distance_from_practice_miles": "8.50",
     }
     row.update({key: "" if value is None else str(value) for key, value in overrides.items()})
     return row
@@ -377,7 +380,7 @@ class BulletTests(unittest.TestCase):
             young[0].header,
             "Market breast augmentation to adults ages 18 to 34 in the ZIP codes below. "
             "Why: median household income and median listing price per square foot in these "
-            "ZIP codes are at or above the Los Angeles County medians of $200 and $345. "
+            "ZIP codes are at or above the medians of ZIP codes within 50 miles of the practice, $200 and $345. "
             "Affordability wasn't checked because this procedure has no published surgeon fee. "
             "ZIP codes are ranked by their share of adults ages 18 to 34. "
             "Race, ethnicity and education describe these ZIP codes and are not used to rank them.",
@@ -389,7 +392,7 @@ class BulletTests(unittest.TestCase):
             young[0].insight,
             "Why Pasadena (90012): 40.0% of adults are ages 18 to 34, the highest share in this list. "
             "Median household income is $300 and median listing price per square foot is $640, "
-            "both at or above the county median. Women are 75.0% of residents.",
+            "both at or above the median of ZIP codes within 50 miles of the practice. Women are 75.0% of residents.",
         )
         self.assertEqual([row.city for row in young], ["pasadena", "pasadena"])
         for row in young + older:
@@ -449,6 +452,9 @@ class BulletTests(unittest.TestCase):
             "city",
             "state",
             "zip_code",
+            "practice_zip_code",
+            "county",
+            "distance_from_practice_miles",
             "insight",
             "household_income",
             "individual_income",
@@ -575,7 +581,7 @@ class AffordabilityTests(unittest.TestCase):
             row["per_capita_income"] = 40000
         kept = rank.render_screen("tummy tuck", screen, Decimal(15500))
         self.assertEqual([(row.rank, row.zip_code) for row in kept], [(1, "90001")])
-        self.assertIn("per-person income is $40,000, both at or above the county median.", kept[0].insight)
+        self.assertIn("per-person income is $40,000, both at or above the median of ZIP codes within 50 miles of the practice.", kept[0].insight)
         self.assertIn(
             "With median household income of $150,000, about $16,126 a year in discretionary "
             "spending covers the $15,500 fee.",
@@ -1058,7 +1064,7 @@ class MeasureColumnTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            list(rank.BULLET_CSV_COLUMNS[5:13]),
+            list(rank.BULLET_CSV_COLUMNS[8:16]),
             [
                 "insight",
                 "household_income",
@@ -1208,6 +1214,9 @@ class BulletYearTests(unittest.TestCase):
             cities,
             states,
             zips,
+            practice_zips,
+            counties,
+            distances,
             insights,
             incomes,
             individual_incomes,
@@ -1229,6 +1238,7 @@ class BulletYearTests(unittest.TestCase):
         self.assertNotIn("\n", headers)
         self.assertEqual(ranks, [1])
         self.assertEqual((cities, states, zips), (["Pasadena"], [""], ["90012"]))
+        self.assertEqual((practice_zips, counties, distances), (["90210"], ["Los Angeles"], [Decimal("8.50")]))
         self.assertTrue(
             insights[0].startswith("Why Pasadena (90012): 40.0% of adults are ages 18 to 34, the highest share")
         )
@@ -1380,7 +1390,8 @@ class SaveTests(unittest.TestCase):
         by_name = {row[-1]: row for row in updates}
         self.assertEqual(set(by_name), {"facelift", "rhinoplasty", "custom procedure"})
         self.assertTrue(all(row[-2] == 2024 for row in updates))
-        headers, ranks, cities, _states, zips, insights = by_name["rhinoplasty"][:6]
+        headers, ranks, cities, _states, zips, practice_zips, counties, _miles, insights = by_name["rhinoplasty"][:9]
+        self.assertEqual((practice_zips, counties), (["90210"], ["Los Angeles"]))
         self.assertTrue(headers.startswith("Market rhinoplasty to adults ages 18 to 34 "))
         self.assertEqual((ranks, cities, zips), ([1], ["Pasadena"], ["90012"]))
         self.assertTrue(insights[0].startswith("Why Pasadena (90012): "))
@@ -1569,6 +1580,9 @@ class ProcedureFeeExportTests(unittest.TestCase):
             "city",
             "state",
             "zip_code",
+            "practice_zip_code",
+            "county",
+            "distance_from_practice_miles",
             "insight",
             "household_income",
             "individual_income",
@@ -1586,6 +1600,9 @@ class ProcedureFeeExportTests(unittest.TestCase):
             ["marina del rey", "pasadena"],
             ["ca", "ca"],
             ["90292", "90012"],
+            ["90210", "90210"],
+            ["Los Angeles", "Orange"],
+            [Decimal("8.5"), Decimal("37.25")],
             ["Young.", "Thirties."],
             [146167, 98000],
             [64075, 52010],
@@ -1616,6 +1633,9 @@ class ProcedureFeeExportTests(unittest.TestCase):
                         "city",
                         "state",
                         "zip_code",
+                        "practice_zip_code",
+                        "county",
+                        "distance_from_practice_miles",
                         "insight",
                         "household_income",
                         "individual_income",
