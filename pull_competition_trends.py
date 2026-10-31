@@ -1,18 +1,20 @@
-"""Competitor counts and Google search interest per Los Angeles County ZIP and procedure.
+"""Competitor counts and Google search interest per practice-area ZIP and procedure.
 
-The grain is one row per ZIP in `zip_census_redfin_join` times one `procedure`
-from `procedure_surgeon_fees`. Tableau joins this file to the procedure fee
-file on `zip_code` and `procedure`.
+The grain is one row per ZIP in `zip_census_redfin_join` within the practice
+area (see practice.py) times one `procedure` from `procedure_surgeon_fees`.
+Tableau joins this file to the procedure fee file on `zip_code` and
+`procedure`.
 
 Competition comes from the CMS NPPES NPI Registry API. A provider is an active
 individual NPI (NPI-1) counted at the ZIP of its primary practice location.
 A provider is in a specialty when any of its listed taxonomies matches that
 specialty's codes. Med spas are not in NPPES and are not counted.
 
-The 5-mile counts add every join ZIP whose Census ZCTA internal point is
-within 5 miles of this ZIP's internal point, including this ZIP. Providers in
-ZIPs outside the join, such as across the Orange or Ventura County line, are
-not added, so the density uses the adults in those same join ZIPs.
+The 5-mile counts add every Census ZCTA whose internal point is within 5 miles
+of this ZIP's internal point, including this ZIP, in any county and whether or
+not it is in the join. Adults for a ZCTA outside the join come from the same
+ACS vintage as the join. When any of those ZCTAs has no adult count, the
+5-mile adults and densities are blank.
 
 Search interest comes from Google Trends through pytrends. That service is
 unofficial and rate-limited. A Trends error never stops the run: the last good
@@ -28,9 +30,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-import io
 import json
-import math
 import os
 import random
 import sys
@@ -38,7 +38,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import zipfile
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -47,6 +46,8 @@ from pathlib import Path
 
 import dataset_stamp
 import load_california
+import practice
+import pull_census_zip_population as census
 
 ROOT = Path(__file__).resolve().parent
 TABLE_NAME = "competition_trends"
@@ -66,12 +67,9 @@ NPPES_MAX_SKIP = 1000
 NPPES_CAP = NPPES_MAX_SKIP + NPPES_PAGE
 NPPES_PAUSE_SECONDS = 0.3
 
-GAZETTEER_URL = (
-    "https://www2.census.gov/geo/docs/maps-data/data/gazetteer/"
-    "2024_Gazetteer/2024_Gaz_zcta_national.zip"
-)
 RADIUS_MILES = 5.0
-EARTH_RADIUS_MILES = 3958.8
+# A degree of latitude is 69.09 miles on practice.EARTH_RADIUS_MILES.
+MILES_PER_DEGREE_LATITUDE = 69.0
 
 TRENDS_GEO = "US-CA-803"
 TRENDS_DMA_NAME = "Los Angeles CA (DMA 803)"
@@ -158,12 +156,15 @@ TRENDS_SOURCE = (
 COMPETITION_LIMITATIONS = (
     "Med spas, nurse injectors, and other businesses without a physician NPI "
     "are not counted. NPPES addresses are self-reported and can be out of date. "
-    "5-mile counts include Los Angeles County ZIPs in the join only."
+    "Search interest is for the Los Angeles DMA 803, which includes Orange County."
 )
 
 COLUMNS: tuple[tuple[str, str], ...] = (
     ("zip_code", "text"),
     ("city", "text"),
+    ("practice_zip_code", "text"),
+    ("county", "text"),
+    ("distance_from_practice_miles", "numeric"),
     ("procedure", "text"),
     ("plastic_surgeon_count", "integer"),
     ("dermatologist_count", "integer"),
@@ -215,6 +216,10 @@ class ZipArea:
     zip_code: str
     city: str
     adult_population: int | None
+    county: str | None = None
+    distance_from_practice_miles: Decimal | None = None
+    practice_zip_code: str = practice.PRACTICE_ZIP_CODE
+    acs_year: int | None = None
 
 
 def split_city(zip_name: str) -> str:
@@ -235,19 +240,34 @@ def parse_whole(raw: object) -> int | None:
 
 
 def zip_areas_from_rows(rows: Iterable[dict]) -> list[ZipArea]:
+    """Join ZIPs inside the practice area. Rows outside it are left out."""
     areas: dict[str, ZipArea] = {}
     for row in rows:
         key = load_california.postal_code_key(str(row.get("zip") or ""))
         if key is None:
             continue
+        fields = [row.get(name) for name in practice.FIELDS]
+        if not practice.in_area(*fields):
+            continue
         areas[key] = ZipArea(
             zip_code=key,
             city=split_city(str(row.get("zip_name") or "")),
             adult_population=parse_whole(row.get("adult_population")),
+            county=str(fields[1]).strip(),
+            distance_from_practice_miles=Decimal(str(fields[2]).strip()),
+            practice_zip_code=str(fields[0]).strip(),
+            acs_year=parse_whole(row.get("acs_year")),
         )
     if not areas:
-        raise SystemExit("The ZIP join has no rows.")
+        raise SystemExit(f"The ZIP join has no rows for {practice.AREA_PHRASE}.")
     return [areas[key] for key in sorted(areas)]
+
+
+def join_acs_year(areas: list[ZipArea]) -> int | None:
+    years = {area.acs_year for area in areas if area.acs_year is not None}
+    if len(years) > 1:
+        raise SystemExit(f"The ZIP join has more than one acs_year: {sorted(years)}.")
+    return next(iter(years), None)
 
 
 def read_csv_rows(path: Path, required: tuple[str, ...]) -> list[dict]:
@@ -261,19 +281,20 @@ def read_csv_rows(path: Path, required: tuple[str, ...]) -> list[dict]:
         return list(reader)
 
 
+JOIN_INPUT_COLUMNS = ("zip", "zip_name", "adult_population", "acs_year") + practice.FIELDS
+
+
 def read_zip_areas(path: Path | None) -> list[ZipArea]:
-    required = ("zip", "zip_name", "adult_population")
     if path is not None:
-        return zip_areas_from_rows(read_csv_rows(path, required))
+        return zip_areas_from_rows(read_csv_rows(path, JOIN_INPUT_COLUMNS))
     if not database_url():
         raise SystemExit(
             "Pass --join zip_census_redfin_join.csv or set DATABASE_URL."
         )
     with load_california.connect() as conn, conn.cursor() as cur:
-        cur.execute(f"SELECT zip, zip_name, adult_population FROM {JOIN_TABLE}")
+        cur.execute(f"SELECT {', '.join(JOIN_INPUT_COLUMNS)} FROM {JOIN_TABLE}")
         return zip_areas_from_rows(
-            {"zip": z, "zip_name": n, "adult_population": a}
-            for z, n, a in cur.fetchall()
+            dict(zip(JOIN_INPUT_COLUMNS, values)) for values in cur.fetchall()
         )
 
 
@@ -434,7 +455,7 @@ def fetch_providers(
     fetch_json: Callable[[dict], dict] = nppes_fetch_json,
     pause: Callable[[], None] = lambda: time.sleep(NPPES_PAUSE_SECONDS),
 ) -> dict[str, Provider]:
-    """Providers in the join's 3-digit ZIP prefixes, one entry per NPI."""
+    """Providers in the 3-digit prefixes of these ZIPs, one entry per NPI."""
     prefixes = sorted({code[:3] for code in zip_codes})
     providers: dict[str, Provider] = {}
     for query in NPPES_QUERIES:
@@ -455,45 +476,13 @@ def fetch_providers(
 # Geography
 
 
-def parse_gazetteer(text: str) -> dict[str, tuple[float, float]]:
-    reader = csv.reader(io.StringIO(text), delimiter="\t")
-    header = [name.strip() for name in next(reader)]
-    try:
-        zi, lat_i, lon_i = header.index("GEOID"), header.index("INTPTLAT"), header.index("INTPTLONG")
-    except ValueError as exc:
-        raise SystemExit(f"The ZCTA gazetteer is missing a column: {exc}") from exc
-    points: dict[str, tuple[float, float]] = {}
-    for row in reader:
-        if len(row) <= max(zi, lat_i, lon_i):
-            continue
-        try:
-            points[row[zi].strip()] = (float(row[lat_i]), float(row[lon_i]))
-        except ValueError:
-            continue
-    if not points:
-        raise SystemExit("The ZCTA gazetteer has no points.")
-    return points
-
-
 def fetch_centroids() -> dict[str, tuple[float, float]]:
-    body = with_retries(
-        lambda: http_get(GAZETTEER_URL, timeout=120),
+    return with_retries(
+        practice.zcta_points,
         attempts=4,
         first_wait=4,
         what="Census gazetteer download",
     )
-    with zipfile.ZipFile(io.BytesIO(body)) as archive:
-        name = next(n for n in archive.namelist() if n.endswith(".txt"))
-        return parse_gazetteer(archive.read(name).decode("utf-8-sig"))
-
-
-def miles_between(a: tuple[float, float], b: tuple[float, float]) -> float:
-    lat1, lon1, lat2, lon2 = map(math.radians, (*a, *b))
-    h = (
-        math.sin((lat2 - lat1) / 2) ** 2
-        + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2
-    )
-    return 2 * EARTH_RADIUS_MILES * math.asin(math.sqrt(h))
 
 
 def neighbors_within(
@@ -501,16 +490,64 @@ def neighbors_within(
     centroids: dict[str, tuple[float, float]],
     miles: float = RADIUS_MILES,
 ) -> dict[str, list[str]]:
-    """Join ZIPs within `miles` of each ZIP, itself included. A ZIP with no point is left out."""
-    located = [code for code in zip_codes if code in centroids]
-    return {
-        code: [
+    """Every ZCTA within `miles` of each ZIP, itself included, in any county.
+
+    A ZIP with no point is left out.
+    """
+    lat_reach = miles / MILES_PER_DEGREE_LATITUDE
+    points = sorted(centroids.items())
+    near: dict[str, list[str]] = {}
+    for code in zip_codes:
+        origin = centroids.get(code)
+        if origin is None:
+            continue
+        near[code] = [
             other
-            for other in located
-            if miles_between(centroids[code], centroids[other]) <= miles
+            for other, point in points
+            if abs(point[0] - origin[0]) <= lat_reach
+            and practice.miles_between(origin, point) <= miles
         ]
-        for code in located
-    }
+    return near
+
+
+def outside_neighbors(near: dict[str, list[str]], zip_codes: Iterable[str]) -> list[str]:
+    """ZCTAs within the radius of some ZIP that are not themselves in zip_codes."""
+    inside = set(zip_codes)
+    return sorted({other for nearby in near.values() for other in nearby} - inside)
+
+
+def adults_from_records(records: Iterable[dict[str, str]]) -> dict[str, int | None]:
+    bands = census.band_codes()
+    adults: dict[str, int | None] = {}
+    for record in records:
+        zip_code = (record.get(census.GEO_COLUMN) or "").strip()
+        if not zip_code:
+            continue
+        adults[zip_code] = census.sum_counts(
+            [
+                census.sum_counts(
+                    [census.as_int(census.parse_estimate(record.get(code)), column) for code in codes]
+                )
+                for column, codes in bands.items()
+            ]
+        )
+    return adults
+
+
+def fetch_adults(
+    year: int,
+    zip_codes: list[str],
+    fetch_piece: Callable[[int, list[str], tuple[str, ...]], list[dict[str, str]]] = census.fetch_field_piece,
+    pause: Callable[[], None] = lambda: time.sleep(census.CALL_PAUSE_SECONDS),
+) -> dict[str, int | None]:
+    """ACS adults 18 and older per ZCTA, summed the same way as the Census pull."""
+    variables = dict(census.field_groups())["age_bands"]
+    adults: dict[str, int | None] = {}
+    for index, batch in enumerate(census.chunks(zip_codes, census.BATCH_SIZE)):
+        if index:
+            pause()
+        adults.update(adults_from_records(fetch_piece(year, list(batch), variables)))
+    return adults
 
 
 # ---------------------------------------------------------------------------
@@ -536,11 +573,18 @@ def competition_by_zip(
     areas: list[ZipArea],
     providers: dict[str, Provider],
     centroids: dict[str, tuple[float, float]],
+    outside_adults: dict[str, int | None] | None = None,
+    near: dict[str, list[str]] | None = None,
 ) -> dict[str, ZipCompetition]:
+    """Counts per join ZIP. outside_adults holds adults for neighbors outside the join."""
     codes = [area.zip_code for area in areas]
-    adults = {area.zip_code: area.adult_population for area in areas}
+    if near is None:
+        near = neighbors_within(codes, centroids)
+    adults: dict[str, int | None] = dict(outside_adults or {})
+    adults.update({area.zip_code: area.adult_population for area in areas})
+    counted = set(codes).union(*near.values())
     in_zip: dict[str, dict[str, set[str]]] = {
-        code: {specialty.key: set() for specialty in SPECIALTIES} for code in codes
+        code: {specialty.key: set() for specialty in SPECIALTIES} for code in counted
     }
     for provider in providers.values():
         sets = in_zip.get(provider.zip_code)
@@ -548,7 +592,6 @@ def competition_by_zip(
             continue
         for key in provider.specialties():
             sets[key].add(provider.npi)
-    near = neighbors_within(codes, centroids)
     result: dict[str, ZipCompetition] = {}
     for code in codes:
         nearby = near.get(code)
@@ -559,8 +602,8 @@ def competition_by_zip(
                 key: set().union(*(in_zip[other][key] for other in nearby))
                 for key in in_zip[code]
             }
-            counted = [adults[other] for other in nearby if adults[other]]
-            adults_5mi = sum(counted) if counted else None
+            values = [adults.get(other) for other in nearby]
+            adults_5mi = None if None in values else sum(values)
         result[code] = ZipCompetition(in_zip[code], within, adults[code], adults_5mi)
     return result
 
@@ -879,6 +922,9 @@ def build_rows(
         base = {
             "zip_code": area.zip_code,
             "city": area.city,
+            "practice_zip_code": area.practice_zip_code,
+            "county": area.county,
+            "distance_from_practice_miles": area.distance_from_practice_miles,
             "adult_population": comp.adults,
             "adult_population_5mi": comp.adults_5mi,
             "competition_pulled_at": competition_pulled_at,
@@ -1012,11 +1058,31 @@ def main(argv: list[str] | None = None) -> int:
     procedures = read_procedures(args.procedures)
     print(f"{len(areas)} ZIPs x {len(procedures)} procedures.")
 
+    codes = [area.zip_code for area in areas]
     centroids = fetch_centroids()
-    providers = fetch_providers(area.zip_code for area in areas)
+    near = neighbors_within(codes, centroids)
+    outside = outside_neighbors(near, codes)
+    providers = fetch_providers([*codes, *outside])
     competition_pulled_at = dataset_stamp.stamp()
-    competition = competition_by_zip(areas, providers, centroids)
-    print(f"NPPES: {len(providers)} active individual providers in the join's ZIP prefixes.")
+    print(f"NPPES: {len(providers)} active individual providers in the ZIP prefixes read.")
+    outside_adults: dict[str, int | None] = {}
+    year = join_acs_year(areas)
+    if outside and year is None:
+        print("The ZIP join has no acs_year. 5-mile adults that need ZCTAs outside the join are blank.")
+    elif outside:
+        try:
+            outside_adults = fetch_adults(year, outside)
+        except (Exception, SystemExit) as exc:
+            print(
+                f"ACS {year} adults for ZCTAs outside the join failed "
+                f"({census.public_error(exc)}). 5-mile adults that need them are blank."
+            )
+        print(
+            f"{len(outside)} ZCTAs within {RADIUS_MILES:g} miles are outside the join; "
+            f"ACS {year} adults found for "
+            f"{sum(value is not None for value in outside_adults.values())}."
+        )
+    competition = competition_by_zip(areas, providers, centroids, outside_adults, near)
 
     cache = load_cache(args.cache) or cache_from_table()
     trends = refresh_trends(

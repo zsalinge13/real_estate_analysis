@@ -74,6 +74,7 @@ jobs:
       - name: Build competition_trends
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CENSUS_API_KEY: ${{ secrets.CENSUS_API_KEY }}
         run: |
           set -euo pipefail
           args=()

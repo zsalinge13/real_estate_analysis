@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
+import practice
 import pull_competition_trends as ct
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -134,21 +135,106 @@ class GeographyTests(unittest.TestCase):
             "90212\t1\t0\t1\t0\t34.0627\t-118.4020\n"
             "90265\t1\t0\t1\t0\t34.0630\t-118.8500\n"
         )
-        points = ct.parse_gazetteer(text)
+        points = practice.parse_gazetteer(text)
         self.assertEqual(points["90212"], (34.0627, -118.402))
         near = ct.neighbors_within(["90210", "90212", "90265", "99999"], points)
         self.assertEqual(near["90210"], ["90210", "90212"])
         self.assertEqual(near["90265"], ["90265"])
         self.assertNotIn("99999", near)
-        self.assertAlmostEqual(ct.miles_between(points["90210"], points["90212"]), 2.85, places=1)
+        self.assertAlmostEqual(practice.miles_between(points["90210"], points["90212"]), 2.85, places=1)
+
+    def test_neighbors_cross_the_county_line_and_leave_the_join(self):
+        points = {
+            "90720": (33.7951, -118.0647),
+            "90740": (33.7562, -118.0809),
+            "90803": (33.7614, -118.1323),
+            "93063": (34.3070, -118.6860),
+        }
+        near = ct.neighbors_within(["90803"], points)
+        self.assertEqual(near["90803"], ["90720", "90740", "90803"])
+        self.assertEqual(ct.outside_neighbors(near, ["90803", "90720"]), ["90740"])
+
+    def test_radius_edge_uses_the_haversine_distance(self):
+        north = (34.0 + 4.99 / 69.09, -118.0)
+        points = {"a": (34.0, -118.0), "b": north, "c": (34.0 + 5.01 / 69.09, -118.0)}
+        self.assertEqual(ct.neighbors_within(["a"], points)["a"], ["a", "b"])
+
+
+def join_input(zip_code, county="Los Angeles", distance="8.50", practice_zip="90210", adults="1000"):
+    return {
+        "zip": zip_code,
+        "zip_name": "irvine, ca" if county == "Orange" else "beverly hills, ca",
+        "adult_population": adults,
+        "acs_year": "2024",
+        "practice_zip_code": practice_zip,
+        "county": county,
+        "distance_from_practice_miles": distance,
+    }
+
+
+class JoinInputTests(unittest.TestCase):
+    def test_only_practice_area_rows_are_kept(self):
+        areas = ct.zip_areas_from_rows(
+            [
+                join_input("90210", distance="0.00"),
+                join_input("92618", county="Orange", distance="49.21"),
+                join_input("92630", county="Orange", distance="51.79"),
+                join_input("93063", county="Ventura", distance="30.00"),
+                join_input("90211", practice_zip="90001"),
+                join_input("90212", distance=""),
+            ]
+        )
+        self.assertEqual([area.zip_code for area in areas], ["90210", "92618"])
+        irvine = areas[1]
+        self.assertEqual(
+            (irvine.city, irvine.practice_zip_code, irvine.county, irvine.distance_from_practice_miles),
+            ("irvine", "90210", "Orange", Decimal("49.21")),
+        )
+        self.assertEqual(ct.join_acs_year(areas), 2024)
+
+    def test_no_area_rows_stops_the_run(self):
+        with self.assertRaises(SystemExit):
+            ct.zip_areas_from_rows([join_input("92630", county="Orange", distance="51.79")])
+
+    def test_join_csv_needs_the_practice_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "join.csv"
+            path.write_text("zip,zip_name,adult_population,acs_year\n90210,beverly hills,1,2024\n")
+            with self.assertRaises(SystemExit) as caught:
+                ct.read_zip_areas(path)
+            self.assertIn("practice_zip_code", str(caught.exception))
+
+
+class OutsideAdultsTests(unittest.TestCase):
+    def record(self, zip_code, value="10"):
+        out = {ct.census.GEO_COLUMN: zip_code}
+        for codes in ct.census.band_codes().values():
+            for code in codes:
+                out[code] = value
+        return out
+
+    def test_adults_sum_every_band_and_missing_is_blank(self):
+        calls = []
+
+        def fetch(year, zips, variables):
+            calls.append((year, list(zips), len(variables)))
+            return [self.record(z, "-666666666" if z == "90740" else "10") for z in zips]
+
+        zips = [f"9{index:04d}" for index in range(11)] + ["90740"]
+        adults = ct.fetch_adults(2024, zips, fetch, lambda: None)
+        bands = sum(len(codes) for codes in ct.census.band_codes().values())
+        self.assertEqual(adults["90000"], 10 * bands)
+        self.assertIsNone(adults["90740"])
+        self.assertEqual([len(z) for _y, z, _n in calls], [10, 2])
+        self.assertTrue(all(year == 2024 and n == bands for year, _z, n in calls))
 
 
 class CompetitionTests(unittest.TestCase):
     def setUp(self):
         self.areas = [
-            ct.ZipArea("90210", "beverly hills", 20000),
-            ct.ZipArea("90212", "beverly hills", 10000),
-            ct.ZipArea("90265", "malibu", None),
+            ct.ZipArea("90210", "beverly hills", 20000, "Los Angeles", Decimal("0.00")),
+            ct.ZipArea("90212", "beverly hills", 10000, "Los Angeles", Decimal("2.85")),
+            ct.ZipArea("90265", "malibu", None, "Los Angeles", Decimal("25.50")),
         ]
         self.points = {"90210": (34.103, -118.4105), "90212": (34.0627, -118.402), "90265": (34.063, -118.85)}
         self.providers = {
@@ -196,6 +282,46 @@ class CompetitionTests(unittest.TestCase):
         self.assertIsNone(row["plastic_surgeons_per_10k_adults"])
         self.assertEqual(row["plastic_surgeon_count_5mi"], 0)
         self.assertIsNone(row["adult_population_5mi"])
+
+    def test_practice_fields_follow_city(self):
+        row = next(r for r in self.rows() if r["zip_code"] == "90212")
+        self.assertEqual(ct.COLUMN_NAMES[1:6], ("city", *practice.FIELDS, "procedure"))
+        self.assertEqual(
+            (row["practice_zip_code"], row["county"], row["distance_from_practice_miles"]),
+            ("90210", "Los Angeles", Decimal("2.85")),
+        )
+
+    def test_neighbors_outside_the_join_add_providers_and_adults(self):
+        self.points["90211"] = (34.0652, -118.3833)
+        self.providers["6"] = ct.Provider("6", "90211", {"208200000X"})
+        comp = ct.competition_by_zip(self.areas, self.providers, self.points, {"90211": 5000})
+        rows = ct.build_rows(self.areas, ["liposuction"], comp, {}, NOW, NOW)
+        row = next(r for r in rows if r["zip_code"] == "90210")
+        self.assertEqual(row["plastic_surgeon_count"], 1)
+        self.assertEqual(row["plastic_surgeon_count_5mi"], 3)
+        self.assertEqual(row["adult_population_5mi"], 35000)
+        self.assertEqual(row["plastic_surgeons_per_10k_adults_5mi"], Decimal("0.86"))
+        self.assertNotIn("90211", {r["zip_code"] for r in rows})
+
+    def test_unknown_outside_adults_blank_the_5_mile_density(self):
+        self.points["90211"] = (34.0652, -118.3833)
+        for outside in ({}, {"90211": None}):
+            comp = ct.competition_by_zip(self.areas, self.providers, self.points, outside)
+            row = next(
+                r
+                for r in ct.build_rows(self.areas, ["liposuction"], comp, {}, NOW, NOW)
+                if r["zip_code"] == "90210"
+            )
+            self.assertEqual(row["plastic_surgeon_count_5mi"], 2)
+            self.assertIsNone(row["adult_population_5mi"])
+            self.assertIsNone(row["plastic_surgeons_per_10k_adults_5mi"])
+            self.assertIsNone(row["procedure_competitors_per_10k_adults_5mi"])
+            self.assertEqual(row["plastic_surgeons_per_10k_adults"], Decimal("0.50"))
+
+    def test_limitations_drop_the_county_line_undercount(self):
+        self.assertNotIn("Los Angeles County ZIPs in the join only", ct.COMPETITION_LIMITATIONS)
+        self.assertIn("DMA 803", ct.COMPETITION_LIMITATIONS)
+        self.assertEqual(ct.TRENDS_GEO, "US-CA-803")
 
     def test_zip_without_a_centroid_has_blank_radius_fields(self):
         self.points.pop("90265")
@@ -332,7 +458,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_no_new_secrets(self):
         secrets = set(re.findall(r"secrets\.([A-Z_]+)", self.workflow))
-        self.assertEqual(secrets, {"DATABASE_URL"})
+        self.assertEqual(secrets, {"DATABASE_URL", "CENSUS_API_KEY"})
 
     def test_csv_and_cache_are_not_committed(self):
         ignored = (ROOT / ".gitignore").read_text().split()
