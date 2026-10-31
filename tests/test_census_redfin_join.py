@@ -436,11 +436,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("zip%20code%20tabulation%20area:90001,90002", url)
         self.assertNotIn("in=", url)
         self.assertNotIn("state", url)
-        self.assertIn('cron: "0 17 * * *"', workflow)
+        self.assertIn('cron: "17 17 * * *"', workflow)
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("GitHub cron is UTC and does not follow daylight saving.", workflow)
-        self.assertIn("10:00 AM Pacific Daylight Time", workflow)
-        self.assertIn("9:00 AM Pacific Standard Time", workflow)
+        self.assertIn("10:17 AM Pacific Daylight Time", workflow)
+        self.assertIn("9:17 AM Pacific Standard Time", workflow)
         self.assertNotIn("0 16 1 1,7 *", workflow)
 
 
