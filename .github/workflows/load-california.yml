@@ -14,6 +14,10 @@ name: Load California ZIP inventory
 # writes procedure_surgeon_fees.csv, including marketing_bullets for every
 # report year, and that job uploads the same four artifacts. An in-progress
 # run is not cancelled. This file does not start another run.
+# On every run, the competition_trends job then builds competition-trends from
+# this run's join and fees (or Supabase when a job before it failed). NPPES is
+# read every run and Google Trends about once a week; either failing keeps the
+# last good values. That job never fails the run and always uploads the CSV.
 on:
   schedule:
     # 16:00 UTC on January 1 and July 1 only (every six months).
@@ -247,3 +251,64 @@ jobs:
           path: procedure_surgeon_fees.csv
           retention-days: 90
           if-no-files-found: error
+
+  competition_trends:
+    name: Build competition_trends
+    needs: [join_rank_full, load_census_year]
+    if: ${{ !cancelled() }}
+    # A Trends, NPPES, or Supabase problem here never fails the California run.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Download the ZIP join from this run
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: zip-census-redfin-join
+          path: inputs/join
+      - name: Download procedure surgeon fees from this run
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: procedure-surgeon-fees
+          path: inputs/fees
+      - name: Build competition_trends
+        id: competition
+        continue-on-error: true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CENSUS_API_KEY: ${{ secrets.CENSUS_API_KEY }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ -f inputs/join/zip_census_redfin_join.csv ]]; then
+            args+=(--join inputs/join/zip_census_redfin_join.csv)
+          else
+            echo "No join artifact in this run. Reading public.zip_census_redfin_join."
+          fi
+          if [[ -f inputs/fees/procedure_surgeon_fees.csv ]]; then
+            args+=(--procedures inputs/fees/procedure_surgeon_fees.csv)
+          fi
+          python pull_competition_trends.py "${args[@]}"
+      - name: Export the last good competition_trends
+        if: ${{ !cancelled() && hashFiles('competition_trends.csv') == '' }}
+        continue-on-error: true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python export_supabase_backup.py competition_trends
+      - name: Upload competition trends CSV
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: competition-trends
+          path: competition_trends.csv
+          retention-days: 90
+          if-no-files-found: warn

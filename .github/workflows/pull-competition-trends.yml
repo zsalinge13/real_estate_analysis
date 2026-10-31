@@ -1,0 +1,89 @@
+name: Pull competition and search trends
+
+# Manual refresh only. Every Load California ZIP inventory run already builds
+# competition-trends; this rebuilds it without rerunning that load.
+# It reads zip-census-redfin-join and procedure-surgeon-fees from the latest
+# successful Load California ZIP inventory run on main that still has both
+# artifacts, and the last good Trends values from public.competition_trends,
+# under the same once-a-week Trends rule as the California run.
+# It replaces public.competition_trends only. It does not start another run.
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: pull-competition-trends
+  cancel-in-progress: false
+
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Download the latest ZIP join and procedure fees
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for run_id in $(gh run list \
+              --workflow load-california.yml \
+              --branch main \
+              --status success \
+              --limit 30 \
+              --json databaseId \
+              --jq '.[].databaseId'); do
+            rm -rf inputs
+            if gh run download "$run_id" -n zip-census-redfin-join -D inputs/join \
+              && gh run download "$run_id" -n procedure-surgeon-fees -D inputs/fees; then
+              echo "Using Load California ZIP inventory run ${run_id}."
+              exit 0
+            fi
+          done
+          rm -rf inputs
+          echo "No Load California run has both artifacts. The script reads Supabase instead."
+      - name: Build competition_trends
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CENSUS_API_KEY: ${{ secrets.CENSUS_API_KEY }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ -f inputs/join/zip_census_redfin_join.csv ]]; then
+            args+=(--join inputs/join/zip_census_redfin_join.csv)
+          fi
+          if [[ -f inputs/fees/procedure_surgeon_fees.csv ]]; then
+            args+=(--procedures inputs/fees/procedure_surgeon_fees.csv)
+          fi
+          python pull_competition_trends.py "${args[@]}"
+      - name: Upload competition trends CSV
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: competition-trends
+          path: competition_trends.csv
+          retention-days: 90
+          if-no-files-found: error
+      - name: Export Supabase backup CSV
+        id: backup
+        if: failure()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python export_supabase_backup.py competition_trends
+      - name: Upload Supabase backup CSV
+        if: failure() && steps.backup.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: competition-trends
+          path: competition_trends.csv
+          retention-days: 90
+          if-no-files-found: error

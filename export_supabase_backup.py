@@ -15,6 +15,7 @@ from pathlib import Path
 
 import load_california
 import pull_census_zip_population
+import pull_competition_trends
 import pull_nfhl_flood_zones
 import pull_nri_census_tracts
 import pull_procedure_surgeon_fees
@@ -69,6 +70,10 @@ def census_columns(cur) -> tuple[str, ...]:
 
 def procedure_columns(_cur) -> tuple[str, ...]:
     return pull_procedure_surgeon_fees.COLUMNS
+
+
+def competition_columns(_cur) -> tuple[str, ...]:
+    return pull_competition_trends.COLUMN_NAMES
 
 
 def nri_columns(cur) -> tuple[str, ...]:
@@ -132,6 +137,13 @@ def build_specs() -> dict[str, Spec]:
             connect=pull_procedure_surgeon_fees.connect,
             columns=procedure_columns,
             order_by=("report_year", "procedure"),
+        ),
+        Spec(
+            table=pull_competition_trends.TABLE,
+            path=pull_competition_trends.OUTPUT_CSV,
+            connect=load_california.connect,
+            columns=competition_columns,
+            order_by=("zip_code", "procedure"),
         ),
     )
     return {spec.table_name: spec for spec in specs}
