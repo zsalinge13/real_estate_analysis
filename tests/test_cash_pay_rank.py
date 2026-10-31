@@ -525,16 +525,27 @@ class AffordabilityTests(unittest.TestCase):
             rank.DISCRETIONARY_SHARE["35 to 44"], Decimal(13287) / Decimal(139176)
         )
 
-    def test_income_measure_follows_the_cash_screen(self):
+    def test_every_persona_uses_median_household_income(self):
         row = {"median_household_income": 200000, "per_capita_income": 80000}
-        young = rank.PERSONA_BY_LABEL["35 to 44"]
-        older = rank.PERSONA_BY_LABEL["55 and older"]
-        self.assertEqual(
-            rank.discretionary_income(row, young), rank.DISCRETIONARY_SHARE["35 to 44"] * 200000
+        for label in rank.PERSONA_BY_LABEL:
+            self.assertEqual(
+                rank.discretionary_income(row, rank.PERSONA_BY_LABEL[label]),
+                rank.DISCRETIONARY_SHARE[label] * 200000,
+            )
+
+    def test_older_affordability_ignores_per_person_income(self):
+        screen = self._screen("55 and older", {"90001": 150000, "90002": 100000})
+        for row in screen.passed:
+            row["per_capita_income"] = 40000
+        kept = rank.render_screen(screen, Decimal(15500))
+        self.assertEqual([(row.rank, row.zip_code) for row in kept], [(1, "90001")])
+        self.assertIn("per-person income $40,000 are at or above those middles.", kept[0].insight)
+        self.assertIn(
+            "About $16,126 a year in discretionary spending from median household income of "
+            "$150,000 covers the $15,500 fee midpoint.",
+            kept[0].insight,
         )
-        self.assertEqual(
-            rank.discretionary_income(row, older), rank.DISCRETIONARY_SHARE["55 and older"] * 80000
-        )
+        self.assertTrue(kept[0].header.startswith("55 and older. Median listing price per square foot and per-person income"))
 
     def test_fee_midpoint(self):
         self.assertEqual(rank.fee_midpoint(8000, 15000), Decimal(11500))
@@ -581,13 +592,14 @@ class AffordabilityTests(unittest.TestCase):
     def test_header_and_insight_describe_the_screen(self):
         screen = self._screen("35 to 44", {"90001": 200000})
         row = rank.render_screen(screen, Decimal(10750))[0]
-        self.assertIn("Estimated yearly discretionary spending (9.5% of household income", row.header)
+        self.assertIn("Estimated yearly discretionary spending (9.5% of median household income", row.header)
         self.assertIn("BLS Consumer Expenditure Surveys 2025", row.header)
         self.assertIn("covers the $10,750 surgeon fee midpoint.", row.header)
         self.assertIn("About $19,094 a year in discretionary spending covers the $10,750 fee midpoint.", row.insight)
         older = self._screen("55 and older", {"90001": 100000})
         older_row = rank.render_screen(older, Decimal(5750))[0]
-        self.assertIn("10.8% of per-person income", older_row.header)
+        self.assertIn("10.8% of median household income", older_row.header)
+        self.assertNotIn("of per-person income", older_row.header)
 
     def test_a_group_with_no_affordable_zip_adds_no_rows(self):
         screen = self._screen("55 and older", {"90001": 40000})

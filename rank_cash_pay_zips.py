@@ -13,7 +13,7 @@ not copied from another year. The fee load owns the column and does not
 fill it. Each procedure then gets an affordability screen: a ZIP stays on
 that procedure's list only when its estimated yearly discretionary spending
 (the BLS Consumer Expenditure Surveys 2025 share for the persona's age, times
-the income the persona's cash screen uses) is at least the midpoint of that
+the ZIP's median household income for every persona) is at least the midpoint of that
 procedure's surgeon fee range. The survivors are re-ranked, so lists differ by
 procedure. A procedure with a blank fee is not screened. cash_pay_zip_rank
 keeps the persona ranking without this screen.
@@ -428,19 +428,12 @@ def passes_cash(row: dict, persona: Persona, income_middle, per_capita_middle, p
     raise SystemExit(f"Unknown cash test {persona.cash!r}.")
 
 
-def income_measure(row: dict, persona: Persona) -> Decimal:
-    """The income the persona's cash screen uses."""
-    if persona.cash == "working":
-        return Decimal(row["median_household_income"])
-    return Decimal(row["per_capita_income"])
-
-
-def income_phrase(persona: Persona) -> str:
-    return "household income" if persona.cash == "working" else "per-person income"
-
-
 def discretionary_income(row: dict, persona: Persona) -> Decimal:
-    return DISCRETIONARY_SHARE[persona.label] * income_measure(row, persona)
+    """BLS shares are per household, so every persona uses median household income.
+
+    The 55-and-older cash screen still uses per-person income.
+    """
+    return DISCRETIONARY_SHARE[persona.label] * Decimal(row["median_household_income"])
 
 
 def cash_signal(row: dict, persona: Persona) -> Decimal:
@@ -575,7 +568,7 @@ def affordability_header(persona: Persona, price: Decimal | None) -> str:
         return "This procedure has no published surgeon fee, so no affordability screen is applied."
     return (
         f"Estimated yearly discretionary spending ({format_percent(DISCRETIONARY_SHARE[persona.label])} "
-        f"of {income_phrase(persona)}, BLS Consumer Expenditure Surveys {DISCRETIONARY_SOURCE_YEAR}) "
+        f"of median household income, BLS Consumer Expenditure Surveys {DISCRETIONARY_SOURCE_YEAR}) "
         f"covers the {format_money(price)} surgeon fee midpoint."
     )
 
@@ -600,8 +593,14 @@ def zip_insight(screen: PersonaRank, row: dict, price: Decimal | None = None) ->
         spending = discretionary_income(row, screen.persona).quantize(
             Decimal(1), rounding=ROUND_HALF_UP
         )
+        source = ""
+        if screen.persona.cash != "working":
+            source = (
+                " from median household income of "
+                f"{format_money(Decimal(row['median_household_income']))}"
+            )
         insight += (
-            f" About {format_money(spending)} a year in discretionary spending covers "
+            f" About {format_money(spending)} a year in discretionary spending{source} covers "
             f"the {format_money(price)} fee midpoint."
         )
     if row.get("female_share") is not None:
