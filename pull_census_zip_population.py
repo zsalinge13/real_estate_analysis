@@ -452,13 +452,13 @@ def home_value_postal_codes() -> set[str]:
     return codes
 
 
-def area_home_value_zips() -> set[str]:
+def area_home_value_zips(area: dict | None = None) -> set[str]:
     home_value = home_value_postal_codes()
-    area = practice.practice_area()
+    area = practice.practice_area() if area is None else area
     kept = select_zips(home_value, area)
     print(
         f"Home-value file ZIPs: {len(home_value)}. "
-        f"Practice-area ZIPs within {practice.MAX_DISTANCE_MILES} miles of "
+        f"Practice-area ZIPs within {practice.MAX_PRACTICE_DISTANCE_MILES} miles of "
         f"{practice.PRACTICE_ZIP_CODE}: {len(area)}. Kept: {len(kept)}.",
         flush=True,
     )
@@ -1103,32 +1103,74 @@ def rows_from_download(
     return rows
 
 
+def county_pulls(
+    california_zips: list[str],
+    counties: dict[str, str] | None,
+) -> list[tuple[str, list[str]]]:
+    """One pull per practice county, in practice.COUNTIES order, so no batch mixes counties."""
+    if counties is None:
+        return [("California", list(california_zips))]
+    by_county: dict[str, list[str]] = {name: [] for name in practice.COUNTIES.values()}
+    for zip_code in california_zips:
+        county = counties.get(zip_code)
+        if county not in by_county:
+            raise SystemExit(f"ZIP {zip_code} has no practice county.")
+        by_county[county].append(zip_code)
+    return [(f"{name} County", zips) for name, zips in by_county.items() if zips]
+
+
 def rows_for_vintage(
     year: int,
     california_zips: list[str],
     area_zips: set[str],
     on_batch,
+    counties: dict[str, str] | None = None,
+    clock=time.monotonic,
 ) -> list[tuple]:
-    """Download California ZCTAs in batches and checkpoint after each one."""
+    """Download each county's ZCTAs in its own batches and checkpoint after each batch.
+
+    Every batch is BATCH_SIZE ZIPs or fewer from one county, and fetch_zip_batch
+    sends each field group as its own request with the usual timeout, retry,
+    and split rules.
+    """
     variables = estimate_variables()
     california = set(california_zips)
     rows: list[tuple] = []
     seen: set[str] = set()
-    total = len(california_zips)
-    for index, batch in enumerate(chunks(list(california_zips), BATCH_SIZE)):
-        if index:
-            time.sleep(CALL_PAUSE_SECONDS)
+    calls = 0
+    for label, county_zips in county_pulls(california_zips, counties):
+        started = clock()
+        county_rows = 0
+        batches = list(chunks(county_zips, BATCH_SIZE))
+        for index, batch in enumerate(batches, start=1):
+            if calls:
+                time.sleep(CALL_PAUSE_SECONDS)
+            calls += 1
+            batch_started = clock()
+            print(
+                f"ACS {year} {label}: downloading batch {index} of {len(batches)}, "
+                f"{len(batch)} ZIPs ({batch[0]} to {batch[-1]}).",
+                flush=True,
+            )
+            records = fetch_zip_batch(year, list(batch))
+            new_rows = rows_from_download(
+                year, records, variables, california, area_zips, seen
+            )
+            county_rows += len(new_rows)
+            rows.extend(new_rows)
+            on_batch(list(rows), new_rows)
+            print(
+                f"ACS {year} {label}: batch {index} took {clock() - batch_started:.1f} s.",
+                flush=True,
+            )
+        expected = len(set(county_zips) & area_zips)
         print(
-            f"ACS {year}: downloading {len(batch)} California ZIPs "
-            f"({index * BATCH_SIZE + len(batch)} of {total}).",
+            f"ACS {year} {label}: {county_rows} of {expected} ZIPs in {len(batches)} batches, "
+            f"{clock() - started:.1f} s.",
             flush=True,
         )
-        records = fetch_zip_batch(year, list(batch))
-        new_rows = rows_from_download(
-            year, records, variables, california, area_zips, seen
-        )
-        rows.extend(new_rows)
-        on_batch(list(rows), new_rows)
+        if county_rows < max(1, expected // 2):
+            raise SystemExit(f"ACS {year} returned too few {label} ZIPs.")
     print(
         f"ACS {year}: {len(rows)} of {len(area_zips)} practice-area home-value ZIPs.",
         flush=True,
@@ -1352,9 +1394,13 @@ def main() -> int:
     print(f"dataset_updated_at: {updated_at.isoformat()}")
     rows: list[tuple] | None = None
     try:
-        area_zips = area_home_value_zips()
+        area = practice.practice_area()
+        area_zips = area_home_value_zips(area)
+        counties = {zip_code: zip_area.county for zip_code, zip_area in area.items()}
         california = [zip_code for zip_code in california_zctas() if zip_code in area_zips]
         print(f"California ZCTAs to request: {len(california)}.", flush=True)
+        for label, zips in county_pulls(california, counties):
+            print(f"{label}: {len(zips)} ZCTAs in {-(-len(zips) // BATCH_SIZE)} batches.", flush=True)
         vintage = latest_vintage(datetime.now(timezone.utc).year)
         print(f"ACS 5-year vintage: {vintage}.", flush=True)
         verify_labels(vintage)
@@ -1362,7 +1408,7 @@ def main() -> int:
         def on_batch(rows_so_far: list[tuple], new_rows: list[tuple]) -> None:
             checkpoint_download(holder, rows_so_far, new_rows)
 
-        rows = rows_for_vintage(vintage, california, area_zips, on_batch)
+        rows = rows_for_vintage(vintage, california, area_zips, on_batch, counties)
     except SystemExit as exc:
         print(public_error(exc), file=sys.stderr)
         rows = None

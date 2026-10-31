@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import inspect
 import io
@@ -11,6 +12,7 @@ import unittest
 from contextlib import redirect_stdout
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 import join_census_redfin as join
 import load_california
@@ -57,13 +59,23 @@ def source_row(month_yyyymm: str, postal: str, price: str) -> dict[str, str]:
     return row
 
 
-def history_reader(rows: list[dict[str, str]]) -> csv.DictReader:
+def history_file(rows: list[dict[str, str]], extra: str = "") -> io.BytesIO:
+    """A source CSV with the kept columns plus an unused column the reader must skip."""
     buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=list(load_california.KEPT_COLUMNS))
+    fieldnames = list(load_california.KEPT_COLUMNS) + ([extra] if extra else [])
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
     writer.writeheader()
     writer.writerows(rows)
-    buffer.seek(0)
-    return csv.DictReader(buffer)
+    return io.BytesIO(buffer.getvalue().encode("utf-8"))
+
+
+def read_rows(handle, locations, census_year=None, chunk_rows=2) -> list[tuple]:
+    rows: list[tuple] = []
+    for chunk in load_california.read_california_rows(
+        handle, "2026_10_27", locations, census_year, chunk_rows=chunk_rows
+    ):
+        rows.extend(chunk)
+    return rows
 
 
 class CensusYearLoadTests(unittest.TestCase):
@@ -72,7 +84,7 @@ class CensusYearLoadTests(unittest.TestCase):
         source = inspect.getsource(load_california.load_history)
         self.assertIn("if census_year is None:", source)
         self.assertIn("return replace_table(conn)", source)
-        self.assertIn("return upsert_census_year(conn, census_year, area, updated_at)", source)
+        self.assertIn("return upsert_census_year(conn, census_year, locations, updated_at)", source)
         replace = inspect.getsource(load_california.replace_table)
         self.assertIn("DELETE FROM {TABLE}", replace)
 
@@ -112,7 +124,7 @@ class CensusYearLoadTests(unittest.TestCase):
         self.assertIsNotNone(re.fullmatch(pattern, "2024_09"))
         self.assertIsNone(re.fullmatch(pattern, "2025_12"))
         self.assertIsNone(re.fullmatch(pattern, "2026_09"))
-        reader = history_reader(
+        handle = history_file(
             [
                 source_row("202412", "90001", "10"),
                 source_row("202501", "90001", "99"),
@@ -121,35 +133,64 @@ class CensusYearLoadTests(unittest.TestCase):
                 source_row("202412", "10001", "7"),
             ]
         )
-        kept = list(
-            load_california.iter_area_rows(
-                reader,
-                "2026_10_27",
-                {
-                    "90001": practice.AreaZip("Los Angeles", Decimal("12.34")),
-                    "90002": practice.AreaZip("Los Angeles", Decimal("13.00")),
-                },
-                2024,
-            )
+        kept = read_rows(
+            handle,
+            {
+                "90001": practice.AreaZip("Los Angeles", Decimal("12.34")),
+                "90002": practice.AreaZip("Los Angeles", Decimal("13.00")),
+            },
+            2024,
         )
         self.assertEqual([row[0] for row in kept], ["2024_12", "2024_01"])
         self.assertEqual([row[1] for row in kept], ["90001", "90002"])
-        self.assertEqual(kept[0][3], Decimal("10"))
+        self.assertEqual(kept[0][3], "10")
+        self.assertEqual(kept[0][6], 4)
         self.assertEqual(kept[0][-3:], ("90210", "Los Angeles", Decimal("12.34")))
 
     def test_scheduled_iterator_still_yields_every_year(self):
-        reader = history_reader(
+        handle = history_file(
             [
                 source_row("202412", "90001", "10"),
                 source_row("202509", "90001", "11"),
             ]
         )
-        kept = list(
-            load_california.iter_area_rows(
-                reader, "2026_10_27", {"90001": practice.AreaZip("Los Angeles", Decimal("12.34"))}
-            )
-        )
+        kept = read_rows(handle, {"90001": practice.AreaZip("Los Angeles", Decimal("12.34"))})
         self.assertEqual([row[0] for row in kept], ["2024_12", "2025_09"])
+
+    def test_every_california_zip_is_kept_with_practice_fields(self):
+        far = source_row("202412", "96001", "300000")
+        far["zip_name"] = "Redding, CA"
+        unlocated = source_row("202412", "90090", "1,250.5")
+        unlocated["zip_name"] = "Los Angeles, ca"
+        unlocated["active_listing_count"] = "2.5"
+        blank_name = source_row("202412", "90010", "")
+        blank_name["zip_name"] = ""
+        other_state = source_row("202412", "10001", "7")
+        other_state["zip_name"] = "New York, NY"
+        bad_month = source_row("2024-12", "90001", "5")
+        bad_zip = source_row("202412", "9001", "5")
+        bad_zip["zip_name"] = "Somewhere, CA"
+        locations = {
+            "96001": practice.AreaZip("", Decimal("478.12")),
+            "90010": practice.AreaZip("Los Angeles", Decimal("5.40")),
+            "90001": practice.AreaZip("Los Angeles", Decimal("12.34")),
+        }
+        handle = history_file([far, unlocated, blank_name, other_state, bad_month, bad_zip], extra="unused_column")
+        kept = read_rows(handle, locations)
+        by_zip = {row[1]: row for row in kept}
+        self.assertEqual(sorted(by_zip), ["90010", "90090", "96001"])
+        self.assertEqual(by_zip["96001"][-3:], ("90210", None, Decimal("478.12")))
+        self.assertEqual(by_zip["90090"][-3:], ("90210", None, None))
+        self.assertEqual(by_zip["90090"][3], "1250.5")
+        self.assertEqual(by_zip["90090"][6], 3)
+        self.assertEqual(by_zip["90010"][-3:], ("90210", "Los Angeles", Decimal("5.40")))
+        self.assertIsNone(by_zip["90010"][3])
+        self.assertTrue(all(len(row) == len(load_california.LOAD_COLUMNS) for row in kept))
+
+    def test_reader_refuses_a_file_without_the_kept_columns(self):
+        handle = io.BytesIO(b"month_date_yyyymm,postal_code\n202412,90001\n")
+        with self.assertRaises(SystemExit):
+            read_rows(handle, {})
 
 
 class JoinTests(unittest.TestCase):
@@ -453,6 +494,46 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("10:17 AM Pacific Daylight Time", workflow)
         self.assertIn("9:17 AM Pacific Standard Time", workflow)
         self.assertNotIn("0 16 1 1,7 *", workflow)
+        self.assert_county_batches_stay_small()
+
+    def assert_county_batches_stay_small(self):
+        """Orange County gets its own batches, split the same way as Los Angeles County."""
+        la = [f"90{index:03d}" for index in range(12)]
+        oc = [f"92{index:03d}" for index in range(13)]
+        mixed = sorted(la + oc + ["90620", "90630"])
+        counties = {**{z: "Los Angeles" for z in la}, **{z: "Orange" for z in oc + ["90620", "90630"]}}
+        groups = census.field_groups()
+        self.assertGreater(len(groups), 4)
+        self.assertTrue(all(0 < len(variables) <= 50 for _name, variables in groups))
+        calls: list[tuple[str, ...]] = []
+
+        def fetch_query(year, zips, variables):
+            calls.append((tuple(zips), variables))
+            return [{census.GEO_COLUMN: z, **{v: "10" for v in variables}} for z in zips]
+
+        ticks = iter(range(10_000))
+        with mock.patch.object(census, "fetch_query", fetch_query), mock.patch.object(census.time, "sleep"):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rows = census.rows_for_vintage(
+                    2024, mixed, set(mixed), lambda *_: None, counties, clock=lambda: next(ticks)
+                )
+        self.assertEqual(len(rows), len(mixed))
+        batches = list(dict.fromkeys(zips for zips, _variables in calls))
+        self.assertEqual([len(b) for b in batches], [10, 2, 10, 5])
+        for batch in batches:
+            self.assertEqual(len({counties[z] for z in batch}), 1, batch)
+        self.assertEqual({counties[z] for z in batches[0] + batches[1]}, {"Los Angeles"})
+        self.assertEqual({counties[z] for z in batches[2] + batches[3]}, {"Orange"})
+        self.assertEqual(len(calls), len(batches) * len(groups))
+        self.assertTrue(all(len(variables) <= 50 for _zips, variables in calls))
+        log = out.getvalue()
+        self.assertIn("ACS 2024 Los Angeles County: downloading batch 1 of 2, 10 ZIPs", log)
+        self.assertIn("ACS 2024 Orange County: downloading batch 2 of 2, 5 ZIPs", log)
+        self.assertRegex(log, r"ACS 2024 Orange County: 15 of 15 ZIPs in 2 batches, [\d.]+ s\.")
+        self.assertEqual(census.county_pulls(mixed, None), [("California", mixed)])
+        with self.assertRaises(SystemExit):
+            census.county_pulls(["94102"], counties)
+        self.assertIn("rows_for_vintage(vintage, california, area_zips, on_batch, counties)", inspect.getsource(census.main))
 
 
 if __name__ == "__main__":
