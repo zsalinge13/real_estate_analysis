@@ -613,7 +613,27 @@ def rank_personas(rows: list[dict[str, str]]) -> list[PersonaRank]:
         raise SystemExit("The join has a row without a ZIP.")
     if len(zips) != len(set(zips)):
         raise SystemExit("The join has more than one row for a ZIP.")
+    rows = practice_area_rows(rows)
     return [rank_persona(rows, persona) for persona in PERSONAS]
+
+
+def practice_area_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    """The 50-mile rule, applied before any screen, median, or rank."""
+    kept, far, other = practice.split_by_area(
+        rows,
+        lambda row: (
+            row.get("practice_zip_code"),
+            row.get("county"),
+            row.get("distance_from_practice_miles"),
+        ),
+    )
+    print(
+        f"Excluded {far} ZIPs more than {practice.MAX_PRACTICE_DISTANCE_MILES} miles from the "
+        f"practice ZIP {practice.PRACTICE_ZIP_CODE} before any screen, median, or rank."
+    )
+    if other:
+        print(f"Excluded {other} ZIPs outside {', '.join(practice.COUNTIES.values())} or another practice ZIP.")
+    return kept
 
 
 @dataclass(frozen=True)
@@ -698,10 +718,11 @@ def screen_header(procedure: str, screen: PersonaRank, price: Decimal | None = N
     group = f"adults {persona.age_phrase}"
     if screen.household_income_middle is None or not screen.rows:
         return (
-            f"No ZIP code within {practice.MAX_DISTANCE_MILES} miles of the practice qualified "
+            f"No ZIP code within {practice.MAX_PRACTICE_DISTANCE_MILES} miles of the practice qualified "
             f"for marketing {procedure} to {group}. "
             "Each ZIP code needs income and median listing price per square foot at or above "
-            f"the median of {practice.AREA_PHRASE}, plus at least {MIN_ACTIVE_LISTINGS} active listings."
+            f"the median of {practice.AREA_PHRASE}, plus at least {MIN_ACTIVE_LISTINGS} active listings. "
+            f"{practice.DISTANCE_RULE}"
         )
     if price is None:
         why = (
@@ -718,6 +739,7 @@ def screen_header(procedure: str, screen: PersonaRank, price: Decimal | None = N
         f"Market {procedure} to {group} in the ZIP codes below.",
         why,
         f"ZIP codes are ranked by their share of {group}.",
+        practice.DISTANCE_RULE,
         "Race, ethnicity and education describe these ZIP codes and are not used to rank them.",
     ]
     if price is not None:
@@ -1022,10 +1044,25 @@ def fee_midpoint(low: object, high: object) -> Decimal | None:
     return (Decimal(str(low)) + Decimal(str(high))) / Decimal(2)
 
 
+RANK_DISTANCE_PLACES = Decimal("0.1")
+
+
 def flatten(screens: list[PersonaRank]) -> list[dict]:
+    """cash_pay_zip_rank rows. Every row has the practice ZIP and its distance to one decimal."""
     rows: list[dict] = []
     for screen in screens:
-        rows.extend(screen.rows)
+        for row in screen.rows:
+            distance = row.get("distance_from_practice_miles")
+            if row.get("practice_zip_code") != practice.PRACTICE_ZIP_CODE or practice.beyond_distance(distance):
+                raise SystemExit(f"ZIP {row['zip']} is outside the practice area but was ranked.")
+            rows.append(
+                {
+                    **row,
+                    "distance_from_practice_miles": Decimal(str(distance)).quantize(
+                        RANK_DISTANCE_PLACES, rounding=ROUND_HALF_UP
+                    ),
+                }
+            )
     return rows
 
 

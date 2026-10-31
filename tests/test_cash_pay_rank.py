@@ -383,6 +383,8 @@ class BulletTests(unittest.TestCase):
             "ZIP codes are at or above the medians of ZIP codes within 50 miles of the practice, $200 and $345. "
             "Affordability wasn't checked because this procedure has no published surgeon fee. "
             "ZIP codes are ranked by their share of adults ages 18 to 34. "
+            "Only ZIP codes within 50 miles of the practice (ZIP 90210) are included, because patients "
+            "rarely drive more than 50 miles to a new practice that is still building its reputation. "
             "Race, ethnicity and education describe these ZIP codes and are not used to rank them.",
         )
         self.assertTrue(

@@ -5,10 +5,11 @@ for the chained run has only that calendar year. The join keeps the latest
 `month_date_yyyymm` in that year. A ZIP is kept only when `postal_code`
 equals `zip`. The grain is one row per ZIP.
 
-Only practice-area ZIPs are joined: the Redfin row's practice_zip_code
-must be the practice ZIP in practice.py, its county must be Los Angeles or
-Orange, and distance_from_practice_miles must be 50 or less. A Redfin file
-without those fields is refused.
+The Redfin file covers all of California. Right after it is read (only the
+load columns, in pandas), rows outside the practice area are dropped: the
+Redfin row's practice_zip_code must be the practice ZIP in practice.py, its
+county must be Los Angeles or Orange, and distance_from_practice_miles must
+be 50 or less. A Redfin file without those fields is refused.
 
 Prices and census values are copied from those rows. A blank cell stays
 blank. This script does not fill a price from an earlier month. A Census
@@ -29,6 +30,8 @@ import sys
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
+import pandas as pd
 
 import dataset_stamp
 import load_california
@@ -122,6 +125,38 @@ def read_csv(path: Path, required: tuple[str, ...]) -> list[dict[str, str]]:
         return rows
 
 
+def eligible_mask(frame: pd.DataFrame) -> pd.Series:
+    """Rows whose stored practice fields put them inside the practice area."""
+    miles = pd.to_numeric(frame["distance_from_practice_miles"].str.strip(), errors="coerce")
+    return (
+        (frame["practice_zip_code"].str.strip() == practice.PRACTICE_ZIP_CODE)
+        & frame["county"].str.strip().isin(list(practice.COUNTIES.values()))
+        & (miles <= float(practice.MAX_PRACTICE_DISTANCE_MILES))
+    )
+
+
+def read_redfin_csv(path: Path) -> list[dict[str, str]]:
+    """Read the statewide Redfin CSV and keep only eligible rows, in pandas."""
+    if not path.is_file():
+        raise SystemExit(f"{path} is missing.")
+    header = pd.read_csv(path, nrows=0).columns
+    missing = [name for name in load_california.LOAD_COLUMNS if name not in header]
+    if missing:
+        raise SystemExit(f"{path.name} is missing columns: {missing}")
+    frame = pd.read_csv(
+        path, usecols=list(load_california.LOAD_COLUMNS), dtype=str, keep_default_na=False
+    )
+    keep = eligible_mask(frame)
+    beyond = frame.loc[~keep, "postal_code"].nunique()
+    print(
+        f"Redfin file: {frame['postal_code'].nunique()} California ZIPs. Kept "
+        f"{frame.loc[keep, 'postal_code'].nunique()} within {practice.MAX_PRACTICE_DISTANCE_MILES} miles "
+        f"of {practice.PRACTICE_ZIP_CODE} in {' or '.join(practice.COUNTIES.values())} County; "
+        f"dropped {beyond} before the join."
+    )
+    return frame[keep].to_dict(orient="records")
+
+
 def loaded_acs_year(rows: list[dict[str, str]]) -> int:
     """The single Census vintage in the file that was just loaded."""
     if not rows:
@@ -181,16 +216,22 @@ def join_records(
             raise SystemExit(f"Census has more than one row for ZIP {key} in {year}.")
         census_by_zip[key] = row
     redfin_by_zip: dict[str, dict[str, str]] = {}
+    month_rows = []
     for row in redfin_rows:
         if cell(row, "month_date_yyyymm") != month:
             continue
-        key = load_california.postal_code_key(cell(row, "postal_code"))
-        if not key:
+        if not load_california.postal_code_key(cell(row, "postal_code")):
             raise SystemExit(f"Redfin month {month} has a row without a ZIP.")
-        if not practice.in_area(
-            cell(row, "practice_zip_code"), cell(row, "county"), cell(row, "distance_from_practice_miles")
-        ):
-            continue
+        month_rows.append(row)
+    kept, far, _other = practice.split_by_area(
+        month_rows, lambda row: tuple(cell(row, name) for name in practice.FIELDS)
+    )
+    print(
+        f"Excluded {far} Redfin ZIPs more than {practice.MAX_PRACTICE_DISTANCE_MILES} miles "
+        f"from the practice ZIP {practice.PRACTICE_ZIP_CODE} before the join."
+    )
+    for row in kept:
+        key = load_california.postal_code_key(cell(row, "postal_code"))
         if key in redfin_by_zip:
             raise SystemExit(
                 f"Redfin has more than one row for ZIP {key} in {month}."
@@ -331,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
             "Usage: python join_census_redfin.py CENSUS_CSV REDFIN_CSV"
         )
     census_rows = read_census_csv(Path(args[0]))
-    redfin_rows = read_csv(Path(args[1]), load_california.LOAD_COLUMNS)
+    redfin_rows = read_redfin_csv(Path(args[1]))
     year, month, joined = join_records(census_rows, redfin_rows)
     write_join_csv(joined)
     print(
