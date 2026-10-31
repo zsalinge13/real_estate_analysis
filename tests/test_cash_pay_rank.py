@@ -372,7 +372,8 @@ class BulletTests(unittest.TestCase):
             rank.marketing_bullets("liposuction", self.screens),
             rank.marketing_bullets("breast reduction", self.screens),
         )
-        self.assertIn("Pasadena (90012)", young)
+        self.assertIn("\nPasadena: 40.0% of adults", young)
+        self.assertNotIn("90012", young)
         self.assertIn("18 to 34", young)
         self.assertIn("35 to 44", young)
         self.assertNotIn("55 and older", young)
@@ -384,7 +385,8 @@ class BulletTests(unittest.TestCase):
         self.assertIn("at or above", young)
         self.assertIn("Women are 75.0% of residents.", young)
         self.assertNotIn("per-person income", young)
-        self.assertIn("Older Hills (90040)", older)
+        self.assertIn("\nOlder Hills: ", older)
+        self.assertNotIn("90040", older)
         self.assertIn("45 to 54", older)
         self.assertIn("55 and older", older)
         self.assertNotIn("18 to 34", older)
@@ -392,22 +394,67 @@ class BulletTests(unittest.TestCase):
         self.assertIn("per-person income", older)
         self.assertIn("listing price per square foot", older)
         self.assertIn("$800", older)
-        self.assertTrue(older.splitlines()[1].startswith("- 1. "))
+        self.assertTrue(older.splitlines()[1].startswith("Older Hills: "))
+
+    def test_zip_lines_carry_rank_and_zip_outside_the_text(self):
+        lines = rank.bullet_lines("breast augmentation", self.screens)
+        self.assertEqual(
+            [(line.rank, line.zip_code) for line in lines],
+            [(None, None), (1, "90012"), (None, None), (1, "90012")],
+        )
+        for line in lines:
+            self.assertNotRegex(line.text, r"^\s*(- )?\d+\. ")
+            self.assertNotIn("(90012)", line.text)
+        self.assertTrue(lines[1].text.startswith("Pasadena: 40.0% of adults"))
+        custom = rank.bullet_lines("custom procedure", self.screens)
+        self.assertEqual([(line.rank, line.zip_code) for line in custom], [(None, None)])
+
+    def test_zip_line_without_a_name_starts_with_the_reason(self):
+        screens = rank.rank_personas(
+            [
+                join_row(
+                    "90012",
+                    zip_name="",
+                    median_household_income="300",
+                    median_listing_price="300",
+                    population_18_34="40",
+                    adult_population="100",
+                )
+            ]
+        )
+        line = rank.bullet_lines("rhinoplasty", screens)[1]
+        self.assertEqual((line.rank, line.zip_code), (1, "90012"))
+        self.assertTrue(line.text.startswith("40.0% of adults"))
 
     def test_tableau_file_writes_one_row_per_bullet(self):
-        text = rank.marketing_bullets("facelift", self.screens)
+        bullets = rank.bullet_lines("facelift", self.screens)
+        text = "\n".join(line.text for line in bullets)
         lines = [line.strip() for line in text.splitlines() if line.strip()]
-        zip_lines = [line for line in lines if line.startswith("- ")]
+        zip_lines = [line.text for line in bullets if line.rank is not None]
         self.assertGreaterEqual(len(zip_lines), 1)
         self.assertIn("\n", text)
-        columns = ["report_year", "procedure", "surgeon_fee_low", "marketing_bullets"]
+        columns = [
+            "report_year",
+            "procedure",
+            "surgeon_fee_low",
+            "marketing_bullets",
+            "rank",
+            "zip_code",
+        ]
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "procedure_surgeon_fees.csv"
             count = rank.write_procedure_fee_csv(
                 columns,
                 [
-                    (2024, "facelift", 8000, text),
-                    (2025, "facelift", None, None),
+                    (
+                        2024,
+                        "facelift",
+                        8000,
+                        text,
+                        [line.rank for line in bullets],
+                        [line.zip_code for line in bullets],
+                    ),
+                    (2025, "facelift", None, None, None, None),
                 ],
                 path,
             )
@@ -419,9 +466,16 @@ class BulletTests(unittest.TestCase):
         bullet_rows = written[: len(lines)]
         self.assertEqual([row["marketing_bullets"] for row in bullet_rows], lines)
         self.assertEqual(
-            [row["marketing_bullets"] for row in bullet_rows if row["marketing_bullets"].startswith("- ")],
+            [row["marketing_bullets"] for row in bullet_rows if row["rank"]],
             zip_lines,
         )
+        self.assertEqual(
+            [(row["rank"], row["zip_code"]) for row in bullet_rows],
+            [("" if line.rank is None else str(line.rank), line.zip_code or "") for line in bullets],
+        )
+        self.assertEqual(bullet_rows[1]["rank"], "1")
+        self.assertEqual(bullet_rows[1]["zip_code"], "90040")
+        self.assertEqual((written[-1]["rank"], written[-1]["zip_code"]), ("", ""))
         self.assertTrue(
             all(row["report_year"] == "2024" and row["procedure"] == "facelift" for row in bullet_rows)
         )
@@ -435,7 +489,7 @@ class BulletTests(unittest.TestCase):
     def test_shared_persona_lists_repeat_the_same_text(self):
         names = ["breast augmentation", "rhinoplasty", "facelift", "eyelid surgery"]
         bullets = rank.bullets_by_procedure(names, self.screens)
-        self.assertEqual(bullets["breast augmentation"], bullets["rhinoplasty"])
+        self.assertIs(bullets["breast augmentation"], bullets["rhinoplasty"])
         self.assertEqual(bullets["facelift"], bullets["eyelid surgery"])
         self.assertNotEqual(bullets["breast augmentation"], bullets["facelift"])
 
@@ -533,24 +587,69 @@ class BulletYearTests(unittest.TestCase):
             def executemany(self, sql, batch):
                 self.statements.append((" ".join(sql.split()), list(batch)))
 
+            def fetchall(self):
+                return []
+
         cursor = Cursor()
         year, count = rank.apply_marketing_bullets(cursor, screens, procedure_rows, 2025)
         self.assertEqual(year, 2024)
         self.assertEqual(count, 1)
-        clear = next(
-            params for sql, params in cursor.statements if "marketing_bullets = NULL" in sql
+        clear_sql, clear = next(
+            (sql, params) for sql, params in cursor.statements if "marketing_bullets = NULL" in sql
         )
         self.assertEqual(clear, (2024,))
+        self.assertIn("rank = NULL", clear_sql)
+        self.assertIn("zip_code = NULL", clear_sql)
         updates = next(
             batch
             for _sql, batch in cursor.statements
             if isinstance(batch, list) and batch
         )
-        self.assertEqual(updates, [(updates[0][0], 2024, "rhinoplasty")])
-        self.assertIn("Pasadena (90012)", updates[0][0])
+        text, ranks, zips, report_year, name = updates[0]
+        self.assertEqual((len(updates), report_year, name), (1, 2024, "rhinoplasty"))
+        self.assertIn("\nPasadena: ", text)
+        self.assertNotIn("(90012)", text)
+        self.assertEqual(ranks, [None, 1, None])
+        self.assertEqual(zips, [None, "90012", None])
+        self.assertEqual(len(text.split("\n")), len(ranks))
+        joined = " ".join(sql for sql, _params in cursor.statements)
+        self.assertIn("ADD COLUMN IF NOT EXISTS rank integer[]", joined)
+        self.assertIn("ADD COLUMN IF NOT EXISTS zip_code text[]", joined)
+        self.assertNotIn("RENAME", joined)
         for sql, _params in cursor.statements:
             self.assertNotIn("surgeon_fee_low", sql)
             self.assertNotIn("surgeon_fee_high", sql)
+
+    def _column_cursor(self, found):
+        class Cursor:
+            def __init__(self):
+                self.statements: list[str] = []
+
+            def execute(self, sql, params=None):
+                self.statements.append(" ".join(sql.split()))
+
+            def fetchall(self):
+                return list(found.items())
+
+        return Cursor()
+
+    def test_existing_bullet_rank_is_renamed_to_rank(self):
+        cursor = self._column_cursor({"marketing_bullets": "text", "bullet_rank": "int4"})
+        rank.ensure_bullet_columns(cursor)
+        joined = " ".join(cursor.statements)
+        self.assertIn(
+            "ALTER TABLE public.procedure_surgeon_fees RENAME COLUMN bullet_rank TO rank",
+            joined,
+        )
+        self.assertIn("ALTER COLUMN rank TYPE integer[]", joined)
+        self.assertNotIn("DROP", joined.upper())
+        self.assertIn("ADD COLUMN IF NOT EXISTS zip_code text[]", joined)
+
+    def test_bullet_rank_and_rank_together_are_refused(self):
+        cursor = self._column_cursor({"bullet_rank": "_int4", "rank": "_int4"})
+        with self.assertRaises(SystemExit):
+            rank.ensure_bullet_columns(cursor)
+        self.assertFalse(any("RENAME" in sql for sql in cursor.statements))
 
 
 class SaveTests(unittest.TestCase):
@@ -588,6 +687,9 @@ class SaveTests(unittest.TestCase):
                 if "information_schema.tables" in text:
                     self._fetchone = (1,)
                     self._fetchall = None
+                elif "information_schema.columns" in text:
+                    self._fetchone = None
+                    self._fetchall = [("marketing_bullets", "text")]
                 elif "SELECT report_year, procedure" in text:
                     self._fetchone = None
                     self._fetchall = [
@@ -655,12 +757,18 @@ class SaveTests(unittest.TestCase):
             for sql, rows in statements
             if isinstance(rows, list) and rows and "marketing_bullets = %s" in sql
         )
-        by_name = {procedure: text for text, report_year, procedure in updates}
+        by_name = {procedure: text for text, _r, _z, _year, procedure in updates}
+        ranks = {procedure: values for _t, values, _z, _year, procedure in updates}
+        zips = {procedure: values for _t, _r, values, _year, procedure in updates}
         self.assertEqual(set(by_name), {"facelift", "rhinoplasty", "custom procedure"})
-        self.assertTrue(all(report_year == 2024 for _text, report_year, _name in updates))
-        self.assertIn("Pasadena (90012)", by_name["rhinoplasty"])
+        self.assertTrue(all(row[3] == 2024 for row in updates))
+        self.assertIn("\nPasadena: ", by_name["rhinoplasty"])
+        self.assertNotIn("90012", by_name["rhinoplasty"])
+        self.assertEqual(ranks["rhinoplasty"], [None, 1, None])
+        self.assertEqual(zips["rhinoplasty"], [None, "90012", None])
         self.assertNotIn("Pasadena", by_name["facelift"])
         self.assertIn("no cash-pay persona list", by_name["custom procedure"])
+        self.assertEqual((ranks["custom procedure"], zips["custom procedure"]), ([None], [None]))
         insert = next(rows for sql, rows in statements if "INSERT INTO public.cash_pay_zip_rank" in sql)
         self.assertIs(insert[0][-1], moment)
         update_sql = next(sql for sql, rows in statements if isinstance(rows, list) and "marketing_bullets = %s" in sql)
@@ -840,14 +948,16 @@ class ProcedureFeeExportTests(unittest.TestCase):
             "dataset_updated_at",
             "marketing_bullets",
             "source_note",
+            "rank",
+            "zip_code",
         ]
         moment = datetime(2026, 10, 27, 17, 0, tzinfo=timezone.utc)
-        bullet = "18 to 34. Ranked.\n- 1. Pasadena (90012): cash."
+        bullet = "18 to 34. Ranked.\nPasadena: cash."
         table_rows = [
-            (2024, "facelift", 10, 1000, 2000, "national", "https://example.test/2024", moment, None, "older"),
-            (2024, "rhinoplasty", 11, 1100, 2100, "national", "https://example.test/2024", moment, None, "older"),
-            (2025, "facelift", 12, None, None, "national", "https://example.test/2025", moment, "older personas", "latest"),
-            (2025, "rhinoplasty", 13, None, None, "national", "https://example.test/2025", moment, bullet, "latest"),
+            (2024, "facelift", 10, 1000, 2000, "national", "https://example.test/2024", moment, None, "older", None, None),
+            (2024, "rhinoplasty", 11, 1100, 2100, "national", "https://example.test/2024", moment, None, "older", None, None),
+            (2025, "facelift", 12, None, None, "national", "https://example.test/2025", moment, "older personas", "latest", [None], [None]),
+            (2025, "rhinoplasty", 13, None, None, "national", "https://example.test/2025", moment, bullet, "latest", [None, 1], [None, "90012"]),
         ]
         conn = self._connection(columns, table_rows)
         with tempfile.TemporaryDirectory() as tmp:
@@ -870,7 +980,11 @@ class ProcedureFeeExportTests(unittest.TestCase):
         self.assertEqual(written[1]["marketing_bullets"], "")
         self.assertEqual(written[2]["marketing_bullets"], "older personas")
         self.assertEqual(written[3]["marketing_bullets"], "18 to 34. Ranked.")
-        self.assertEqual(written[4]["marketing_bullets"], "- 1. Pasadena (90012): cash.")
+        self.assertEqual(written[4]["marketing_bullets"], "Pasadena: cash.")
+        self.assertEqual(
+            [(row["rank"], row["zip_code"]) for row in written],
+            [("", ""), ("", ""), ("", ""), ("", ""), ("1", "90012")],
+        )
         self.assertNotIn("\n", written[3]["marketing_bullets"])
         self.assertNotIn("\n", written[4]["marketing_bullets"])
         self.assertEqual(written[0]["source_note"], "older")
@@ -898,6 +1012,12 @@ class ProcedureFeeExportTests(unittest.TestCase):
             next(params for sql, params in conn.cursor_obj.statements if params),
             ("procedure_surgeon_fees",),
         )
+
+    def test_export_refuses_ranks_that_do_not_match_the_lines(self):
+        columns = ["report_year", "procedure", "marketing_bullets", "rank", "zip_code"]
+        rows = [(2024, "facelift", "Header.\nPasadena: cash.", [None], [None, "90012"])]
+        with self.assertRaises(SystemExit):
+            rank.expand_marketing_bullet_rows(columns, rows)
 
     def test_export_refuses_a_table_without_marketing_bullets(self):
         conn = self._connection(["report_year", "procedure"], [])

@@ -10,12 +10,15 @@ procedure rows. When the join year qualifies, bullets are written only
 there. Otherwise they are written only on the most recent report year that
 qualifies. Every other report year is left blank in that column. Fees are
 not copied from another year. The fee load owns the column and does not
-fill it.
+fill it. The same write fills rank (integer[]) and zip_code (text[]) with one
+element per bullet line. A ZIP line holds its rank and 5-digit ZIP, and the
+line text has neither. A header line holds null in both.
 After that write succeeds, the same run exports every column of
-procedure_surgeon_fees, including marketing_bullets, for the chosen report
-year and every other report year. The file has one row per bullet line.
-report_year and procedure repeat on each of those rows, and the bullet
-text has no line break inside the cell.
+procedure_surgeon_fees, including marketing_bullets, rank, and zip_code, for
+the chosen report year and every other report year. The file has one row per
+bullet line. report_year and procedure repeat on each of those rows, rank and
+zip_code are that line's values or blank, and the bullet text has no line
+break inside the cell.
 """
 
 from __future__ import annotations
@@ -40,6 +43,9 @@ OUTPUT_CSV = Path(__file__).resolve().parent / OUTPUT_CSV_NAME
 MIN_ACTIVE_LISTINGS = 10
 TOP_N = 25
 DATABASE_URL_ENV = load_california.DATABASE_URL_ENV
+BULLET_RANK = "rank"
+BULLET_ZIP_CODE = "zip_code"
+LEGACY_BULLET_RANK = "bullet_rank"
 
 # Equal age shares are the close case. The higher cash signal ranks first.
 # Household income is that signal for working-age personas. Listing price
@@ -414,11 +420,17 @@ def rank_personas(rows: list[dict[str, str]]) -> list[PersonaRank]:
     return [rank_persona(rows, persona) for persona in PERSONAS]
 
 
+@dataclass(frozen=True)
+class BulletLine:
+    """One marketing bullet line. Header lines have no rank and no ZIP."""
+
+    text: str
+    rank: int | None = None
+    zip_code: str | None = None
+
+
 def place_name(row: dict) -> str:
-    name = str(row.get("zip_name") or "").strip()
-    if not name:
-        return str(row["zip"])
-    return f"{name} ({row['zip']})"
+    return str(row.get("zip_name") or "").strip()
 
 
 def screen_header(screen: PersonaRank) -> str:
@@ -475,37 +487,49 @@ def zip_bullet(screen: PersonaRank, row: dict) -> str:
         )
     if row.get("female_share") is not None:
         reason += f" Women are {format_percent(row['female_share'])} of residents."
-    return f"{row['rank']}. {place_name(row)}: {reason}"
+    name = place_name(row)
+    if not name:
+        return reason
+    return f"{name}: {reason}"
 
 
-def render_screen(screen: PersonaRank) -> str:
-    lines = [screen_header(screen)]
+def render_screen(screen: PersonaRank) -> list[BulletLine]:
+    lines = [BulletLine(screen_header(screen))]
     for row in screen.rows:
-        lines.append(f"- {zip_bullet(screen, row)}")
-    return "\n".join(lines)
+        lines.append(
+            BulletLine(zip_bullet(screen, row), int(row["rank"]), str(row["zip"]))
+        )
+    return lines
+
+
+def bullet_lines(procedure: str, screens: list[PersonaRank]) -> list[BulletLine]:
+    """Bullet lines for one procedure's persona lists. Shared lists repeat."""
+    labels = PROCEDURE_PERSONAS.get(procedure)
+    if not labels:
+        return [BulletLine(f"{procedure} has no cash-pay persona list.")]
+    by_label = {screen.persona.label: screen for screen in screens}
+    lines: list[BulletLine] = []
+    for label in labels:
+        lines.extend(render_screen(by_label[label]))
+    return lines
 
 
 def marketing_bullets(procedure: str, screens: list[PersonaRank]) -> str:
-    """Bullet text for one procedure's persona lists. Shared lists repeat."""
-    labels = PROCEDURE_PERSONAS.get(procedure)
-    if not labels:
-        return f"- {procedure} has no cash-pay persona list."
-    by_label = {screen.persona.label: screen for screen in screens}
-    return "\n".join(render_screen(by_label[label]) for label in labels)
+    return "\n".join(line.text for line in bullet_lines(procedure, screens))
 
 
 def bullets_by_procedure(
     procedures_in_year: list[str], screens: list[PersonaRank]
-) -> dict[str, str]:
-    cache: dict[tuple[str, ...], str] = {}
-    bullets: dict[str, str] = {}
+) -> dict[str, list[BulletLine]]:
+    cache: dict[tuple[str, ...], list[BulletLine]] = {}
+    bullets: dict[str, list[BulletLine]] = {}
     for name in procedures_in_year:
         labels = PROCEDURE_PERSONAS.get(name)
         if labels is None:
-            bullets[name] = marketing_bullets(name, screens)
+            bullets[name] = bullet_lines(name, screens)
             continue
         if labels not in cache:
-            cache[labels] = marketing_bullets(name, screens)
+            cache[labels] = bullet_lines(name, screens)
         bullets[name] = cache[labels]
     return bullets
 
@@ -675,6 +699,52 @@ def select_bullet_report_year(
     return max(qualifying)
 
 
+def procedure_column_types(cur) -> dict[str, str]:
+    cur.execute(
+        """
+        SELECT column_name, udt_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = %s
+        """,
+        (procedures.TABLE_NAME,),
+    )
+    return {str(name): str(udt) for name, udt in (cur.fetchall() or [])}
+
+
+def ensure_bullet_columns(cur) -> None:
+    """Add rank and zip_code beside marketing_bullets. An old bullet_rank becomes rank.
+
+    Each holds one element per marketing_bullets line, in line order. Header
+    lines hold null.
+    """
+    procedures.ensure_marketing_bullets(cur)
+    found = procedure_column_types(cur)
+    if LEGACY_BULLET_RANK in found:
+        if BULLET_RANK in found:
+            raise SystemExit(
+                f"{procedures.TABLE} has both {LEGACY_BULLET_RANK} and {BULLET_RANK}."
+            )
+        cur.execute(
+            f"ALTER TABLE {procedures.TABLE} RENAME COLUMN "
+            f"{quote_ident(LEGACY_BULLET_RANK)} TO {quote_ident(BULLET_RANK)}"
+        )
+        if found[LEGACY_BULLET_RANK] != "_int4":
+            cur.execute(
+                f"ALTER TABLE {procedures.TABLE} ALTER COLUMN {BULLET_RANK} "
+                f"TYPE integer[] USING CASE WHEN {BULLET_RANK} IS NULL THEN NULL "
+                f"ELSE ARRAY[{BULLET_RANK}::integer] END"
+            )
+    cur.execute(
+        f"ALTER TABLE {procedures.TABLE} ADD COLUMN IF NOT EXISTS "
+        f"{quote_ident(BULLET_RANK)} integer[]"
+    )
+    cur.execute(
+        f"ALTER TABLE {procedures.TABLE} ADD COLUMN IF NOT EXISTS "
+        f"{quote_ident(BULLET_ZIP_CODE)} text[]"
+    )
+
+
 def apply_marketing_bullets(
     cur,
     screens: list[PersonaRank],
@@ -683,21 +753,33 @@ def apply_marketing_bullets(
 ) -> tuple[int, int]:
     """Write bullet text on one qualifying report year and blank every other year.
 
+    rank and zip_code are written with the text, one element per line.
     Surgeon fee columns are not updated. A blank fee stays blank.
     """
-    procedures.ensure_marketing_bullets(cur)
+    ensure_bullet_columns(cur)
     chosen = select_bullet_report_year(preferred_year, procedure_rows)
     cur.execute(
-        f"UPDATE {procedures.TABLE} SET {procedures.MARKETING_BULLETS} = NULL "
+        f"UPDATE {procedures.TABLE} SET {procedures.MARKETING_BULLETS} = NULL, "
+        f"{BULLET_RANK} = NULL, {BULLET_ZIP_CODE} = NULL "
         "WHERE report_year <> %s",
         (chosen,),
     )
     names = [name for year, name, _low, _high in procedure_rows if year == chosen]
     bullets = bullets_by_procedure(names, screens)
-    updates = [(bullets[name], chosen, name) for name in names]
+    updates = [
+        (
+            "\n".join(line.text for line in bullets[name]),
+            [line.rank for line in bullets[name]],
+            [line.zip_code for line in bullets[name]],
+            chosen,
+            name,
+        )
+        for name in names
+    ]
     if updates:
         cur.executemany(
-            f"UPDATE {procedures.TABLE} SET {procedures.MARKETING_BULLETS} = %s "
+            f"UPDATE {procedures.TABLE} SET {procedures.MARKETING_BULLETS} = %s, "
+            f"{BULLET_RANK} = %s, {BULLET_ZIP_CODE} = %s "
             "WHERE report_year = %s AND procedure = %s",
             updates,
         )
@@ -768,22 +850,47 @@ def marketing_bullet_cells(value: object) -> list[str]:
     return cells
 
 
+def per_line_values(value: object, count: int, column: str) -> list[object]:
+    """Split a stored rank or zip_code list so element i goes with bullet line i."""
+    if value is None:
+        return [None] * count
+    if not isinstance(value, (list, tuple)):
+        raise SystemExit(f"{procedures.TABLE}.{column} is not a list.")
+    if len(value) != count:
+        raise SystemExit(
+            f"{procedures.TABLE}.{column} has {len(value)} values for {count} bullet lines."
+        )
+    return list(value)
+
+
 def expand_marketing_bullet_rows(columns: list[str], rows: list[tuple]) -> list[tuple]:
-    """Repeat report_year and procedure once per bullet line."""
+    """Repeat report_year and procedure once per bullet line, with its rank and ZIP."""
     if procedures.MARKETING_BULLETS not in columns:
         raise SystemExit(
             f"{procedures.TABLE} is missing {procedures.MARKETING_BULLETS}."
         )
     index = columns.index(procedures.MARKETING_BULLETS)
+    paired = [
+        columns.index(name)
+        for name in (BULLET_RANK, BULLET_ZIP_CODE)
+        if name in columns
+    ]
     expanded: list[tuple] = []
     for row in rows:
         if len(row) != len(columns):
             raise SystemExit(
                 f"{procedures.OUTPUT_CSV_NAME} row does not match its columns."
             )
-        for cell in marketing_bullet_cells(row[index]):
+        cells = marketing_bullet_cells(row[index])
+        values = {
+            column: per_line_values(row[column], len(cells), columns[column])
+            for column in paired
+        }
+        for position, cell in enumerate(cells):
             copied = list(row)
             copied[index] = cell
+            for column in paired:
+                copied[column] = values[column][position]
             expanded.append(tuple(copied))
     return expanded
 
