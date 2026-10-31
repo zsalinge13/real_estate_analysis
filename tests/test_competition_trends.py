@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import csv
+import inspect
+import io
 import json
 import re
 import tempfile
@@ -106,14 +109,23 @@ class NppesTests(unittest.TestCase):
                 return {"results": [result("1", "90210", ["208200000X"])]}
             return {"results": [result("1", "90210", ["207N00000X"])]}
 
-        providers = ct.fetch_providers(["90210", "90211", "91101"], fetch, lambda: None)
+        with contextlib.redirect_stdout(io.StringIO()):
+            providers = ct.fetch_providers(["90210", "90211", "91101"], fetch, lambda: None)
         self.assertEqual(
             sorted({(c["taxonomy_description"], c["postal_code"]) for c in calls}),
-            [("Dermatology", "902*"), ("Dermatology", "911*"), ("Plastic", "902*"), ("Plastic", "911*")],
+            [
+                ("Dermatology", "90210*"),
+                ("Dermatology", "90211*"),
+                ("Dermatology", "91101*"),
+                ("Plastic", "90210*"),
+                ("Plastic", "90211*"),
+                ("Plastic", "91101*"),
+            ],
         )
         self.assertEqual(list(providers), ["1"])
         self.assertEqual(providers["1"].specialties(), {"plastic_surgeon", "dermatologist"})
         self.assertTrue(all(c["state"] == "CA" and c["enumeration_type"] == "NPI-1" for c in calls))
+        self.assertTrue(all(len(c["postal_code"].rstrip("*")) == 5 for c in calls))
 
     def test_prefix_at_the_api_cap_is_split(self):
         def fetch(params):
@@ -197,13 +209,23 @@ class JoinInputTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             ct.zip_areas_from_rows([join_input("92630", county="Orange", distance="51.79")])
 
-    def test_join_csv_needs_the_practice_fields(self):
+    def test_join_csv_without_practice_fields_uses_the_area(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "join.csv"
-            path.write_text("zip,zip_name,adult_population,acs_year\n90210,beverly hills,1,2024\n")
-            with self.assertRaises(SystemExit) as caught:
-                ct.read_zip_areas(path)
-            self.assertIn("practice_zip_code", str(caught.exception))
+            path.write_text(
+                "zip,zip_name,adult_population,acs_year\n"
+                "90210,beverly hills,1,2024\n"
+                "93063,simi valley,1,2024\n"
+            )
+            area = {"90210": practice.AreaZip("Los Angeles", Decimal("0.00"))}
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                areas = ct.read_zip_areas(path, area)
+            self.assertEqual([a.zip_code for a in areas], ["90210"])
+            self.assertEqual(
+                (areas[0].city, areas[0].practice_zip_code, areas[0].county, areas[0].distance_from_practice_miles),
+                ("beverly hills", "90210", "Los Angeles", Decimal("0.00")),
+            )
+            self.assertIn("no practice-area columns", out.getvalue())
 
 
 class OutsideAdultsTests(unittest.TestCase):
@@ -512,6 +534,13 @@ class FallbackTests(unittest.TestCase):
 
         self.assertIsNone(ct.pull_competition(self.areas, broken, lambda c: {}, lambda y, c: {}))
 
+    def test_too_few_zips_is_not_kept_as_last_good(self):
+        def broken(_codes):
+            raise ct.TooFewZipsError("NPPES returned too few ZIPs.")
+
+        with self.assertRaises(ct.TooFewZipsError):
+            ct.pull_competition(self.areas, lambda: self.points, broken, lambda y, c: {})
+
     def test_success_marks_rows_new(self):
         comp = ct.pull_competition(self.areas, lambda: self.points, lambda c: {}, lambda y, c: {})
         rows = ct.build_rows(self.areas, ["liposuction"], comp, {}, NOW, NOW)
@@ -526,6 +555,78 @@ class FallbackTests(unittest.TestCase):
         out = ct.refresh_trends(["liposuction"], {"liposuction": entry}, None, NOW)["liposuction"]
         self.assertEqual((out.dma_status, out.city_status), (ct.STATUS_KEPT, ct.STATUS_RECENT))
         self.assertEqual(out.dma.pulled_at, entry.dma.pulled_at)
+
+
+class SafeguardTests(unittest.TestCase):
+    def test_competition_safeguards_stay_in_place(self):
+        workflow = (ROOT / ".github/workflows/pull-competition-trends.yml").read_text()
+        california = (ROOT / ".github/workflows/load-california.yml").read_text()
+        self.assertEqual(ct.BATCH_SIZE, 10)
+        self.assertEqual(ct.NPPES_TIMEOUT, 60)
+        self.assertGreaterEqual(ct.NPPES_ATTEMPTS, 2)
+        self.assertGreaterEqual(ct.NPPES_PAUSE_SECONDS, 0.3)
+        self.assertIn("timeout=NPPES_TIMEOUT", inspect.getsource(ct.nppes_fetch_json))
+        self.assertIn("attempts=NPPES_ATTEMPTS", inspect.getsource(ct.nppes_fetch_json))
+        self.assertIn("downloading batch", inspect.getsource(ct.fetch_providers))
+        self.assertIn("downloading batch", inspect.getsource(ct.fetch_adults))
+        self.assertIn("too few", inspect.getsource(ct.fetch_providers))
+        self.assertIn("TooFewZipsError", inspect.getsource(ct.pull_competition))
+        self.assertNotIn("code[:3]", inspect.getsource(ct.fetch_providers))
+        self.assertIn("timeout-minutes: 90", workflow)
+        self.assertIn("timeout-minutes: 90", california.split("\n  competition_trends:\n", 1)[1])
+        self.assertIn("cancel-in-progress: false", workflow)
+        self.assertIn("cancel-in-progress: false", california)
+        self.assert_nppes_batches_stay_small()
+
+    def assert_nppes_batches_stay_small(self):
+        """Each NPPES request is one ZIP. Batches of ten are logged. Taxonomies are not combined."""
+        zips = [f"90{index:03d}" for index in range(12)]
+        self.assertEqual([len(batch) for batch in ct.zip_batches(zips)], [10, 2])
+        calls: list[dict] = []
+
+        def fetch(params):
+            calls.append(params)
+            if params["skip"]:
+                return {"results": []}
+            return {"results": [result("1", params["postal_code"].rstrip("*"), ["208200000X"])]}
+
+        ticks = iter(range(10_000))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            providers = ct.fetch_providers(zips, fetch, lambda: None, clock=lambda: next(ticks))
+        self.assertEqual(len(providers), 1)
+        self.assertTrue(all(len(call["postal_code"].rstrip("*")) == 5 for call in calls))
+        self.assertFalse(any(len(call["postal_code"].rstrip("*")) == 3 for call in calls))
+        first_pages = [call for call in calls if call["skip"] == 0]
+        self.assertEqual(len(first_pages), 24)
+        plastic = [call for call in first_pages if call["taxonomy_description"] == "Plastic"]
+        dermatology = [call for call in first_pages if call["taxonomy_description"] == "Dermatology"]
+        self.assertEqual([call["postal_code"] for call in plastic], [f"{zip_code}*" for zip_code in zips])
+        self.assertEqual([call["postal_code"] for call in dermatology], [f"{zip_code}*" for zip_code in zips])
+        self.assertTrue(
+            all(call["taxonomy_description"] in ct.NPPES_QUERIES for call in calls),
+        )
+        log = out.getvalue()
+        self.assertIn("NPPES Plastic: downloading batch 1 of 2, 10 ZIPs (90000 to 90009).", log)
+        self.assertIn("NPPES Plastic: downloading batch 2 of 2, 2 ZIPs (90010 to 90011).", log)
+        self.assertIn("NPPES Dermatology: downloading batch 1 of 2, 10 ZIPs (90000 to 90009).", log)
+        self.assertRegex(log, r"NPPES Plastic: 12 of 12 ZIPs in 2 batches, [\d.]+ s\.")
+        self.assertIn("NPPES: 12 of 12 ZIPs returned for every taxonomy.", log)
+
+    def test_too_few_zips_stops_the_run(self):
+        def fetch(params):
+            if params["postal_code"].startswith("90001"):
+                return {"results": []}
+            raise TimeoutError("nppes")
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            with self.assertRaises(ct.TooFewZipsError) as caught:
+                ct.fetch_providers(
+                    ["90001", "90002", "90003", "90004", "90005"],
+                    fetch,
+                    lambda: None,
+                )
+        self.assertIn("too few", str(caught.exception))
+        self.assertIn("ZIP 90002 failed", out.getvalue())
 
 
 class WorkflowTests(unittest.TestCase):

@@ -16,10 +16,12 @@ not it is in the join. Adults for a ZCTA outside the join come from the same
 ACS vintage as the join. When any of those ZCTAs has no adult count, the
 5-mile adults and densities are blank.
 
-NPPES is read on every run. When NPPES or the gazetteer fails, each ZIP and
-procedure keeps its last good competition values from
-`public.competition_trends`, with their original `competition_pulled_at`, and
-the run still writes the CSV.
+NPPES is read on every run in ZIP batches of ten, one taxonomy at a time.
+Each request is one 5-digit ZIP (with a * so ZIP+4 matches). Requests are
+not combined across ZIPs. When NPPES returns too few ZIPs, the run stops.
+When NPPES or the gazetteer fails for another reason, each ZIP and procedure
+keeps its last good competition values from `public.competition_trends`,
+with their original `competition_pulled_at`, and the run still writes the CSV.
 
 Search interest comes from Google Trends through pytrends. That service is
 unofficial and rate-limited. A Trends error never stops the run: the last good
@@ -72,6 +74,16 @@ NPPES_PAGE = 200
 NPPES_MAX_SKIP = 1000
 NPPES_CAP = NPPES_MAX_SKIP + NPPES_PAGE
 NPPES_PAUSE_SECONDS = 0.3
+# One NPPES call asks for one ZIP. Batches of ten are logged together.
+BATCH_SIZE = 10
+NPPES_TIMEOUT = 60
+NPPES_ATTEMPTS = 5
+NPPES_RETRY_WAIT_SECONDS = 4
+
+
+class TooFewZipsError(SystemExit):
+    """NPPES answered for fewer than half of the requested ZIPs."""
+
 
 RADIUS_MILES = 5.0
 # A degree of latitude is 69.09 miles on practice.EARTH_RADIUS_MILES.
@@ -261,30 +273,6 @@ def parse_whole(raw: object) -> int | None:
         return None
 
 
-def zip_areas_from_rows(rows: Iterable[dict]) -> list[ZipArea]:
-    """Join ZIPs inside the practice area. Rows outside it are left out."""
-    areas: dict[str, ZipArea] = {}
-    for row in rows:
-        key = load_california.postal_code_key(str(row.get("zip") or ""))
-        if key is None:
-            continue
-        fields = [row.get(name) for name in practice.FIELDS]
-        if not practice.in_area(*fields):
-            continue
-        areas[key] = ZipArea(
-            zip_code=key,
-            city=split_city(str(row.get("zip_name") or "")),
-            adult_population=parse_whole(row.get("adult_population")),
-            county=str(fields[1]).strip(),
-            distance_from_practice_miles=Decimal(str(fields[2]).strip()),
-            practice_zip_code=str(fields[0]).strip(),
-            acs_year=parse_whole(row.get("acs_year")),
-        )
-    if not areas:
-        raise SystemExit(f"The ZIP join has no rows for {practice.AREA_PHRASE}.")
-    return [areas[key] for key in sorted(areas)]
-
-
 def join_acs_year(areas: list[ZipArea]) -> int | None:
     years = {area.acs_year for area in areas if area.acs_year is not None}
     if len(years) > 1:
@@ -303,21 +291,97 @@ def read_csv_rows(path: Path, required: tuple[str, ...]) -> list[dict]:
         return list(reader)
 
 
-JOIN_INPUT_COLUMNS = ("zip", "zip_name", "adult_population", "acs_year") + practice.FIELDS
+JOIN_REQUIRED_COLUMNS = ("zip", "zip_name", "adult_population", "acs_year")
+JOIN_INPUT_COLUMNS = JOIN_REQUIRED_COLUMNS + practice.FIELDS
 
 
-def read_zip_areas(path: Path | None) -> list[ZipArea]:
+def has_practice_fields(row: dict) -> bool:
+    """True when the join already has the practice-area columns, even if a cell is blank."""
+    return all(name in row for name in practice.FIELDS)
+
+
+def zip_areas_from_rows(
+    rows: Iterable[dict],
+    area: dict[str, practice.AreaZip] | None = None,
+) -> list[ZipArea]:
+    """Join ZIPs inside the practice area. Rows outside it are left out.
+
+    A join file or table from before the practice-area columns existed is still
+    read. Those distances are filled from practice.practice_area().
+    """
+    areas: dict[str, ZipArea] = {}
+    loaded_area = area
+    filled_from_gazetteer = False
+    for row in rows:
+        key = load_california.postal_code_key(str(row.get("zip") or ""))
+        if key is None:
+            continue
+        if has_practice_fields(row):
+            fields = [row.get(name) for name in practice.FIELDS]
+            if not practice.in_area(*fields):
+                continue
+            practice_zip = str(fields[0]).strip()
+            county = str(fields[1]).strip()
+            distance = Decimal(str(fields[2]).strip())
+        else:
+            filled_from_gazetteer = True
+            if loaded_area is None:
+                loaded_area = practice.practice_area()
+            place = loaded_area.get(key)
+            if place is None:
+                continue
+            practice_zip = place.practice_zip_code
+            county = place.county
+            distance = place.distance_from_practice_miles
+        areas[key] = ZipArea(
+            zip_code=key,
+            city=split_city(str(row.get("zip_name") or "")),
+            adult_population=parse_whole(row.get("adult_population")),
+            county=county,
+            distance_from_practice_miles=distance,
+            practice_zip_code=practice_zip,
+            acs_year=parse_whole(row.get("acs_year")),
+        )
+    if filled_from_gazetteer:
+        print(
+            "The ZIP join has no practice-area columns. "
+            "Distances are filled from the Gazetteer.",
+            flush=True,
+        )
+    if not areas:
+        raise SystemExit(f"The ZIP join has no rows for {practice.AREA_PHRASE}.")
+    return [areas[key] for key in sorted(areas)]
+
+
+def read_join_table_rows() -> list[dict]:
+    """Rows from public.zip_census_redfin_join, with or without practice columns."""
+    with load_california.connect() as conn, conn.cursor() as cur:
+        try:
+            cur.execute(f"SELECT {', '.join(JOIN_INPUT_COLUMNS)} FROM {JOIN_TABLE}")
+            names = JOIN_INPUT_COLUMNS
+            values = cur.fetchall()
+        except Exception as exc:
+            missing = "practice_zip_code" in str(exc) or type(exc).__name__ == "UndefinedColumn"
+            if not missing:
+                raise
+            conn.rollback()
+            cur.execute(f"SELECT {', '.join(JOIN_REQUIRED_COLUMNS)} FROM {JOIN_TABLE}")
+            names = JOIN_REQUIRED_COLUMNS
+            values = cur.fetchall()
+    return [dict(zip(names, row)) for row in values]
+
+
+def read_zip_areas(
+    path: Path | None,
+    area: dict[str, practice.AreaZip] | None = None,
+) -> list[ZipArea]:
     if path is not None:
-        return zip_areas_from_rows(read_csv_rows(path, JOIN_INPUT_COLUMNS))
+        return zip_areas_from_rows(read_csv_rows(path, JOIN_REQUIRED_COLUMNS), area)
     if not database_url():
         raise SystemExit(
             "Pass --join zip_census_redfin_join.csv or set DATABASE_URL."
         )
-    with load_california.connect() as conn, conn.cursor() as cur:
-        cur.execute(f"SELECT {', '.join(JOIN_INPUT_COLUMNS)} FROM {JOIN_TABLE}")
-        return zip_areas_from_rows(
-            dict(zip(JOIN_INPUT_COLUMNS, values)) for values in cur.fetchall()
-        )
+    return zip_areas_from_rows(read_join_table_rows(), area)
 
 
 def procedures_from_rows(rows: Iterable[dict]) -> list[str]:
@@ -429,9 +493,9 @@ def provider_from_result(result: dict) -> Provider | None:
 def nppes_fetch_json(params: dict) -> dict:
     query = urllib.parse.urlencode({"version": "2.1", **params})
     body = with_retries(
-        lambda: http_get(f"{NPPES_URL}?{query}", timeout=60),
-        attempts=5,
-        first_wait=4,
+        lambda: http_get(f"{NPPES_URL}?{query}", timeout=NPPES_TIMEOUT),
+        attempts=NPPES_ATTEMPTS,
+        first_wait=NPPES_RETRY_WAIT_SECONDS,
         what="NPPES request",
     )
     data = json.loads(body)
@@ -440,13 +504,23 @@ def nppes_fetch_json(params: dict) -> dict:
     return data
 
 
+def zip_batches(zip_codes: Iterable[str], size: int = BATCH_SIZE) -> list[list[str]]:
+    """Sorted unique ZIPs in groups of `size`. Never one large combined request."""
+    codes = sorted({code for code in zip_codes if code})
+    return [codes[index : index + size] for index in range(0, len(codes), size)]
+
+
 def nppes_prefix(
     query: str,
     prefix: str,
     fetch_json: Callable[[dict], dict],
     pause: Callable[[], None],
 ) -> list[dict]:
-    """Every result for one ZIP prefix. A prefix at the API cap is split by its next digit."""
+    """Every result for one ZIP or prefix. A prefix at the API cap is split by its next digit.
+
+    fetch_providers passes a 5-digit ZIP, so the request is that ZIP plus `*`
+    (ZIP+4). Shorter prefixes are only used when a single ZIP hits the API cap.
+    """
     results: list[dict] = []
     for skip in range(0, NPPES_MAX_SKIP + 1, NPPES_PAGE):
         page = fetch_json(
@@ -472,25 +546,80 @@ def nppes_prefix(
     return split
 
 
+def fetch_zip_results(
+    query: str,
+    zip_code: str,
+    fetch_json: Callable[[dict], dict],
+    pause: Callable[[], None],
+) -> list[dict] | None:
+    """Results for one 5-digit ZIP, including ZIP+4. None when retries are exhausted."""
+    try:
+        return nppes_prefix(query, zip_code, fetch_json, pause)
+    except (Exception, SystemExit) as exc:
+        print(
+            f"NPPES {query}: ZIP {zip_code} failed ({type(exc).__name__}: {exc}).",
+            flush=True,
+        )
+        return None
+
+
 def fetch_providers(
     zip_codes: Iterable[str],
     fetch_json: Callable[[dict], dict] = nppes_fetch_json,
     pause: Callable[[], None] = lambda: time.sleep(NPPES_PAUSE_SECONDS),
+    clock=time.monotonic,
 ) -> dict[str, Provider]:
-    """Providers in the 3-digit prefixes of these ZIPs, one entry per NPI."""
-    prefixes = sorted({code[:3] for code in zip_codes})
+    """Providers in these ZIPs, one NPPES request per ZIP and taxonomy.
+
+    ZIPs are requested in batches of BATCH_SIZE. Each request is one 5-digit
+    ZIP, not a combined 3-digit prefix. A ZIP that fails after retries is
+    skipped. The pull stops if fewer than half of the ZIPs return.
+    """
+    codes = sorted({code for code in zip_codes if code})
+    batches = zip_batches(codes)
     providers: dict[str, Provider] = {}
+    returned: dict[str, int] = {code: 0 for code in codes}
     for query in NPPES_QUERIES:
-        for prefix in prefixes:
-            for result in nppes_prefix(query, prefix, fetch_json, pause):
-                provider = provider_from_result(result)
-                if provider is None:
+        started = clock()
+        query_returned: set[str] = set()
+        for index, batch in enumerate(batches, start=1):
+            batch_started = clock()
+            print(
+                f"NPPES {query}: downloading batch {index} of {len(batches)}, "
+                f"{len(batch)} ZIPs ({batch[0]} to {batch[-1]}).",
+                flush=True,
+            )
+            for zip_code in batch:
+                results = fetch_zip_results(query, zip_code, fetch_json, pause)
+                if results is None:
                     continue
-                known = providers.get(provider.npi)
-                if known is None:
-                    providers[provider.npi] = provider
-                else:
-                    known.codes |= provider.codes
+                query_returned.add(zip_code)
+                returned[zip_code] += 1
+                for result in results:
+                    provider = provider_from_result(result)
+                    if provider is None:
+                        continue
+                    known = providers.get(provider.npi)
+                    if known is None:
+                        providers[provider.npi] = provider
+                    else:
+                        known.codes |= provider.codes
+            print(
+                f"NPPES {query}: batch {index} took {clock() - batch_started:.1f} s.",
+                flush=True,
+            )
+        print(
+            f"NPPES {query}: {len(query_returned)} of {len(codes)} ZIPs in "
+            f"{len(batches)} batches, {clock() - started:.1f} s.",
+            flush=True,
+        )
+    complete = sum(1 for code in codes if returned[code] >= len(NPPES_QUERIES))
+    print(
+        f"NPPES: {complete} of {len(codes)} ZIPs returned for every taxonomy.",
+        flush=True,
+    )
+    if complete < max(1, len(codes) // 2):
+        raise TooFewZipsError("NPPES returned too few ZIPs.")
     return providers
 
 
@@ -565,9 +694,15 @@ def fetch_adults(
     """ACS adults 18 and older per ZCTA, summed the same way as the Census pull."""
     variables = dict(census.field_groups())["age_bands"]
     adults: dict[str, int | None] = {}
-    for index, batch in enumerate(census.chunks(zip_codes, census.BATCH_SIZE)):
-        if index:
+    batches = zip_batches(zip_codes)
+    for index, batch in enumerate(batches, start=1):
+        if index > 1:
             pause()
+        print(
+            f"ACS {year} adults: downloading batch {index} of {len(batches)}, "
+            f"{len(batch)} ZIPs ({batch[0]} to {batch[-1]}).",
+            flush=True,
+        )
         adults.update(adults_from_records(fetch_piece(year, list(batch), variables)))
     return adults
 
@@ -671,13 +806,15 @@ def pull_competition(
         near = neighbors_within(codes, centroids)
         outside = outside_neighbors(near, codes)
         providers = fetch_nppes([*codes, *outside])
+    except TooFewZipsError:
+        raise
     except (Exception, SystemExit) as exc:
         print(
             f"The NPPES or gazetteer pull failed ({type(exc).__name__}: {exc}). "
             "Last good competition values are kept."
         )
         return None
-    print(f"NPPES: {len(providers)} active individual providers in the ZIP prefixes read.")
+    print(f"NPPES: {len(providers)} active individual providers in the ZIPs read.")
     outside_adults: dict[str, int | None] = {}
     year = join_acs_year(areas)
     if outside and year is None:
