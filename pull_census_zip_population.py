@@ -17,9 +17,12 @@ office, dermatology, or NPI locations.
 
 A run fetches only the latest published ACS 5-year vintage. Income, age,
 sex, age bands, race and ethnicity (B03002), education (B15003), household
-income brackets (B19001), mothers and births (B23003 and B13016), tenure
-(B25003 and B25007), and occupation (C24010) are separate requests, about
-10 ZIP codes at a time. Sex by age reuses the B01001 age-band codes.
+income brackets (B19001), household income by age of householder (B19037),
+mothers and births (B23003 and B13016), tenure (B25003 and B25007), and
+occupation (C24010) are separate requests, about 10 ZIP codes at a time,
+one county at a time. Sex by age reuses the B01001 age-band codes. The
+householder-age bands 25–44, 45–64, and 65+ come from B01001 (people),
+B25007 (owners), and B19037 (household income brackets).
 The script waits a couple of seconds between calls. A failure retries that
 piece. Each finished batch is saved before the next batch starts. A closed
 connection, a dropped connection, or a read timeout is retried more than
@@ -288,6 +291,59 @@ TENURE_BY_AGE_GROUPS = {
         ),
     )
 }
+# Persona bands match the B19037 householder-age bands: 25 to 44, 45 to 64,
+# and 65 and older. Under 25 is not a persona. B01001 and B25007 codes are the
+# ones the age_bands and tenure requests already download.
+AGE_BAND_MALE_CODES = {
+    "population_25_44": tuple(MALE_BANDS["population_18_34"][4:]) + MALE_BANDS["population_35_44"],
+    "population_45_64": MALE_BANDS["population_45_54"] + MALE_BANDS["population_55_64"],
+}
+AGE_BAND_GROUPS = {
+    column: tuple(
+        pair
+        for code, phrase in pairs
+        for pair in ((code, f"Male:!!{phrase}"), (female_code(code), f"Female:!!{phrase}"))
+    )
+    for column, pairs in AGE_BAND_MALE_CODES.items()
+}
+# Women and men 25 to 44 and 45 to 64. The 65-and-older counts are already in
+# SEX_BY_AGE_GROUPS.
+SEX_BY_HOUSEHOLDER_AGE_GROUPS = {
+    f"{sex.lower()}_{column}": tuple(
+        (code if sex == "Male" else female_code(code), f"{sex}:!!{phrase}") for code, phrase in pairs
+    )
+    for column, pairs in AGE_BAND_MALE_CODES.items()
+    for sex in ("Male", "Female")
+}
+TENURE_BY_HOUSEHOLDER_AGE_GROUPS = {
+    f"{tenure.lower()}_occupied_householder_{band}": tenure_band(tenure, start + offset, phrases)
+    for tenure, start in (("Owner", 3), ("Renter", 13))
+    for band, offset, phrases in (
+        ("25_44", 1, ("25 to 34 years", "35 to 44 years")),
+        ("45_64", 3, ("45 to 54 years", "55 to 59 years", "60 to 64 years")),
+        ("65_plus", 6, ("65 to 74 years", "75 to 84 years", "85 years and over")),
+    )
+}
+# B19037 household income by age of householder. Each band repeats the 16
+# B19001 brackets. The band totals are not requested: they are the bracket
+# sums, and leaving them out keeps the request at 48 variables.
+HOUSEHOLDER_AGE_BANDS = (
+    ("25_44", 20, "Householder 25 to 44 years:"),
+    ("45_64", 37, "Householder 45 to 64 years:"),
+    ("65_plus", 54, "Householder 65 years and over:"),
+)
+HOUSEHOLDER_INCOME_GROUPS = {
+    f"householder_{band}_{column}": ((f"B19037_{first + index:03d}E", f"{label}!!{phrase}"),)
+    for band, first, label in HOUSEHOLDER_AGE_BANDS
+    for index, (column, _code, phrase, _low) in enumerate(HOUSEHOLD_INCOME_BRACKETS)
+}
+
+
+def householder_income_columns(band: str) -> tuple[str, ...]:
+    """B19037 bracket columns for one householder band, in HOUSEHOLD_INCOME_BRACKETS order."""
+    return tuple(f"householder_{band}_{column}" for column, _code, _phrase, _low in HOUSEHOLD_INCOME_BRACKETS)
+
+
 # C24010 civilian employed population 16 and older, female side.
 FEMALE_OCCUPATION = "Female:!!Management, business, science, and arts occupations:"
 OCCUPATION_GROUPS = {
@@ -313,6 +369,10 @@ COUNT_GROUP_TABLES = (
     ("B25003", TENURE_GROUPS, "tenure"),
     ("B25007", TENURE_BY_AGE_GROUPS, "tenure"),
     ("C24010", OCCUPATION_GROUPS, "occupation"),
+    ("B01001", AGE_BAND_GROUPS, None),
+    ("B01001", SEX_BY_HOUSEHOLDER_AGE_GROUPS, None),
+    ("B25007", TENURE_BY_HOUSEHOLDER_AGE_GROUPS, None),
+    ("B19037", HOUSEHOLDER_INCOME_GROUPS, "householder_income"),
 )
 POPULATION_25_PLUS = "population_25_plus"
 RACE_EDUCATION_COLUMNS = (
@@ -327,9 +387,15 @@ PROFILE_COLUMNS = (
     + tuple(TENURE_BY_AGE_GROUPS)
     + tuple(OCCUPATION_GROUPS)
 )
+HOUSEHOLDER_AGE_COLUMNS = (
+    tuple(AGE_BAND_GROUPS)
+    + tuple(SEX_BY_HOUSEHOLDER_AGE_GROUPS)
+    + tuple(TENURE_BY_HOUSEHOLDER_AGE_GROUPS)
+    + tuple(HOUSEHOLDER_INCOME_GROUPS)
+)
 # Each set is filled on a stored ZIP only when every column in that set is blank.
-BACKFILL_SETS = (RACE_EDUCATION_COLUMNS, PROFILE_COLUMNS)
-ADDED_COLUMNS = RACE_EDUCATION_COLUMNS + PROFILE_COLUMNS
+BACKFILL_SETS = (RACE_EDUCATION_COLUMNS, PROFILE_COLUMNS, HOUSEHOLDER_AGE_COLUMNS)
+ADDED_COLUMNS = RACE_EDUCATION_COLUMNS + PROFILE_COLUMNS + HOUSEHOLDER_AGE_COLUMNS
 BASE_COLUMNS = COLUMNS
 COLUMNS = BASE_COLUMNS + ADDED_COLUMNS
 INTEGER_COLUMNS = {

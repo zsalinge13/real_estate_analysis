@@ -101,7 +101,7 @@ BULLET_CSV_COLUMNS = ("marketing_bullets",) + BULLET_LIST_NAMES
 
 # Equal age shares are the close case. The higher cash signal ranks first.
 # Household income is that signal for working-age personas. Median listing
-# price per square foot is that signal for ages 55 and older. The female share
+# price per square foot is that signal for ages 65 and older. The female share
 # is not a rank key.
 
 
@@ -111,18 +111,17 @@ class Persona:
     age_columns: tuple[str, ...]
     cash: str
     age_phrase: str
+    householder_band: str
+    householder_phrase: str
 
 
+# The persona bands are the Census B19037 householder-age bands, so the
+# household income of each band can be read directly. Adults under 25 are not
+# a persona.
 PERSONAS = (
-    Persona("18 to 34", ("population_18_34",), "working", "ages 18 to 34"),
-    Persona("35 to 44", ("population_35_44",), "working", "ages 35 to 44"),
-    Persona("45 to 54", ("population_45_54",), "working", "ages 45 to 54"),
-    Persona(
-        "55 and older",
-        ("population_55_64", "population_65_plus"),
-        "older",
-        "ages 55 and older",
-    ),
+    Persona("25–44", ("population_25_44",), "working", "ages 25 to 44", "25_44", "25–44"),
+    Persona("45–64", ("population_45_64",), "working", "ages 45 to 64", "45_64", "45–64"),
+    Persona("65+", ("population_65_plus",), "older", "ages 65 and older", "65_plus", "65 or older"),
 )
 PERSONA_BY_LABEL = {persona.label: persona for persona in PERSONAS}
 
@@ -150,10 +149,9 @@ BLS_AGE_BANDS = {
     "65 and older": (39878, 69497, 2818 + 556 + 1383 + 2975 + 757 + 121),
 }
 PERSONA_BLS_BANDS = {
-    "18 to 34": ("under 25", "25 to 34"),
-    "35 to 44": ("35 to 44",),
-    "45 to 54": ("45 to 54",),
-    "55 and older": ("55 to 64", "65 and older"),
+    "25–44": ("25 to 34", "35 to 44"),
+    "45–64": ("45 to 54", "55 to 64"),
+    "65+": ("65 and older",),
 }
 
 
@@ -170,19 +168,19 @@ DISCRETIONARY_SHARE = {
 # The ZIP rank does not change by procedure. A procedure uses these persona
 # lists, and procedures that use the same lists get the same bullet text.
 PROCEDURE_PERSONAS = {
-    "breast augmentation": ("18 to 34", "35 to 44"),
-    "breast lift": ("35 to 44", "45 to 54"),
-    "breast reduction": ("18 to 34", "35 to 44", "45 to 54"),
-    "liposuction": ("18 to 34", "35 to 44", "45 to 54"),
-    "tummy tuck": ("35 to 44", "45 to 54"),
-    "arm lift": ("35 to 44", "45 to 54", "55 and older"),
-    "thigh lift": ("35 to 44", "45 to 54", "55 and older"),
-    "buttock augmentation with fat grafting": ("18 to 34", "35 to 44"),
-    "eyelid surgery": ("45 to 54", "55 and older"),
-    "facelift": ("45 to 54", "55 and older"),
-    "neck lift": ("45 to 54", "55 and older"),
-    "rhinoplasty": ("18 to 34", "35 to 44"),
-    "forehead lift": ("45 to 54", "55 and older"),
+    "breast augmentation": ("25–44",),
+    "breast lift": ("25–44", "45–64"),
+    "breast reduction": ("25–44", "45–64"),
+    "liposuction": ("25–44", "45–64"),
+    "tummy tuck": ("25–44", "45–64"),
+    "arm lift": ("25–44", "45–64", "65+"),
+    "thigh lift": ("25–44", "45–64", "65+"),
+    "buttock augmentation with fat grafting": ("25–44",),
+    "eyelid surgery": ("45–64", "65+"),
+    "facelift": ("45–64", "65+"),
+    "neck lift": ("45–64", "65+"),
+    "rhinoplasty": ("25–44",),
+    "forehead lift": ("45–64", "65+"),
 }
 
 LOWERCASE_CITY_WORDS = frozenset({"del", "de", "of", "the"})
@@ -203,13 +201,6 @@ EDUCATION_LABELS = {
     "education_graduate_or_professional": "Graduate or professional degree",
 }
 BACHELORS_OR_HIGHER = ("education_bachelors", "education_graduate_or_professional")
-# B25007 householder bands closest to each persona band.
-PERSONA_TENURE_BAND = {
-    "18 to 34": "15_34",
-    "35 to 44": "35_44",
-    "45 to 54": "45_54",
-    "55 and older": "55_plus",
-}
 MOTHER_PROCEDURES = frozenset(
     {"tummy tuck", "breast lift", "breast augmentation", "breast reduction", "liposuction"}
 )
@@ -291,10 +282,8 @@ JOIN_FIELDS = (
     "male_population",
     "female_population",
     "adult_population",
-    "population_18_34",
-    "population_35_44",
-    "population_45_54",
-    "population_55_64",
+    "population_25_44",
+    "population_45_64",
     "population_65_plus",
     "median_listing_price",
     "median_listing_price_per_square_foot",
@@ -525,7 +514,10 @@ def screen_row(row: dict[str, str], persona: Persona) -> dict | None:
         "month_date_yyyymm": month,
         "date_pulled_yyyymmdd": pulled,
         **describe_zip(row),
-        "profile": {name: as_int(row.get(name), name) for name in census.PROFILE_COLUMNS},
+        "profile": {
+            name: as_int(row.get(name), name)
+            for name in census.PROFILE_COLUMNS + census.HOUSEHOLDER_AGE_COLUMNS
+        },
     }
 
 
@@ -546,7 +538,7 @@ def passes_cash(row: dict, persona: Persona, income_middle, per_capita_middle, p
 def discretionary_income(row: dict, persona: Persona) -> Decimal:
     """BLS shares are per household, so every persona uses median household income.
 
-    The 55-and-older cash screen still uses per-person income.
+    The 65-and-older cash screen still uses per-person income.
     """
     return DISCRETIONARY_SHARE[persona.label] * Decimal(row["median_household_income"])
 
@@ -792,8 +784,9 @@ def zip_insight(
             count = metrics["affordable_households"]
             noun = "household" if count == 1 else "households"
             sentences.append(
-                f"About {metrics['affordable_households_share']}% of households here "
-                f"({count:,} {noun}) earn at least {format_money(metrics['income_needed'])}, "
+                f"About {metrics['affordable_households_share']}% of households headed by someone "
+                f"{screen.persona.householder_phrase} here ({count:,} {noun}) earn at least "
+                f"{format_money(metrics['income_needed'])}, "
                 f"enough to cover the {format_money(price)} fee."
             )
     residents = row.get("female_share")
@@ -856,14 +849,21 @@ def income_needed(price: Decimal, persona: Persona) -> int:
     return int((price / DISCRETIONARY_SHARE[persona.label]).quantize(Decimal(1), rounding=ROUND_HALF_UP))
 
 
-def households_at_or_above(profile: dict, threshold: Decimal) -> Decimal | None:
-    """Estimated households with income at or above the threshold, from B19001 brackets.
+def households_at_or_above(
+    profile: dict, threshold: Decimal, columns: tuple[str, ...] | None = None
+) -> Decimal | None:
+    """Estimated households with income at or above the threshold, from income brackets.
+
+    `columns` are the 16 bracket counts in HOUSEHOLD_INCOME_BRACKETS order: the
+    B19037 brackets of one householder-age band, or B19001 when not given.
 
     Inside a closed bracket the households are spread evenly, so the part at
     or above the threshold is linear. At or above $200,000 the open bracket
     uses a Pareto tail fitted to the $150,000 and $200,000 bounds.
     """
-    counts = [profile.get(column) for column, _code, _phrase, _low in census.HOUSEHOLD_INCOME_BRACKETS]
+    if columns is None:
+        columns = tuple(column for column, _code, _phrase, _low in census.HOUSEHOLD_INCOME_BRACKETS)
+    counts = [profile.get(column) for column in columns]
     if any(count is None for count in counts):
         return None
     lows = [Decimal(low) for _column, _code, _phrase, low in census.HOUSEHOLD_INCOME_BRACKETS]
@@ -905,7 +905,7 @@ def zip_metrics(row: dict, persona: Persona, price: Decimal | None) -> dict:
     renters = profile.get("renter_occupied_households")
     occupied = None if owners is None or renters is None else owners + renters
     owner_share = percent_of(owners, occupied)
-    band = PERSONA_TENURE_BAND[persona.label]
+    band = persona.householder_band
     band_owners = profile.get(f"owner_occupied_householder_{band}")
     band_renters = profile.get(f"renter_occupied_householder_{band}")
     band_total = None if band_owners is None or band_renters is None else band_owners + band_renters
@@ -936,10 +936,9 @@ def zip_metrics(row: dict, persona: Persona, price: Decimal | None) -> dict:
     if price is not None:
         needed = income_needed(price, persona)
         metrics["income_needed"] = needed
-        affordable = households_at_or_above(profile, Decimal(needed))
-        brackets = count_sum(
-            profile, [column for column, _code, _phrase, _low in census.HOUSEHOLD_INCOME_BRACKETS]
-        )
+        columns = census.householder_income_columns(persona.householder_band)
+        affordable = households_at_or_above(profile, Decimal(needed), columns)
+        brackets = count_sum(profile, list(columns))
         if affordable is not None and brackets:
             metrics["affordable_households"] = int(
                 affordable.quantize(Decimal(1), rounding=ROUND_HALF_UP)
