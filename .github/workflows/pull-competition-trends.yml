@@ -1,15 +1,13 @@
 name: Pull competition and search trends
 
-# Weekly, not chained to the daily Census run, so Google Trends is asked at
-# most once a week and a Trends or NPPES problem never touches the join.
+# Manual refresh only. Every Load California ZIP inventory run already builds
+# competition-trends; this rebuilds it without rerunning that load.
 # It reads zip-census-redfin-join and procedure-surgeon-fees from the latest
 # successful Load California ZIP inventory run on main that still has both
-# artifacts, and the last Trends cache from this workflow's latest run.
+# artifacts, and the last good Trends values from public.competition_trends,
+# under the same once-a-week Trends rule as the California run.
 # It replaces public.competition_trends only. It does not start another run.
 on:
-  schedule:
-    # 18:43 UTC every Monday: 11:43 AM Pacific Daylight Time, 10:43 AM Pacific Standard Time.
-    - cron: "43 18 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -53,24 +51,6 @@ jobs:
           done
           rm -rf inputs
           echo "No Load California run has both artifacts. The script reads Supabase instead."
-      - name: Download the last Google Trends cache
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          for run_id in $(gh run list \
-              --workflow pull-competition-trends.yml \
-              --branch main \
-              --limit 30 \
-              --json databaseId \
-              --jq '.[].databaseId'); do
-            if gh run download "$run_id" -n competition-trends-cache -D .; then
-              echo "Trends cache from run ${run_id}."
-              exit 0
-            fi
-          done
-          echo "No earlier Trends cache. Last good values come from Supabase if present."
       - name: Build competition_trends
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -93,14 +73,6 @@ jobs:
           path: competition_trends.csv
           retention-days: 90
           if-no-files-found: error
-      - name: Upload Google Trends cache
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: competition-trends-cache
-          path: competition_trends_cache.json
-          retention-days: 90
-          if-no-files-found: ignore
       - name: Export Supabase backup CSV
         id: backup
         if: failure()

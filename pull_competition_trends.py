@@ -16,11 +16,17 @@ not it is in the join. Adults for a ZCTA outside the join come from the same
 ACS vintage as the join. When any of those ZCTAs has no adult count, the
 5-mile adults and densities are blank.
 
+NPPES is read on every run. When NPPES or the gazetteer fails, each ZIP and
+procedure keeps its last good competition values from
+`public.competition_trends`, with their original `competition_pulled_at`, and
+the run still writes the CSV.
+
 Search interest comes from Google Trends through pytrends. That service is
 unofficial and rate-limited. A Trends error never stops the run: the last good
 values in `competition_trends_cache.json` are kept, or read back from
 `public.competition_trends` when the cache file is missing. A pull newer than
-six days is reused without asking Google again.
+six and a half days is reused without asking Google again, so the daily run
+asks Google about once a week.
 
 The CSV is `competition_trends.csv`. When DATABASE_URL is set, the rows replace
 `public.competition_trends`. No other table is modified.
@@ -77,7 +83,9 @@ TRENDS_TIMEFRAME = "today 5-y"
 TRENDS_ANCHOR = "liposuction"
 TRENDS_BATCH = 5
 TRENDS_WEEKS = 52
-TRENDS_REUSE_AGE = timedelta(days=6)
+# Under seven days so a daily run that starts a little earlier than last
+# week's still asks Google on the seventh day.
+TRENDS_REUSE_AGE = timedelta(days=6, hours=12)
 TRENDS_DEADLINE_SECONDS = 25 * 60
 TRENDS_ATTEMPTS = 4
 
@@ -185,6 +193,7 @@ COLUMNS: tuple[tuple[str, str], ...] = (
     ("procedure_competitor_count_5mi", "integer"),
     ("procedure_competitors_per_10k_adults_5mi", "numeric"),
     ("competition_pulled_at", "timestamptz"),
+    ("competition_status", "text"),
     ("competition_source", "text"),
     ("centroid_source", "text"),
     ("competition_limitations", "text"),
@@ -201,6 +210,19 @@ COLUMNS: tuple[tuple[str, str], ...] = (
     ("trends_city_pulled_at", "timestamptz"),
     ("trends_source", "text"),
     (dataset_stamp.COLUMN, dataset_stamp.SQL_TYPE),
+)
+COMPETITION_COUNT_COLUMNS = (
+    *(f"{specialty.key}_count" for specialty in SPECIALTIES),
+    *(f"{specialty.key}_count_5mi" for specialty in SPECIALTIES),
+    "adult_population_5mi",
+    "plastic_surgeons_per_10k_adults",
+    "dermatologists_per_10k_adults",
+    "plastic_surgeons_per_10k_adults_5mi",
+    "dermatologists_per_10k_adults_5mi",
+    "procedure_competitor_count",
+    "procedure_competitor_count_5mi",
+    "procedure_competitors_per_10k_adults_5mi",
+    "competition_pulled_at",
 )
 COLUMN_NAMES = tuple(name for name, _ in COLUMNS)
 COLUMN_TYPES = dict(COLUMNS)
@@ -612,6 +634,70 @@ def competitors_for(procedure: str) -> tuple[str, ...]:
     return PROCEDURE_COMPETITORS.get(procedure, DEFAULT_COMPETITORS)
 
 
+def stored_competition() -> dict[tuple[str, str], dict]:
+    """Last good competition columns per (zip_code, procedure) from public.competition_trends."""
+    if not database_url():
+        return {}
+    names = ", ".join(COMPETITION_COUNT_COLUMNS)
+    try:
+        with load_california.connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT to_regclass(%s)", (TABLE,))
+            if cur.fetchone()[0] is None:
+                return {}
+            cur.execute(f"SELECT zip_code, procedure, {names} FROM {TABLE}")
+            rows = cur.fetchall()
+    except Exception as exc:
+        print(f"Could not read the last competition values from {TABLE} ({type(exc).__name__}).")
+        return {}
+    return {
+        (zip_code, procedure): dict(zip(COMPETITION_COUNT_COLUMNS, values))
+        for zip_code, procedure, *values in rows
+    }
+
+
+def pull_competition(
+    areas: list[ZipArea],
+    fetch_points: Callable[[], dict[str, tuple[float, float]]] | None = None,
+    fetch_nppes: Callable[[list[str]], dict[str, Provider]] | None = None,
+    fetch_outside_adults: Callable[[int, list[str]], dict[str, int | None]] | None = None,
+) -> dict[str, ZipCompetition] | None:
+    """Counts from this run's gazetteer and NPPES pull, or None when either fails."""
+    fetch_points = fetch_points or fetch_centroids
+    fetch_nppes = fetch_nppes or fetch_providers
+    fetch_outside_adults = fetch_outside_adults or fetch_adults
+    codes = [area.zip_code for area in areas]
+    try:
+        centroids = fetch_points()
+        near = neighbors_within(codes, centroids)
+        outside = outside_neighbors(near, codes)
+        providers = fetch_nppes([*codes, *outside])
+    except (Exception, SystemExit) as exc:
+        print(
+            f"The NPPES or gazetteer pull failed ({type(exc).__name__}: {exc}). "
+            "Last good competition values are kept."
+        )
+        return None
+    print(f"NPPES: {len(providers)} active individual providers in the ZIP prefixes read.")
+    outside_adults: dict[str, int | None] = {}
+    year = join_acs_year(areas)
+    if outside and year is None:
+        print("The ZIP join has no acs_year. 5-mile adults that need ZCTAs outside the join are blank.")
+    elif outside:
+        try:
+            outside_adults = fetch_outside_adults(year, outside)
+        except (Exception, SystemExit) as exc:
+            print(
+                f"ACS {year} adults for ZCTAs outside the join failed "
+                f"({census.public_error(exc)}). 5-mile adults that need them are blank."
+            )
+        print(
+            f"{len(outside)} ZCTAs within {RADIUS_MILES:g} miles are outside the join; "
+            f"ACS {year} adults found for "
+            f"{sum(value is not None for value in outside_adults.values())}."
+        )
+    return competition_by_zip(areas, providers, centroids, outside_adults, near)
+
+
 # ---------------------------------------------------------------------------
 # Google Trends
 
@@ -907,27 +993,60 @@ def rounded(value: float | None, places: str = "0.01") -> Decimal | None:
     return Decimal(str(value)).quantize(Decimal(places), rounding=ROUND_HALF_UP)
 
 
+def competition_cells(
+    comp: ZipCompetition,
+    procedure: str,
+    competition_pulled_at: datetime,
+) -> dict:
+    within = comp.by_specialty_5mi
+    cells: dict = {
+        "adult_population_5mi": comp.adults_5mi,
+        "competition_pulled_at": competition_pulled_at,
+    }
+    for specialty in SPECIALTIES:
+        cells[f"{specialty.key}_count"] = len(comp.by_specialty[specialty.key])
+        cells[f"{specialty.key}_count_5mi"] = (
+            None if within is None else len(within[specialty.key])
+        )
+    cells["plastic_surgeons_per_10k_adults"] = per_10k(cells["plastic_surgeon_count"], comp.adults)
+    cells["dermatologists_per_10k_adults"] = per_10k(cells["dermatologist_count"], comp.adults)
+    cells["plastic_surgeons_per_10k_adults_5mi"] = per_10k(
+        cells["plastic_surgeon_count_5mi"], comp.adults_5mi
+    )
+    cells["dermatologists_per_10k_adults_5mi"] = per_10k(
+        cells["dermatologist_count_5mi"], comp.adults_5mi
+    )
+    keys = competitors_for(procedure)
+    in_zip = set().union(*(comp.by_specialty[key] for key in keys))
+    near = None if within is None else set().union(*(within[key] for key in keys))
+    cells["procedure_competitor_count"] = len(in_zip)
+    cells["procedure_competitor_count_5mi"] = None if near is None else len(near)
+    cells["procedure_competitors_per_10k_adults_5mi"] = per_10k(
+        None if near is None else len(near), comp.adults_5mi
+    )
+    return cells
+
+
 def build_rows(
     areas: list[ZipArea],
     procedures: list[str],
-    competition: dict[str, ZipCompetition],
+    competition: dict[str, ZipCompetition] | None,
     trends: dict[str, TrendsEntry],
     competition_pulled_at: datetime,
     updated_at: datetime,
+    stored: dict[tuple[str, str], dict] | None = None,
 ) -> list[dict]:
+    """competition is None when this run's NPPES pull failed; stored rows fill in."""
     rows: list[dict] = []
     for area in areas:
-        comp = competition[area.zip_code]
-        within = comp.by_specialty_5mi
+        comp = None if competition is None else competition[area.zip_code]
         base = {
             "zip_code": area.zip_code,
             "city": area.city,
             "practice_zip_code": area.practice_zip_code,
             "county": area.county,
             "distance_from_practice_miles": area.distance_from_practice_miles,
-            "adult_population": comp.adults,
-            "adult_population_5mi": comp.adults_5mi,
-            "competition_pulled_at": competition_pulled_at,
+            "adult_population": area.adult_population if comp is None else comp.adults,
             "competition_source": COMPETITION_SOURCE,
             "centroid_source": CENTROID_SOURCE,
             "competition_limitations": COMPETITION_LIMITATIONS,
@@ -935,37 +1054,24 @@ def build_rows(
             "trends_source": TRENDS_SOURCE,
             dataset_stamp.COLUMN: updated_at,
         }
-        for specialty in SPECIALTIES:
-            base[f"{specialty.key}_count"] = len(comp.by_specialty[specialty.key])
-            base[f"{specialty.key}_count_5mi"] = (
-                None if within is None else len(within[specialty.key])
-            )
-        base["plastic_surgeons_per_10k_adults"] = per_10k(base["plastic_surgeon_count"], comp.adults)
-        base["dermatologists_per_10k_adults"] = per_10k(base["dermatologist_count"], comp.adults)
-        base["plastic_surgeons_per_10k_adults_5mi"] = per_10k(
-            base["plastic_surgeon_count_5mi"], comp.adults_5mi
-        )
-        base["dermatologists_per_10k_adults_5mi"] = per_10k(
-            base["dermatologist_count_5mi"], comp.adults_5mi
-        )
         for procedure in procedures:
             keys = competitors_for(procedure)
-            in_zip = set().union(*(comp.by_specialty[key] for key in keys))
-            near = None if within is None else set().union(*(within[key] for key in keys))
             entry = trends.get(procedure) or TrendsEntry(term=term_for(procedure))
             dma = entry.dma.values if entry.dma else {}
             city_name, city_value = city_interest(entry, area.city)
             row = dict(base)
+            if comp is not None:
+                row.update(competition_cells(comp, procedure, competition_pulled_at))
+                row["competition_status"] = STATUS_NEW
+            else:
+                last = (stored or {}).get((area.zip_code, procedure))
+                row.update(last or {})
+                row["competition_status"] = STATUS_KEPT if last else STATUS_UNAVAILABLE
             row.update(
                 {
                     "procedure": procedure,
                     "procedure_competitor_specialties": ", ".join(
                         SPECIALTY_BY_KEY[key].label for key in keys
-                    ),
-                    "procedure_competitor_count": len(in_zip),
-                    "procedure_competitor_count_5mi": None if near is None else len(near),
-                    "procedure_competitors_per_10k_adults_5mi": per_10k(
-                        None if near is None else len(near), comp.adults_5mi
                     ),
                     "trends_search_term": entry.term,
                     "trends_dma_interest_12mo_avg": rounded(dma.get("latest_avg")),
@@ -1058,31 +1164,9 @@ def main(argv: list[str] | None = None) -> int:
     procedures = read_procedures(args.procedures)
     print(f"{len(areas)} ZIPs x {len(procedures)} procedures.")
 
-    codes = [area.zip_code for area in areas]
-    centroids = fetch_centroids()
-    near = neighbors_within(codes, centroids)
-    outside = outside_neighbors(near, codes)
-    providers = fetch_providers([*codes, *outside])
+    competition = pull_competition(areas)
     competition_pulled_at = dataset_stamp.stamp()
-    print(f"NPPES: {len(providers)} active individual providers in the ZIP prefixes read.")
-    outside_adults: dict[str, int | None] = {}
-    year = join_acs_year(areas)
-    if outside and year is None:
-        print("The ZIP join has no acs_year. 5-mile adults that need ZCTAs outside the join are blank.")
-    elif outside:
-        try:
-            outside_adults = fetch_adults(year, outside)
-        except (Exception, SystemExit) as exc:
-            print(
-                f"ACS {year} adults for ZCTAs outside the join failed "
-                f"({census.public_error(exc)}). 5-mile adults that need them are blank."
-            )
-        print(
-            f"{len(outside)} ZCTAs within {RADIUS_MILES:g} miles are outside the join; "
-            f"ACS {year} adults found for "
-            f"{sum(value is not None for value in outside_adults.values())}."
-        )
-    competition = competition_by_zip(areas, providers, centroids, outside_adults, near)
+    stored = stored_competition() if competition is None else {}
 
     cache = load_cache(args.cache) or cache_from_table()
     trends = refresh_trends(
@@ -1097,7 +1181,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Trends {procedure!r}: weekly {entry.dma_status}; cities {entry.city_status}.")
 
     updated_at = dataset_stamp.stamp()
-    rows = build_rows(areas, procedures, competition, trends, competition_pulled_at, updated_at)
+    rows = build_rows(
+        areas, procedures, competition, trends, competition_pulled_at, updated_at, stored
+    )
+    if competition is None:
+        kept = sum(row["competition_status"] == STATUS_KEPT for row in rows)
+        print(f"Competition: {kept} of {len(rows)} rows kept their last good values.")
     write_csv(rows, args.output)
     print(f"Wrote {len(rows)} rows to {args.output.name}.")
     if not database_url():

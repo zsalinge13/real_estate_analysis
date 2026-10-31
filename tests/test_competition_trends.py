@@ -7,6 +7,7 @@ import json
 import re
 import tempfile
 import unittest
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -436,19 +437,113 @@ class TrendsTests(unittest.TestCase):
         self.assertEqual(seed, set(ct.TRENDS_TERMS))
 
 
+class CaliforniaWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        text = (ROOT / ".github/workflows/load-california.yml").read_text()
+        self.text = text
+        self.job = text.split("\n  competition_trends:\n", 1)[1]
+
+    def test_runs_after_both_join_and_rank_jobs_on_every_trigger(self):
+        self.assertIn("needs: [join_rank_full, load_census_year]", self.job)
+        self.assertEqual(self.job.splitlines()[2], "    if: ${{ !cancelled() }}")
+        self.assertNotIn("github.event_name", self.job)
+        for trigger in ("schedule:", "workflow_dispatch:", "workflow_run:"):
+            self.assertIn(trigger, self.text)
+        self.assertLess(
+            self.text.rindex("python rank_cash_pay_zips.py"), self.text.index("python pull_competition_trends.py")
+        )
+
+    def test_failures_never_fail_the_run_and_the_artifact_still_uploads(self):
+        header = self.job.split("    steps:", 1)[0]
+        self.assertIn("continue-on-error: true", header)
+        build = self.job.split("- name: Build competition_trends", 1)[1].split("- name:", 1)[0]
+        self.assertIn("continue-on-error: true", build)
+        self.assertIn("CENSUS_API_KEY: ${{ secrets.CENSUS_API_KEY }}", build)
+        self.assertIn("--join inputs/join/zip_census_redfin_join.csv", build)
+        self.assertIn("--procedures inputs/fees/procedure_surgeon_fees.csv", build)
+        backup = self.job.split("- name: Export the last good competition_trends", 1)[1].split("- name:", 1)[0]
+        self.assertIn("hashFiles('competition_trends.csv') == ''", backup)
+        self.assertIn("python export_supabase_backup.py competition_trends", backup)
+        upload = self.job.split("- name: Upload competition trends CSV", 1)[1]
+        self.assertIn("if: ${{ !cancelled() }}", upload)
+        self.assertRegex(upload, r"name: competition-trends\n\s+path: competition_trends.csv\n\s+retention-days: 90")
+
+    def test_the_four_existing_artifacts_are_unchanged(self):
+        before = self.text.split("\n  competition_trends:\n", 1)[0]
+        for name in ("redfin-real-estate-value", "zip-census-redfin-join", "cash-pay-zip-rank", "procedure-surgeon-fees"):
+            self.assertIn(f"name: {name}", before)
+        self.assertNotIn("competition", before.split("jobs:", 1)[1])
+
+
+class FallbackTests(unittest.TestCase):
+    def setUp(self):
+        self.areas = [
+            ct.ZipArea("90210", "beverly hills", 20000, "Los Angeles", Decimal("0.00"), acs_year=2024),
+            ct.ZipArea("92618", "irvine", 30000, "Orange", Decimal("49.21"), acs_year=2024),
+        ]
+        self.points = {"90210": (34.103, -118.4105), "92618": (33.6704, -117.7307)}
+
+    def test_nppes_failure_keeps_last_good_values(self):
+        def broken(_codes):
+            raise urllib.error.URLError("down")
+
+        self.assertIsNone(ct.pull_competition(self.areas, lambda: self.points, broken, lambda y, c: {}))
+        old = datetime(2026, 10, 26, tzinfo=timezone.utc)
+        stored = {
+            ("90210", "liposuction"): {
+                **{name: None for name in ct.COMPETITION_COUNT_COLUMNS},
+                "plastic_surgeon_count": 7,
+                "competition_pulled_at": old,
+            }
+        }
+        rows = ct.build_rows(self.areas, ["liposuction"], None, {}, NOW, NOW, stored)
+        kept, missing = rows
+        self.assertEqual(
+            (kept["competition_status"], kept["plastic_surgeon_count"], kept["competition_pulled_at"]),
+            (ct.STATUS_KEPT, 7, old),
+        )
+        self.assertEqual(kept["adult_population"], 20000)
+        self.assertEqual((missing["competition_status"], missing["plastic_surgeon_count"]), (ct.STATUS_UNAVAILABLE, None))
+        self.assertEqual(missing["county"], "Orange")
+
+    def test_gazetteer_failure_is_caught(self):
+        def broken():
+            raise SystemExit("Census gazetteer download returned HTTP 503")
+
+        self.assertIsNone(ct.pull_competition(self.areas, broken, lambda c: {}, lambda y, c: {}))
+
+    def test_success_marks_rows_new(self):
+        comp = ct.pull_competition(self.areas, lambda: self.points, lambda c: {}, lambda y, c: {})
+        rows = ct.build_rows(self.areas, ["liposuction"], comp, {}, NOW, NOW)
+        self.assertEqual({r["competition_status"] for r in rows}, {ct.STATUS_NEW})
+        self.assertEqual({r["competition_pulled_at"] for r in rows}, {NOW})
+
+    def test_trends_are_asked_about_once_a_week(self):
+        self.assertGreater(ct.TRENDS_REUSE_AGE, timedelta(days=6))
+        self.assertLess(ct.TRENDS_REUSE_AGE, timedelta(days=7))
+        entry = ct.TrendsEntry(term="liposuction", dma=ct.TrendsPart({"latest_avg": 1.0}, (NOW - timedelta(days=6, hours=20)).isoformat()))
+        entry.city = ct.TrendsPart({}, (NOW - timedelta(days=6)).isoformat())
+        out = ct.refresh_trends(["liposuction"], {"liposuction": entry}, None, NOW)["liposuction"]
+        self.assertEqual((out.dma_status, out.city_status), (ct.STATUS_KEPT, ct.STATUS_RECENT))
+        self.assertEqual(out.dma.pulled_at, entry.dma.pulled_at)
+
+
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.workflow = (ROOT / ".github/workflows/pull-competition-trends.yml").read_text()
 
-    def test_weekly_schedule_without_a_chain(self):
-        self.assertIn('cron: "43 18 * * 1"', self.workflow)
+    def test_manual_refresh_only(self):
         self.assertIn("workflow_dispatch:", self.workflow)
+        self.assertNotIn("schedule:", self.workflow)
+        self.assertNotIn("cron:", self.workflow)
         self.assertNotIn("workflow_run:", self.workflow)
         self.assertIn("cancel-in-progress: false", self.workflow)
 
-    def test_artifacts_kept_90_days(self):
-        for name in ("competition-trends", "competition-trends-cache"):
-            self.assertRegex(self.workflow, rf"name: {name}\n\s+path: [^\n]+\n\s+retention-days: 90")
+    def test_artifact_kept_90_days_and_trends_come_from_supabase(self):
+        self.assertRegex(
+            self.workflow, r"name: competition-trends\n\s+path: [^\n]+\n\s+retention-days: 90"
+        )
+        self.assertNotIn("competition-trends-cache", self.workflow)
 
     def test_reads_the_join_and_fees_from_load_california(self):
         self.assertIn("--workflow load-california.yml", self.workflow)
