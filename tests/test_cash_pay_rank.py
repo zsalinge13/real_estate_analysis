@@ -374,7 +374,7 @@ class BulletTests(unittest.TestCase):
         self.assertTrue(young[1].header.startswith("35 to 44. "))
         self.assertEqual(
             young[0].insight,
-            "40.0% of adults are ages 18 to 34. Household income $300 and listing price "
+            "40.0% of adults are ages 18 to 34. Household income $300 and median listing price "
             "per square foot $640 are at or above those middles. Women are 75.0% of residents.",
         )
         for row in young + older:
@@ -383,7 +383,7 @@ class BulletTests(unittest.TestCase):
             self.assertNotRegex(row.insight, r"^\s*(- )?\d+\. ")
         self.assertEqual([row.zip_code for row in older], ["90040", "90040"])
         self.assertTrue(older[0].header.startswith("45 to 54. "))
-        self.assertTrue(older[1].header.startswith("55 and older. Listing price per square foot"))
+        self.assertTrue(older[1].header.startswith("55 and older. Median listing price per square foot"))
         self.assertIn("per-person income $200", older[1].insight)
         self.assertIn("$800", older[1].insight)
         self.assertEqual(rows("custom procedure"), [])
@@ -422,6 +422,10 @@ class BulletTests(unittest.TestCase):
             "state",
             "zip_code",
             "insight",
+            "household_income",
+            "median_listing_price_per_square_foot",
+            "age_range",
+            "sex",
         ]
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "procedure_surgeon_fees.csv"
@@ -430,7 +434,7 @@ class BulletTests(unittest.TestCase):
                 [
                     (2024, "facelift", 8000) + stored,
                     (2024, "custom procedure", 100) + rank.bullet_update([]),
-                    (2025, "facelift", None, None, None, None, None, None, None),
+                    (2025, "facelift", None) + (None,) * 10,
                 ],
                 path,
             )
@@ -627,6 +631,94 @@ class AffordabilityTests(unittest.TestCase):
         self.assertEqual(by_name["liposuction"][1], [1])
 
 
+class MeasureColumnTests(unittest.TestCase):
+    def setUp(self):
+        self.screens = rank.rank_personas(
+            [
+                join_row(
+                    "90292",
+                    zip_name="marina del rey, ca",
+                    median_household_income="146167",
+                    per_capita_income="120000",
+                    median_listing_price="2000000",
+                    median_listing_price_per_square_foot="857.5",
+                    population_35_44="29",
+                    population_55_64="20",
+                    population_65_plus="10",
+                    adult_population="100",
+                    female_population="538",
+                    male_population="462",
+                )
+            ]
+        )
+
+    def test_columns_match_the_values_in_the_insight(self):
+        rows = rank.bullet_rows("arm lift", self.screens, Decimal(8250))
+        self.assertEqual([row.age_range for row in rows], ["35 to 44", "55 and older"])
+        for row in rows:
+            self.assertEqual(row.household_income, 146167)
+            self.assertEqual(row.median_listing_price_per_square_foot, Decimal("857.5"))
+            self.assertEqual(row.sex, Decimal("53.8"))
+            self.assertIn(f"Women are {row.sex}% of residents.", row.insight)
+            self.assertIn("median listing price per square foot $857.50", row.insight.lower())
+        self.assertIn("Household income $146,167", rows[0].insight)
+        self.assertTrue(rows[1].header.startswith("55 and older. "))
+
+    def test_blank_female_share_leaves_sex_blank(self):
+        screens = rank.rank_personas(
+            [
+                join_row(
+                    "90012",
+                    median_household_income="300000",
+                    population_35_44="40",
+                    adult_population="100",
+                    female_population="",
+                )
+            ]
+        )
+        row = rank.bullet_rows("tummy tuck", screens, Decimal(10750))[0]
+        self.assertIsNone(row.sex)
+        self.assertNotIn("Women are", row.insight)
+
+    def test_stored_lists_rebuild_the_measure_columns(self):
+        found = rank.bullet_rows("arm lift", self.screens, Decimal(8250))
+        columns = ["report_year", "procedure"] + list(rank.BULLET_CSV_COLUMNS)
+        expanded = rank.expand_marketing_bullet_rows(
+            columns, [(2024, "arm lift") + rank.bullet_update(found)]
+        )
+        tail = [row[-4:] for row in expanded]
+        self.assertEqual(
+            tail,
+            [
+                (146167, Decimal("857.5"), "35 to 44", Decimal("53.8")),
+                (146167, Decimal("857.5"), "55 and older", Decimal("53.8")),
+            ],
+        )
+        self.assertEqual(
+            list(rank.BULLET_CSV_COLUMNS[-5:]),
+            ["insight", "household_income", "median_listing_price_per_square_foot", "age_range", "sex"],
+        )
+
+    def test_text_never_says_plain_listing_price(self):
+        thin = rank.rank_personas([join_row("90001", active_listing_count="1")])
+        texts = []
+        for screens in (self.screens, thin):
+            for procedure in rank.PROCEDURE_PERSONAS:
+                for price in (None, Decimal(1000)):
+                    for row in rank.bullet_rows(procedure, screens, price):
+                        texts += [row.header, row.insight]
+            for screen in screens:
+                texts.append(rank.screen_header(screen, Decimal(1000)))
+        self.assertTrue(any("median listing price per square foot" in text.lower() for text in texts))
+        for text in texts:
+            lowered = text.lower()
+            self.assertEqual(
+                lowered.count("listing price"),
+                lowered.count("median listing price per square foot"),
+                text,
+            )
+
+
 class BulletYearTests(unittest.TestCase):
     def test_join_acs_year_is_the_preferred_report_year(self):
         self.assertEqual(
@@ -738,7 +830,7 @@ class BulletYearTests(unittest.TestCase):
             for _sql, batch in cursor.statements
             if isinstance(batch, list) and batch
         )
-        headers, ranks, cities, states, zips, insights, report_year, name = updates[0]
+        headers, ranks, cities, states, zips, insights, incomes, prices, ages, sexes, report_year, name = updates[0]
         self.assertEqual((len(updates), report_year, name), (1, 2024, "rhinoplasty"))
         self.assertTrue(headers.startswith("18 to 34. "))
         self.assertNotIn("\n", headers)
@@ -1083,11 +1175,25 @@ class ProcedureFeeExportTests(unittest.TestCase):
             "state",
             "zip_code",
             "insight",
+            "household_income",
+            "median_listing_price_per_square_foot",
+            "age_range",
+            "sex",
         ]
         moment = datetime(2026, 10, 27, 17, 0, tzinfo=timezone.utc)
         headers = "18 to 34. Ranked.\n35 to 44. Ranked."
-        lists = ([1, 1], ["marina del rey", "pasadena"], ["ca", "ca"], ["90292", "90012"], ["Young.", "Thirties."])
-        blank = (None,) * 5
+        lists = (
+            [1, 1],
+            ["marina del rey", "pasadena"],
+            ["ca", "ca"],
+            ["90292", "90012"],
+            ["Young.", "Thirties."],
+            [146167, 98000],
+            [Decimal("858"), Decimal("612.5")],
+            ["18 to 34", "35 to 44"],
+            [Decimal("53.8"), None],
+        )
+        blank = (None,) * 9
         table_rows = [
             (2024, "facelift", 10, 1000, 2000, "national", "https://example.test/2024", moment, None, "older") + blank,
             (2024, "rhinoplasty", 11, 1100, 2100, "national", "https://example.test/2024", moment, headers, "older") + lists,
@@ -1102,7 +1208,18 @@ class ProcedureFeeExportTests(unittest.TestCase):
                 self.assertEqual(
                     list(reader.fieldnames),
                     [name for name in columns if name not in rank.BULLET_CSV_COLUMNS]
-                    + ["marketing_bullets", "rank", "city", "state", "zip_code", "insight"],
+                    + [
+                        "marketing_bullets",
+                        "rank",
+                        "city",
+                        "state",
+                        "zip_code",
+                        "insight",
+                        "household_income",
+                        "median_listing_price_per_square_foot",
+                        "age_range",
+                        "sex",
+                    ],
                 )
                 written = list(reader)
         self.assertEqual(count, 4)
@@ -1120,6 +1237,18 @@ class ProcedureFeeExportTests(unittest.TestCase):
                 ("18 to 34. Ranked.", "1", "marina del rey", "ca", "90292", "Young."),
                 ("35 to 44. Ranked.", "1", "pasadena", "ca", "90012", "Thirties."),
                 ("", "", "", "", "", ""),
+            ],
+        )
+        self.assertEqual(
+            [
+                (row["household_income"], row["median_listing_price_per_square_foot"], row["age_range"], row["sex"])
+                for row in written
+            ],
+            [
+                ("", "", "", ""),
+                ("146167", "858", "18 to 34", "53.8"),
+                ("98000", "612.5", "35 to 44", ""),
+                ("", "", "", ""),
             ],
         )
         self.assertEqual(written[1]["surgeon_fee_low"], "1100")

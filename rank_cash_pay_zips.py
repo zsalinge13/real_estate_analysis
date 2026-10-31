@@ -19,7 +19,8 @@ procedure. A procedure with a blank fee is not screened. cash_pay_zip_rank
 keeps the persona ranking without this screen.
 The stored form is one entry per ranked ZIP, in persona-list order:
 marketing_bullets has one line per ZIP holding that ZIP's age-group header
-sentence, and rank, city, state, zip_code, and insight are same-order lists.
+sentence, and rank, city, state, zip_code, insight, household_income,
+median_listing_price_per_square_foot, age_range, and sex are same-order lists.
 A group with no ranked ZIP adds no entry.
 After that write succeeds, the same run exports every column of
 procedure_surgeon_fees for the chosen report year and every other report
@@ -60,13 +61,17 @@ BULLET_LIST_COLUMNS = (
     ("state", "text[]"),
     ("zip_code", "text[]"),
     ("insight", "text[]"),
+    ("household_income", "integer[]"),
+    ("median_listing_price_per_square_foot", "numeric[]"),
+    ("age_range", "text[]"),
+    ("sex", "numeric[]"),
 )
 BULLET_LIST_NAMES = tuple(name for name, _sql_type in BULLET_LIST_COLUMNS)
 BULLET_CSV_COLUMNS = ("marketing_bullets",) + BULLET_LIST_NAMES
 
 # Equal age shares are the close case. The higher cash signal ranks first.
-# Household income is that signal for working-age personas. Listing price
-# per square foot is that signal for ages 55 and older. The female share
+# Household income is that signal for working-age personas. Median listing
+# price per square foot is that signal for ages 55 and older. The female share
 # is not a rank key.
 
 
@@ -306,9 +311,15 @@ def format_money(value: Decimal) -> str:
     return f"${value:,.2f}"
 
 
+def percent_points(share: Decimal | None) -> Decimal | None:
+    """A share as percentage points to one decimal, the number the text shows."""
+    if share is None:
+        return None
+    return (share * Decimal(100)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+
+
 def format_percent(share: Decimal) -> str:
-    points = (share * Decimal(100)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
-    return f"{points}%"
+    return f"{percent_points(share)}%"
 
 
 def read_join_csv(path: Path) -> list[dict[str, str]]:
@@ -507,6 +518,10 @@ class BulletRow:
     state: str
     zip_code: str
     insight: str
+    household_income: int | None = None
+    median_listing_price_per_square_foot: Decimal | None = None
+    age_range: str | None = None
+    sex: Decimal | None = None
 
 
 def split_place(row: dict) -> tuple[str, str]:
@@ -523,27 +538,27 @@ def screen_header(screen: PersonaRank, price: Decimal | None = None) -> str:
     if screen.household_income_middle is None:
         return (
             f"{persona.label}. No ZIP had a published age count, adult population, "
-            "household income, per-person income, listing price per square foot, and at least "
+            "household income, per-person income, median listing price per square foot, and at least "
             f"{MIN_ACTIVE_LISTINGS} active listings."
         )
     if persona.cash == "working":
         middles = (
             f"household income middle {format_money(screen.household_income_middle)}, "
-            f"listing price per square foot middle {format_money(screen.listing_price_middle)}"
+            f"median listing price per square foot middle {format_money(screen.listing_price_middle)}"
         )
-        rule = "Household income and the listing price per square foot are both at or above"
+        rule = "Household income and the median listing price per square foot are both at or above"
         failed = (
-            "No ZIP has both household income and listing price per square foot at or above "
+            "No ZIP has both household income and median listing price per square foot at or above "
             "the middle of Los Angeles County ZIPs in this screen"
         )
     else:
         middles = (
-            f"listing price per square foot middle {format_money(screen.listing_price_middle)}, "
+            f"median listing price per square foot middle {format_money(screen.listing_price_middle)}, "
             f"per-person income middle {format_money(screen.per_capita_income_middle)}"
         )
-        rule = "Listing price per square foot and per-person income are both at or above"
+        rule = "Median listing price per square foot and per-person income are both at or above"
         failed = (
-            "No ZIP has both listing price per square foot and per-person income at or above "
+            "No ZIP has both median listing price per square foot and per-person income at or above "
             "the middle of Los Angeles County ZIPs in this screen"
         )
     if not screen.rows:
@@ -571,13 +586,13 @@ def zip_insight(screen: PersonaRank, row: dict, price: Decimal | None = None) ->
         insight = (
             f"{share} of adults are {screen.persona.age_phrase}. "
             f"Household income {format_money(Decimal(row['median_household_income']))} "
-            f"and listing price per square foot {format_money(row['median_listing_price_per_square_foot'])} "
+            f"and median listing price per square foot {format_money(row['median_listing_price_per_square_foot'])} "
             "are at or above those middles."
         )
     else:
         insight = (
             f"{share} of adults are {screen.persona.age_phrase}. "
-            f"Listing price per square foot {format_money(row['median_listing_price_per_square_foot'])} and "
+            f"Median listing price per square foot {format_money(row['median_listing_price_per_square_foot'])} and "
             f"per-person income {format_money(Decimal(row['per_capita_income']))} "
             "are at or above those middles."
         )
@@ -617,6 +632,10 @@ def render_screen(screen: PersonaRank, price: Decimal | None = None) -> list[Bul
                 state=state,
                 zip_code=str(row["zip"]),
                 insight=zip_insight(screen, row, price),
+                household_income=row["median_household_income"],
+                median_listing_price_per_square_foot=row["median_listing_price_per_square_foot"],
+                age_range=screen.persona.label,
+                sex=percent_points(row.get("female_share")),
             )
         )
     return rows
@@ -879,6 +898,10 @@ def bullet_update(rows: list[BulletRow]) -> tuple:
         [row.state for row in rows],
         [row.zip_code for row in rows],
         [row.insight for row in rows],
+        [row.household_income for row in rows],
+        [row.median_listing_price_per_square_foot for row in rows],
+        [row.age_range for row in rows],
+        [row.sex for row in rows],
     )
 
 
