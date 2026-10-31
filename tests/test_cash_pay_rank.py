@@ -307,7 +307,7 @@ class BulletTests(unittest.TestCase):
             [
                 join_row(
                     "90012",
-                    zip_name="Pasadena",
+                    zip_name="pasadena, ca",
                     median_household_income="300",
                     per_capita_income="20",
                     median_listing_price="300",
@@ -335,7 +335,7 @@ class BulletTests(unittest.TestCase):
                 ),
                 join_row(
                     "90040",
-                    zip_name="Older Hills",
+                    zip_name="older hills, ca",
                     median_household_income="50",
                     per_capita_income="200",
                     median_listing_price="400",
@@ -352,69 +352,48 @@ class BulletTests(unittest.TestCase):
         )
 
     def test_bullets_follow_the_procedure_persona_lists(self):
-        young = rank.marketing_bullets("breast augmentation", self.screens)
-        same_young = rank.marketing_bullets("rhinoplasty", self.screens)
-        body = rank.marketing_bullets("buttock augmentation with fat grafting", self.screens)
-        older = rank.marketing_bullets("facelift", self.screens)
-        same_older = rank.marketing_bullets("eyelid surgery", self.screens)
-        lift = rank.marketing_bullets("breast lift", self.screens)
-        self.assertEqual(young, same_young)
-        self.assertEqual(young, body)
-        self.assertEqual(older, same_older)
-        self.assertEqual(older, rank.marketing_bullets("forehead lift", self.screens))
-        self.assertEqual(older, rank.marketing_bullets("neck lift", self.screens))
-        self.assertEqual(
-            rank.marketing_bullets("arm lift", self.screens),
-            rank.marketing_bullets("thigh lift", self.screens),
-        )
-        self.assertEqual(lift, rank.marketing_bullets("tummy tuck", self.screens))
-        self.assertEqual(
-            rank.marketing_bullets("liposuction", self.screens),
-            rank.marketing_bullets("breast reduction", self.screens),
-        )
-        self.assertIn("\nPasadena: 40.0% of adults", young)
-        self.assertNotIn("90012", young)
-        self.assertIn("18 to 34", young)
-        self.assertIn("35 to 44", young)
-        self.assertNotIn("55 and older", young)
-        self.assertNotIn("Older Hills", young)
-        self.assertNotIn("Compton", young)
-        self.assertIn("Household income", young)
-        self.assertIn("listing price per square foot", young)
-        self.assertIn("$640", young)
-        self.assertIn("at or above", young)
-        self.assertIn("Women are 75.0% of residents.", young)
-        self.assertNotIn("per-person income", young)
-        self.assertIn("\nOlder Hills: ", older)
-        self.assertNotIn("90040", older)
-        self.assertIn("45 to 54", older)
-        self.assertIn("55 and older", older)
-        self.assertNotIn("18 to 34", older)
-        self.assertNotIn("Pasadena", older)
-        self.assertIn("per-person income", older)
-        self.assertIn("listing price per square foot", older)
-        self.assertIn("$800", older)
-        self.assertTrue(older.splitlines()[1].startswith("Older Hills: "))
+        def rows(name):
+            return rank.bullet_rows(name, self.screens)
 
-    def test_zip_lines_carry_rank_and_zip_outside_the_text(self):
-        lines = rank.bullet_lines("breast augmentation", self.screens)
+        young = rows("breast augmentation")
+        older = rows("facelift")
+        self.assertEqual(young, rows("rhinoplasty"))
+        self.assertEqual(young, rows("buttock augmentation with fat grafting"))
+        self.assertEqual(older, rows("eyelid surgery"))
+        self.assertEqual(older, rows("forehead lift"))
+        self.assertEqual(older, rows("neck lift"))
+        self.assertEqual(rows("arm lift"), rows("thigh lift"))
+        self.assertEqual(rows("breast lift"), rows("tummy tuck"))
+        self.assertEqual(rows("liposuction"), rows("breast reduction"))
         self.assertEqual(
-            [(line.rank, line.zip_code) for line in lines],
-            [(None, None), (1, "90012"), (None, None), (1, "90012")],
+            [(row.rank, row.city, row.state, row.zip_code) for row in young],
+            [(1, "pasadena", "ca", "90012"), (1, "pasadena", "ca", "90012")],
         )
-        for line in lines:
-            self.assertNotRegex(line.text, r"^\s*(- )?\d+\. ")
-            self.assertNotIn("(90012)", line.text)
-        self.assertTrue(lines[1].text.startswith("Pasadena: 40.0% of adults"))
-        custom = rank.bullet_lines("custom procedure", self.screens)
-        self.assertEqual([(line.rank, line.zip_code) for line in custom], [(None, None)])
+        self.assertTrue(young[0].header.startswith("18 to 34. Household income"))
+        self.assertIn("Ranked by the share of adults ages 18 to 34.", young[0].header)
+        self.assertTrue(young[1].header.startswith("35 to 44. "))
+        self.assertEqual(
+            young[0].insight,
+            "40.0% of adults are ages 18 to 34. Household income $300 and listing price "
+            "per square foot $640 are at or above those middles. Women are 75.0% of residents.",
+        )
+        for row in young + older:
+            self.assertNotIn(row.zip_code, row.insight)
+            self.assertNotIn(row.city, row.insight)
+            self.assertNotRegex(row.insight, r"^\s*(- )?\d+\. ")
+        self.assertEqual([row.zip_code for row in older], ["90040", "90040"])
+        self.assertTrue(older[0].header.startswith("45 to 54. "))
+        self.assertTrue(older[1].header.startswith("55 and older. Listing price per square foot"))
+        self.assertIn("per-person income $200", older[1].insight)
+        self.assertIn("$800", older[1].insight)
+        self.assertEqual(rows("custom procedure"), [])
 
-    def test_zip_line_without_a_name_starts_with_the_reason(self):
+    def test_group_without_a_ranked_zip_adds_no_row(self):
         screens = rank.rank_personas(
             [
                 join_row(
                     "90012",
-                    zip_name="",
+                    zip_name="pasadena, ca",
                     median_household_income="300",
                     median_listing_price="300",
                     population_18_34="40",
@@ -422,71 +401,72 @@ class BulletTests(unittest.TestCase):
                 )
             ]
         )
-        line = rank.bullet_lines("rhinoplasty", screens)[1]
-        self.assertEqual((line.rank, line.zip_code), (1, "90012"))
-        self.assertTrue(line.text.startswith("40.0% of adults"))
+        found = rank.bullet_rows("rhinoplasty", screens)
+        self.assertEqual([row.header.split(".")[0] for row in found], ["18 to 34"])
 
-    def test_tableau_file_writes_one_row_per_bullet(self):
-        bullets = rank.bullet_lines("facelift", self.screens)
-        text = "\n".join(line.text for line in bullets)
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        zip_lines = [line.text for line in bullets if line.rank is not None]
-        self.assertGreaterEqual(len(zip_lines), 1)
-        self.assertIn("\n", text)
+    def test_city_and_state_come_from_the_zip_name(self):
+        self.assertEqual(rank.split_place({"zip_name": "marina del rey, ca"}), ("marina del rey", "ca"))
+        self.assertEqual(rank.split_place({"zip_name": "Pasadena"}), ("Pasadena", ""))
+        self.assertEqual(rank.split_place({"zip_name": ""}), ("", ""))
+
+    def test_tableau_file_writes_one_row_per_zip(self):
+        found = rank.bullet_rows("facelift", self.screens)
+        stored = rank.bullet_update(found)
         columns = [
             "report_year",
             "procedure",
             "surgeon_fee_low",
             "marketing_bullets",
             "rank",
+            "city",
+            "state",
             "zip_code",
+            "insight",
         ]
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "procedure_surgeon_fees.csv"
             count = rank.write_procedure_fee_csv(
                 columns,
                 [
-                    (
-                        2024,
-                        "facelift",
-                        8000,
-                        text,
-                        [line.rank for line in bullets],
-                        [line.zip_code for line in bullets],
-                    ),
-                    (2025, "facelift", None, None, None, None),
+                    (2024, "facelift", 8000) + stored,
+                    (2024, "custom procedure", 100) + rank.bullet_update([]),
+                    (2025, "facelift", None, None, None, None, None, None, None),
                 ],
                 path,
             )
             raw = path.read_text(encoding="utf-8")
             with path.open(newline="", encoding="utf-8") as handle:
-                written = list(csv.DictReader(handle))
-        self.assertEqual(count, len(lines) + 1)
+                reader = csv.DictReader(handle)
+                self.assertEqual(list(reader.fieldnames), columns)
+                written = list(reader)
+        self.assertEqual(count, len(found) + 2)
         self.assertEqual(len(raw.splitlines()), len(written) + 1)
-        bullet_rows = written[: len(lines)]
-        self.assertEqual([row["marketing_bullets"] for row in bullet_rows], lines)
+        zip_rows = written[: len(found)]
         self.assertEqual(
-            [row["marketing_bullets"] for row in bullet_rows if row["rank"]],
-            zip_lines,
+            [
+                (row["marketing_bullets"], row["rank"], row["city"], row["state"], row["zip_code"], row["insight"])
+                for row in zip_rows
+            ],
+            [
+                (item.header, str(item.rank), item.city, item.state, item.zip_code, item.insight)
+                for item in found
+            ],
         )
-        self.assertEqual(
-            [(row["rank"], row["zip_code"]) for row in bullet_rows],
-            [("" if line.rank is None else str(line.rank), line.zip_code or "") for line in bullets],
-        )
-        self.assertEqual(bullet_rows[1]["rank"], "1")
-        self.assertEqual(bullet_rows[1]["zip_code"], "90040")
-        self.assertEqual((written[-1]["rank"], written[-1]["zip_code"]), ("", ""))
+        self.assertTrue(all(row["rank"] for row in zip_rows))
         self.assertTrue(
-            all(row["report_year"] == "2024" and row["procedure"] == "facelift" for row in bullet_rows)
+            all(row["report_year"] == "2024" and row["procedure"] == "facelift" and row["surgeon_fee_low"] == "8000" for row in zip_rows)
         )
-        self.assertTrue(all("\n" not in row["marketing_bullets"] and "\r" not in row["marketing_bullets"] for row in written))
+        for row in written:
+            self.assertTrue(all("\n" not in value and "\r" not in value for value in row.values()))
+        for row in written[len(found):]:
+            self.assertEqual(
+                [row[name] for name in rank.BULLET_CSV_COLUMNS], [""] * len(rank.BULLET_CSV_COLUMNS)
+            )
+        self.assertEqual(written[-2]["procedure"], "custom procedure")
         self.assertEqual(written[-1]["report_year"], "2025")
-        self.assertEqual(written[-1]["procedure"], "facelift")
-        self.assertEqual(written[-1]["marketing_bullets"], "")
         self.assertEqual(written[-1]["surgeon_fee_low"], "")
-        self.assertEqual(bullet_rows[0]["surgeon_fee_low"], "8000")
 
-    def test_shared_persona_lists_repeat_the_same_text(self):
+    def test_shared_persona_lists_repeat_the_same_rows(self):
         names = ["breast augmentation", "rhinoplasty", "facelift", "eyelid surgery"]
         bullets = rank.bullets_by_procedure(names, self.screens)
         self.assertIs(bullets["breast augmentation"], bullets["rhinoplasty"])
@@ -598,23 +578,23 @@ class BulletYearTests(unittest.TestCase):
             (sql, params) for sql, params in cursor.statements if "marketing_bullets = NULL" in sql
         )
         self.assertEqual(clear, (2024,))
-        self.assertIn("rank = NULL", clear_sql)
-        self.assertIn("zip_code = NULL", clear_sql)
+        for name in ("rank", "city", "state", "zip_code", "insight"):
+            self.assertIn(f"{name} = NULL", clear_sql)
         updates = next(
             batch
             for _sql, batch in cursor.statements
             if isinstance(batch, list) and batch
         )
-        text, ranks, zips, report_year, name = updates[0]
+        headers, ranks, cities, states, zips, insights, report_year, name = updates[0]
         self.assertEqual((len(updates), report_year, name), (1, 2024, "rhinoplasty"))
-        self.assertIn("\nPasadena: ", text)
-        self.assertNotIn("(90012)", text)
-        self.assertEqual(ranks, [None, 1, None])
-        self.assertEqual(zips, [None, "90012", None])
-        self.assertEqual(len(text.split("\n")), len(ranks))
+        self.assertTrue(headers.startswith("18 to 34. "))
+        self.assertNotIn("\n", headers)
+        self.assertEqual(ranks, [1])
+        self.assertEqual((cities, states, zips), (["Pasadena"], [""], ["90012"]))
+        self.assertTrue(insights[0].startswith("40.0% of adults are ages 18 to 34."))
         joined = " ".join(sql for sql, _params in cursor.statements)
-        self.assertIn("ADD COLUMN IF NOT EXISTS rank integer[]", joined)
-        self.assertIn("ADD COLUMN IF NOT EXISTS zip_code text[]", joined)
+        for name, sql_type in rank.BULLET_LIST_COLUMNS:
+            self.assertIn(f"ADD COLUMN IF NOT EXISTS {name} {sql_type}", joined)
         self.assertNotIn("RENAME", joined)
         for sql, _params in cursor.statements:
             self.assertNotIn("surgeon_fee_low", sql)
@@ -643,7 +623,7 @@ class BulletYearTests(unittest.TestCase):
         )
         self.assertIn("ALTER COLUMN rank TYPE integer[]", joined)
         self.assertNotIn("DROP", joined.upper())
-        self.assertIn("ADD COLUMN IF NOT EXISTS zip_code text[]", joined)
+        self.assertIn("ADD COLUMN IF NOT EXISTS insight text[]", joined)
 
     def test_bullet_rank_and_rank_together_are_refused(self):
         cursor = self._column_cursor({"bullet_rank": "_int4", "rank": "_int4"})
@@ -757,18 +737,15 @@ class SaveTests(unittest.TestCase):
             for sql, rows in statements
             if isinstance(rows, list) and rows and "marketing_bullets = %s" in sql
         )
-        by_name = {procedure: text for text, _r, _z, _year, procedure in updates}
-        ranks = {procedure: values for _t, values, _z, _year, procedure in updates}
-        zips = {procedure: values for _t, _r, values, _year, procedure in updates}
+        by_name = {row[-1]: row for row in updates}
         self.assertEqual(set(by_name), {"facelift", "rhinoplasty", "custom procedure"})
-        self.assertTrue(all(row[3] == 2024 for row in updates))
-        self.assertIn("\nPasadena: ", by_name["rhinoplasty"])
-        self.assertNotIn("90012", by_name["rhinoplasty"])
-        self.assertEqual(ranks["rhinoplasty"], [None, 1, None])
-        self.assertEqual(zips["rhinoplasty"], [None, "90012", None])
-        self.assertNotIn("Pasadena", by_name["facelift"])
-        self.assertIn("no cash-pay persona list", by_name["custom procedure"])
-        self.assertEqual((ranks["custom procedure"], zips["custom procedure"]), ([None], [None]))
+        self.assertTrue(all(row[-2] == 2024 for row in updates))
+        headers, ranks, cities, _states, zips, insights = by_name["rhinoplasty"][:6]
+        self.assertTrue(headers.startswith("18 to 34. "))
+        self.assertEqual((ranks, cities, zips), ([1], ["Pasadena"], ["90012"]))
+        self.assertNotIn("90012", insights[0])
+        self.assertEqual(by_name["facelift"][:6], (None,) * 6)
+        self.assertEqual(by_name["custom procedure"][:6], (None,) * 6)
         insert = next(rows for sql, rows in statements if "INSERT INTO public.cash_pay_zip_rank" in sql)
         self.assertIs(insert[0][-1], moment)
         update_sql = next(sql for sql, rows in statements if isinstance(rows, list) and "marketing_bullets = %s" in sql)
@@ -949,15 +926,19 @@ class ProcedureFeeExportTests(unittest.TestCase):
             "marketing_bullets",
             "source_note",
             "rank",
+            "city",
+            "state",
             "zip_code",
+            "insight",
         ]
         moment = datetime(2026, 10, 27, 17, 0, tzinfo=timezone.utc)
-        bullet = "18 to 34. Ranked.\nPasadena: cash."
+        headers = "18 to 34. Ranked.\n35 to 44. Ranked."
+        lists = ([1, 1], ["marina del rey", "pasadena"], ["ca", "ca"], ["90292", "90012"], ["Young.", "Thirties."])
+        blank = (None,) * 5
         table_rows = [
-            (2024, "facelift", 10, 1000, 2000, "national", "https://example.test/2024", moment, None, "older", None, None),
-            (2024, "rhinoplasty", 11, 1100, 2100, "national", "https://example.test/2024", moment, None, "older", None, None),
-            (2025, "facelift", 12, None, None, "national", "https://example.test/2025", moment, "older personas", "latest", [None], [None]),
-            (2025, "rhinoplasty", 13, None, None, "national", "https://example.test/2025", moment, bullet, "latest", [None, 1], [None, "90012"]),
+            (2024, "facelift", 10, 1000, 2000, "national", "https://example.test/2024", moment, None, "older") + blank,
+            (2024, "rhinoplasty", 11, 1100, 2100, "national", "https://example.test/2024", moment, headers, "older") + lists,
+            (2025, "facelift", 12, None, None, "national", "https://example.test/2025", moment, None, "latest") + blank,
         ]
         conn = self._connection(columns, table_rows)
         with tempfile.TemporaryDirectory() as tmp:
@@ -965,34 +946,34 @@ class ProcedureFeeExportTests(unittest.TestCase):
             count = rank.export_procedure_fees(conn, path)
             with path.open(newline="", encoding="utf-8") as handle:
                 reader = csv.DictReader(handle)
-                self.assertEqual(list(reader.fieldnames), columns)
+                self.assertEqual(
+                    list(reader.fieldnames),
+                    [name for name in columns if name not in rank.BULLET_CSV_COLUMNS]
+                    + ["marketing_bullets", "rank", "city", "state", "zip_code", "insight"],
+                )
                 written = list(reader)
-        self.assertEqual(count, 5)
+        self.assertEqual(count, 4)
         self.assertEqual(
-            [row["report_year"] for row in written],
-            ["2024", "2024", "2025", "2025", "2025"],
+            [(row["report_year"], row["procedure"]) for row in written],
+            [("2024", "facelift"), ("2024", "rhinoplasty"), ("2024", "rhinoplasty"), ("2025", "facelift")],
         )
         self.assertEqual(
-            [row["procedure"] for row in written],
-            ["facelift", "rhinoplasty", "facelift", "rhinoplasty", "rhinoplasty"],
+            [
+                (row["marketing_bullets"], row["rank"], row["city"], row["state"], row["zip_code"], row["insight"])
+                for row in written
+            ],
+            [
+                ("", "", "", "", "", ""),
+                ("18 to 34. Ranked.", "1", "marina del rey", "ca", "90292", "Young."),
+                ("35 to 44. Ranked.", "1", "pasadena", "ca", "90012", "Thirties."),
+                ("", "", "", "", "", ""),
+            ],
         )
-        self.assertEqual(written[0]["marketing_bullets"], "")
-        self.assertEqual(written[1]["marketing_bullets"], "")
-        self.assertEqual(written[2]["marketing_bullets"], "older personas")
-        self.assertEqual(written[3]["marketing_bullets"], "18 to 34. Ranked.")
-        self.assertEqual(written[4]["marketing_bullets"], "Pasadena: cash.")
-        self.assertEqual(
-            [(row["rank"], row["zip_code"]) for row in written],
-            [("", ""), ("", ""), ("", ""), ("", ""), ("1", "90012")],
-        )
-        self.assertNotIn("\n", written[3]["marketing_bullets"])
-        self.assertNotIn("\n", written[4]["marketing_bullets"])
-        self.assertEqual(written[0]["source_note"], "older")
-        self.assertEqual(written[3]["source_note"], "latest")
-        self.assertEqual(written[4]["source_note"], "latest")
+        self.assertEqual(written[1]["surgeon_fee_low"], "1100")
+        self.assertEqual(written[2]["surgeon_fee_high"], "2100")
+        self.assertEqual(written[2]["source_note"], "older")
         self.assertEqual(written[0]["dataset_updated_at"], moment.isoformat())
-        self.assertEqual(written[2]["surgeon_fee_low"], "")
-        self.assertEqual(written[0]["surgeon_fee_low"], "1000")
+        self.assertEqual(written[3]["surgeon_fee_low"], "")
         sqls = [sql for sql, _params in conn.cursor_obj.statements]
         joined = "\n".join(sqls)
         self.assertNotIn("DROP", joined.upper())
@@ -1013,9 +994,15 @@ class ProcedureFeeExportTests(unittest.TestCase):
             ("procedure_surgeon_fees",),
         )
 
-    def test_export_refuses_ranks_that_do_not_match_the_lines(self):
+    def test_export_refuses_lists_that_do_not_match_the_headers(self):
         columns = ["report_year", "procedure", "marketing_bullets", "rank", "zip_code"]
-        rows = [(2024, "facelift", "Header.\nPasadena: cash.", [None], [None, "90012"])]
+        rows = [(2024, "facelift", "Header one.\nHeader two.", [1], ["90012", "90013"])]
+        with self.assertRaises(SystemExit):
+            rank.expand_marketing_bullet_rows(columns, rows)
+
+    def test_export_refuses_old_text_without_zip_rows(self):
+        columns = ["report_year", "procedure", "marketing_bullets"]
+        rows = [(2024, "facelift", "18 to 34. Header.\n- 1. pasadena, ca (90012): cash.")]
         with self.assertRaises(SystemExit):
             rank.expand_marketing_bullet_rows(columns, rows)
 
