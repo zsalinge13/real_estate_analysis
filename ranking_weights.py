@@ -25,7 +25,7 @@ Defaults:
 - women_arts_entertainment_media_share: 0.05, for face procedures and
   rhinoplasty only.
 
-Race, ethnicity, and education are never factors.
+Race, ethnicity, education, and lifestyle segment are never factors.
 """
 
 from __future__ import annotations
@@ -107,9 +107,21 @@ DRIVER_PHRASES = {
     "women_arts_entertainment_media_share": "many women in arts, entertainment, and media jobs",
 }
 
-EXCLUDED_WORDS = ("race", "ethnic", "hispanic", "latino", "white", "black", "asian", "education")
+EXCLUDED_WORDS = (
+    "race",
+    "ethnic",
+    "hispanic",
+    "latino",
+    "white",
+    "black",
+    "asian",
+    "education",
+    "lifestyle",
+    "tapestry",
+    "esri",
+)
 if any(word in factor for factor in FACTORS for word in EXCLUDED_WORDS):
-    raise SystemExit("Race, ethnicity, and education are not score factors.")
+    raise SystemExit("Race, ethnicity, education, and lifestyle segment are not score factors.")
 if set(FACTOR_LABELS) != set(FACTORS) or set(DRIVER_PHRASES) != set(FACTORS):
     raise SystemExit("Every score factor needs a label and a driver phrase.")
 

@@ -33,8 +33,8 @@ sentence, and rank, city, state, zip_code, insight, household_income,
 individual_income (ACS per-capita income),
 median_listing_price_per_square_foot, age_range, sex, and the descriptive
 columns after it, through composite_score and the score_<factor> columns,
-are same-order lists. Race, ethnicity, and education never change a screen
-or a rank. A group with no ranked ZIP adds no entry.
+are same-order lists. Race, ethnicity, education, and lifestyle segment never
+change a screen or a rank. A group with no ranked ZIP adds no entry.
 After that write succeeds, the same run exports every column of
 procedure_surgeon_fees for the chosen report year and every other report
 year. The file has one row per ranked ZIP. report_year, procedure, and the
@@ -89,6 +89,7 @@ BULLET_LIST_COLUMNS = (
     ("sex", "text[]"),
     ("race_and_ethnicity", "text[]"),
     ("education_level", "text[]"),
+    ("lifestyle_segment", "text[]"),
     ("women_in_age_range", "integer[]"),
     ("men_in_age_range", "integer[]"),
     ("women_share_of_age_range", "numeric[]"),
@@ -192,6 +193,41 @@ EDUCATION_LABELS = {
 }
 BACHELORS_OR_HIGHER = ("education_bachelors", "education_graduate_or_professional")
 MOTHER_PROCEDURES = ranking_weights.MOTHER_PROCEDURES
+# Named ACS life-stage × housing labels. Not Esri Tapestry or any paid typology.
+# Race and ethnicity are not inputs. The label never screens or ranks a ZIP.
+LIFESTYLE_OWNER_SHARE = Decimal("0.5")
+LIFESTYLE_COLLEGE_SHARE = Decimal("0.5")
+LIFESTYLE_CREATIVE_COLLEGE_SHARE = Decimal("0.4")
+LIFESTYLE_FAMILY_SHARE = Decimal("0.4")
+LIFESTYLE_ARTS_SHARE = Decimal("0.08")
+LIFESTYLE_CREATIVE_RENTERS = "Creative professional renters"
+LIFESTYLE_YOUNG_PROFESSIONAL_RENTERS = "Young professional renters"
+LIFESTYLE_AFFLUENT_FAMILIES = "Affluent families"
+LIFESTYLE_AFFLUENT_RETIREES = "Affluent retirees"
+LIFESTYLE_ESTABLISHED_HOMEOWNERS = "Established homeowners"
+LIFESTYLE_YOUNG_PROFESSIONAL_OWNERS = "Young professional owners"
+LIFESTYLE_COLLEGE_EDUCATED_OWNERS = "College-educated owners"
+LIFESTYLE_YOUNG_RENTER_HOUSEHOLDS = "Young renter households"
+LIFESTYLE_PEAK_EARNING_RENTERS = "Peak-earning renters"
+LIFESTYLE_OLDER_RENTER_HOUSEHOLDS = "Older renter households"
+LIFESTYLE_WORKING_AGE_OWNERS = "Working-age owners"
+# Specific names that add a fact the other insight sentences do not already
+# name. Generic own/rent fallbacks stay on the column and off the insight.
+LIFESTYLE_INSIGHT_SEGMENTS = frozenset(
+    {
+        LIFESTYLE_CREATIVE_RENTERS,
+        LIFESTYLE_YOUNG_PROFESSIONAL_RENTERS,
+        LIFESTYLE_AFFLUENT_FAMILIES,
+        LIFESTYLE_AFFLUENT_RETIREES,
+        LIFESTYLE_ESTABLISHED_HOMEOWNERS,
+        LIFESTYLE_YOUNG_PROFESSIONAL_OWNERS,
+        LIFESTYLE_COLLEGE_EDUCATED_OWNERS,
+    }
+)
+DESCRIBE_NOT_RANK = (
+    "Race, ethnicity, education, and lifestyle segment describe these ZIP codes "
+    "and are not used to rank them."
+)
 
 RANK_COLUMNS = (
     "procedure",
@@ -452,7 +488,94 @@ def describe_zip(row: dict[str, str]) -> dict:
         "race_and_ethnicity_share": race_share,
         "education_level": education,
         "bachelors_or_higher_share": bachelors_or_higher_share(row),
+        "lifestyle_segment": lifestyle_segment(row),
     }
+
+
+def count_fraction(part: int | None, total: int | None) -> Decimal | None:
+    """part / total as a 0–1 share. Blank without a positive total."""
+    if part is None or total is None or total <= 0:
+        return None
+    return Decimal(part) / Decimal(total)
+
+
+def largest_adult_band(young: int, peak: int, older: int) -> str:
+    """Largest of the three persona bands. A tie keeps the younger band."""
+    return max(
+        (("25–44", young), ("45–64", peak), ("65+", older)),
+        key=lambda item: item[1],
+    )[0]
+
+
+def lifestyle_from_shares(
+    largest_band: str | None,
+    owner_share: Decimal | None,
+    college_share: Decimal | None,
+    family_share: Decimal | None,
+    arts_share: Decimal | None,
+) -> str | None:
+    """First matching named ACS segment. Blank without a dominant band and tenure."""
+    if largest_band is None or owner_share is None:
+        return None
+    owns = owner_share >= LIFESTYLE_OWNER_SHARE
+    college = college_share is not None and college_share >= LIFESTYLE_COLLEGE_SHARE
+    college_creative = (
+        college_share is not None and college_share >= LIFESTYLE_CREATIVE_COLLEGE_SHARE
+    )
+    family = family_share is not None and family_share >= LIFESTYLE_FAMILY_SHARE
+    creative = arts_share is not None and arts_share >= LIFESTYLE_ARTS_SHARE
+    young = largest_band == "25–44"
+    peak = largest_band == "45–64"
+    older = largest_band == "65+"
+    if not owns and college_creative and creative:
+        return LIFESTYLE_CREATIVE_RENTERS
+    if young and not owns and college:
+        return LIFESTYLE_YOUNG_PROFESSIONAL_RENTERS
+    if owns and family and not older:
+        return LIFESTYLE_AFFLUENT_FAMILIES
+    if older and owns:
+        return LIFESTYLE_AFFLUENT_RETIREES
+    if peak and owns and college:
+        return LIFESTYLE_ESTABLISHED_HOMEOWNERS
+    if young and owns and college:
+        return LIFESTYLE_YOUNG_PROFESSIONAL_OWNERS
+    if owns and college:
+        return LIFESTYLE_COLLEGE_EDUCATED_OWNERS
+    if young and not owns:
+        return LIFESTYLE_YOUNG_RENTER_HOUSEHOLDS
+    if peak and not owns:
+        return LIFESTYLE_PEAK_EARNING_RENTERS
+    if older and not owns:
+        return LIFESTYLE_OLDER_RENTER_HOUSEHOLDS
+    if owns:
+        return LIFESTYLE_WORKING_AGE_OWNERS
+    return None
+
+
+def lifestyle_segment(row: dict) -> str | None:
+    """ZIP-level ACS lifestyle label. Blank when age bands or tenure are missing."""
+    young = as_int(row.get("population_25_44"), "population_25_44")
+    peak = as_int(row.get("population_45_64"), "population_45_64")
+    older = as_int(row.get("population_65_plus"), "population_65_plus")
+    if young is None or peak is None or older is None:
+        return None
+    owners = as_int(row.get("owner_occupied_households"), "owner_occupied_households")
+    renters = as_int(row.get("renter_occupied_households"), "renter_occupied_households")
+    occupied = None if owners is None or renters is None else owners + renters
+    mothers = as_int(row.get("mothers_with_children_under_18"), "mothers_with_children_under_18")
+    women_20_64 = as_int(row.get("women_20_64"), "women_20_64")
+    arts = as_int(
+        row.get("women_arts_design_entertainment_sports_media"),
+        "women_arts_design_entertainment_sports_media",
+    )
+    employed = as_int(row.get("employed_women"), "employed_women")
+    return lifestyle_from_shares(
+        largest_adult_band(young, peak, older),
+        count_fraction(owners, occupied),
+        bachelors_or_higher_share(row),
+        count_fraction(mothers, women_20_64),
+        count_fraction(arts, employed),
+    )
 
 
 def age_count(row: dict[str, str], persona: Persona) -> int | None:
@@ -715,6 +838,7 @@ class BulletRow:
     sex: str | None = None
     race_and_ethnicity: str | None = None
     education_level: str | None = None
+    lifestyle_segment: str | None = None
     women_in_age_range: int | None = None
     men_in_age_range: int | None = None
     women_share_of_age_range: Decimal | None = None
@@ -814,7 +938,7 @@ def screen_header(procedure: str, screen: PersonaRank, price: Decimal | None = N
         why,
         ranking_sentence(procedure, persona, price),
         practice.DISTANCE_RULE,
-        "Race, ethnicity and education describe these ZIP codes and are not used to rank them.",
+        DESCRIBE_NOT_RANK,
     ]
     if price is not None:
         sentences.append(
@@ -888,6 +1012,9 @@ def zip_insight(
     described = describe_sentence(row)
     if described:
         sentences.append(described)
+    segment = row.get("lifestyle_segment")
+    if segment in LIFESTYLE_INSIGHT_SEGMENTS:
+        sentences.append(f"Its Census lifestyle segment is {segment[0].lower()}{segment[1:]}.")
     housing = housing_work_sentence(metrics)
     if housing:
         sentences.append(housing)
@@ -1259,6 +1386,7 @@ def render_screen(
                 sex=sex_label(row.get("female_share")),
                 race_and_ethnicity=row.get("race_and_ethnicity"),
                 education_level=row.get("education_level"),
+                lifestyle_segment=row.get("lifestyle_segment"),
                 **{name: row[name] for name in DESCRIPTIVE_LIST_NAMES},
                 composite_score=row["composite_score"],
                 scores={name: row[name] for name in SCORE_COLUMNS},

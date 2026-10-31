@@ -49,6 +49,31 @@ def join_row(zip_code: str, **overrides) -> dict[str, str]:
     return row
 
 
+def lifestyle_join(zip_code: str, **overrides) -> dict[str, str]:
+    """A cash-screen ZIP with ACS counts the lifestyle label needs."""
+    defaults = {
+        "median_household_income": "300000",
+        "population_25_44": "400",
+        "population_45_64": "300",
+        "population_65_plus": "200",
+        "adult_population": "1000",
+        "owner_occupied_households": "20",
+        "renter_occupied_households": "80",
+        "education_less_than_high_school": "10",
+        "education_high_school": "10",
+        "education_some_college_or_associate": "20",
+        "education_bachelors": "40",
+        "education_graduate_or_professional": "20",
+        "mothers_with_children_under_18": "50",
+        "women_20_64": "400",
+        "employed_women": "100",
+        "women_arts_design_entertainment_sports_media": "3",
+        "women_management_business_science_arts": "60",
+    }
+    defaults.update(overrides)
+    return join_row(zip_code, **defaults)
+
+
 def persona(screens, label: str) -> rank.PersonaRank:
     return next(screen for screen in screens if screen.persona.label == label)
 
@@ -388,7 +413,7 @@ class BulletTests(unittest.TestCase):
             "and recent births per adult (4%). "
             "Only ZIP codes within 50 miles of the practice (ZIP 90210) are included, because patients "
             "rarely drive more than 50 miles to a new practice that is still building its reputation. "
-            "Race, ethnicity and education describe these ZIP codes and are not used to rank them.",
+            "Race, ethnicity, education, and lifestyle segment describe these ZIP codes and are not used to rank them.",
         )
         self.assertEqual(
             young[0].insight,
@@ -470,6 +495,7 @@ class BulletTests(unittest.TestCase):
             "sex",
             "race_and_ethnicity",
             "education_level",
+            "lifestyle_segment",
             *rank.DESCRIPTIVE_LIST_NAMES,
             "composite_score",
             *rank.SCORE_COLUMNS,
@@ -1021,6 +1047,7 @@ class MeasureColumnTests(unittest.TestCase):
             self.assertEqual(row.sex, "woman")
             self.assertEqual(row.race_and_ethnicity, "Non-Hispanic White")
             self.assertEqual(row.education_level, "Bachelor's degree")
+            self.assertIsNone(row.lifestyle_segment)
             self.assertTrue(
                 row.insight.endswith(
                     "Women are 53.8% of residents. Non-Hispanic White residents are the largest "
@@ -1029,7 +1056,7 @@ class MeasureColumnTests(unittest.TestCase):
                 row.insight,
             )
             self.assertIn(
-                " Race, ethnicity and education describe these ZIP codes and are not used to rank them. Sources: ",
+                " Race, ethnicity, education, and lifestyle segment describe these ZIP codes and are not used to rank them. Sources: ",
                 row.header,
             )
             self.assertIn("median listing price per square foot is $858", row.insight.lower())
@@ -1129,6 +1156,7 @@ class MeasureColumnTests(unittest.TestCase):
                 "sex",
                 "race_and_ethnicity",
                 "education_level",
+                "lifestyle_segment",
                 "women_in_age_range",
                 "men_in_age_range",
                 "women_share_of_age_range",
@@ -1187,16 +1215,16 @@ class MeasureColumnTests(unittest.TestCase):
             columns, [(2024, "arm lift") + rank.bullet_update(found)]
         )
         start = columns.index("household_income")
-        tail = [row[start : start + 7] for row in expanded]
+        tail = [row[start : start + 8] for row in expanded]
         self.assertEqual(
             tail,
             [
-                (146167, 120000, Decimal("857.5"), "25–44", "woman", "Non-Hispanic White", "Bachelor's degree"),
-                (146167, 120000, Decimal("857.5"), "65+", "woman", "Non-Hispanic White", "Bachelor's degree"),
+                (146167, 120000, Decimal("857.5"), "25–44", "woman", "Non-Hispanic White", "Bachelor's degree", None),
+                (146167, 120000, Decimal("857.5"), "65+", "woman", "Non-Hispanic White", "Bachelor's degree", None),
             ],
         )
         self.assertEqual(
-            list(rank.BULLET_CSV_COLUMNS[8:16]),
+            list(rank.BULLET_CSV_COLUMNS[8:17]),
             [
                 "insight",
                 "household_income",
@@ -1206,6 +1234,7 @@ class MeasureColumnTests(unittest.TestCase):
                 "sex",
                 "race_and_ethnicity",
                 "education_level",
+                "lifestyle_segment",
             ],
         )
 
@@ -1227,6 +1256,197 @@ class MeasureColumnTests(unittest.TestCase):
                 lowered.count("median listing price per square foot"),
                 text,
             )
+
+
+class LifestyleSegmentTests(unittest.TestCase):
+    def test_named_segments_follow_the_documented_rules(self):
+        cases = [
+            ({}, rank.LIFESTYLE_YOUNG_PROFESSIONAL_RENTERS),
+            (
+                {"women_arts_design_entertainment_sports_media": "12"},
+                rank.LIFESTYLE_CREATIVE_RENTERS,
+            ),
+            (
+                {
+                    "owner_occupied_households": "80",
+                    "renter_occupied_households": "20",
+                    "mothers_with_children_under_18": "200",
+                },
+                rank.LIFESTYLE_AFFLUENT_FAMILIES,
+            ),
+            (
+                {
+                    "population_25_44": "200",
+                    "population_45_64": "250",
+                    "population_65_plus": "400",
+                    "owner_occupied_households": "70",
+                    "renter_occupied_households": "30",
+                },
+                rank.LIFESTYLE_AFFLUENT_RETIREES,
+            ),
+            (
+                {
+                    "population_25_44": "200",
+                    "population_45_64": "450",
+                    "population_65_plus": "200",
+                    "owner_occupied_households": "70",
+                    "renter_occupied_households": "30",
+                    "mothers_with_children_under_18": "50",
+                },
+                rank.LIFESTYLE_ESTABLISHED_HOMEOWNERS,
+            ),
+            (
+                {
+                    "owner_occupied_households": "70",
+                    "renter_occupied_households": "30",
+                    "mothers_with_children_under_18": "50",
+                },
+                rank.LIFESTYLE_YOUNG_PROFESSIONAL_OWNERS,
+            ),
+            (
+                {
+                    "education_bachelors": "5",
+                    "education_graduate_or_professional": "5",
+                },
+                rank.LIFESTYLE_YOUNG_RENTER_HOUSEHOLDS,
+            ),
+            (
+                {
+                    "population_25_44": "200",
+                    "population_45_64": "450",
+                    "population_65_plus": "200",
+                    "education_bachelors": "5",
+                    "education_graduate_or_professional": "5",
+                },
+                rank.LIFESTYLE_PEAK_EARNING_RENTERS,
+            ),
+            (
+                {
+                    "population_25_44": "200",
+                    "population_45_64": "250",
+                    "population_65_plus": "400",
+                    "education_bachelors": "5",
+                    "education_graduate_or_professional": "5",
+                },
+                rank.LIFESTYLE_OLDER_RENTER_HOUSEHOLDS,
+            ),
+            (
+                {
+                    "owner_occupied_households": "70",
+                    "renter_occupied_households": "30",
+                    "education_bachelors": "5",
+                    "education_graduate_or_professional": "5",
+                    "mothers_with_children_under_18": "50",
+                },
+                rank.LIFESTYLE_WORKING_AGE_OWNERS,
+            ),
+        ]
+        self.assertEqual(
+            rank.lifestyle_from_shares(
+                "other", Decimal("0.7"), Decimal("0.6"), Decimal("0.1"), Decimal("0.02")
+            ),
+            rank.LIFESTYLE_COLLEGE_EDUCATED_OWNERS,
+        )
+        for overrides, expected in cases:
+            self.assertEqual(
+                rank.lifestyle_segment(lifestyle_join("90001", **overrides)),
+                expected,
+                overrides,
+            )
+        self.assertIsNone(rank.lifestyle_segment(join_row("90001")))
+        self.assertIsNone(
+            rank.lifestyle_from_shares("25–44", None, Decimal("0.6"), None, None)
+        )
+        self.assertEqual(
+            rank.largest_adult_band(10, 10, 5),
+            "25–44",
+        )
+
+    def test_label_is_on_the_fee_row_and_not_the_rank_table(self):
+        self.assertIn("lifestyle_segment", rank.BULLET_LIST_NAMES)
+        self.assertNotIn("lifestyle_segment", rank.RANK_COLUMNS)
+        self.assertNotIn("lifestyle_segment", rank.MEASURE_COLUMNS)
+        self.assertEqual(
+            rank.BULLET_LIST_NAMES[rank.BULLET_LIST_NAMES.index("education_level") + 1],
+            "lifestyle_segment",
+        )
+
+    def test_insight_names_specific_segments_and_skips_generic_fallbacks(self):
+        specific = rank.bullet_rows(
+            "rhinoplasty", rank.rank_personas([lifestyle_join("90292", zip_name="marina del rey, ca")]), Decimal(8000)
+        )[0]
+        self.assertEqual(specific.lifestyle_segment, rank.LIFESTYLE_YOUNG_PROFESSIONAL_RENTERS)
+        self.assertIn("Its Census lifestyle segment is young professional renters.", specific.insight)
+        generic = rank.bullet_rows(
+            "rhinoplasty",
+            rank.rank_personas(
+                [
+                    lifestyle_join(
+                        "90001",
+                        zip_name="los angeles, ca",
+                        education_bachelors="5",
+                        education_graduate_or_professional="5",
+                    )
+                ]
+            ),
+            Decimal(8000),
+        )[0]
+        self.assertEqual(generic.lifestyle_segment, rank.LIFESTYLE_YOUNG_RENTER_HOUSEHOLDS)
+        self.assertNotIn("lifestyle segment", generic.insight)
+
+    def test_lifestyle_describes_but_never_ranks(self):
+        professional = lifestyle_join("90001")
+        generic = lifestyle_join(
+            "90002",
+            education_bachelors="5",
+            education_graduate_or_professional="5",
+        )
+        labeled = rank.bullet_rows(
+            "tummy tuck", rank.rank_personas([professional, generic]), Decimal(10750)
+        )
+        unlabeled = rank.bullet_rows(
+            "tummy tuck",
+            rank.rank_personas(
+                [
+                    join_row(
+                        row["zip"],
+                        **{
+                            key: value
+                            for key, value in row.items()
+                            if key not in rank.EDUCATION_LABELS
+                        },
+                    )
+                    for row in (professional, generic)
+                ]
+            ),
+            Decimal(10750),
+        )
+        self.assertEqual(
+            [(row.age_range, row.rank, row.zip_code) for row in labeled],
+            [(row.age_range, row.rank, row.zip_code) for row in unlabeled],
+        )
+        self.assertEqual(
+            {row.zip_code: row.lifestyle_segment for row in labeled if row.age_range == "25–44"},
+            {
+                "90001": rank.LIFESTYLE_YOUNG_PROFESSIONAL_RENTERS,
+                "90002": rank.LIFESTYLE_YOUNG_RENTER_HOUSEHOLDS,
+            },
+        )
+        self.assertEqual(
+            {row.zip_code: row.lifestyle_segment for row in unlabeled if row.age_range == "25–44"},
+            {"90001": rank.LIFESTYLE_YOUNG_RENTER_HOUSEHOLDS, "90002": rank.LIFESTYLE_YOUNG_RENTER_HOUSEHOLDS},
+        )
+        self.assertIn("Its Census lifestyle segment is young professional renters.", labeled[0].insight)
+        self.assertNotIn("lifestyle segment", unlabeled[0].insight)
+        self.assertNotIn("tapestry", labeled[0].insight.lower())
+        self.assertNotIn("esri", labeled[0].insight.lower())
+
+    def test_census_pulls_stay_batched(self):
+        self.assertEqual(census.BATCH_SIZE, 10)
+        self.assertLessEqual(census.VARIABLE_CHUNK, 20)
+        self.assertTrue(all(len(codes) <= 50 for _name, codes in census.field_groups()))
+        self.assertNotIn("lifestyle_segment", census.COLUMNS)
+        self.assertNotIn("lifestyle_segment", census.ADDED_COLUMNS)
 
 
 class BulletYearTests(unittest.TestCase):
@@ -1357,12 +1577,13 @@ class BulletYearTests(unittest.TestCase):
             sexes,
             races,
             educations,
+            lifestyles,
             *descriptive,
             report_year,
             name,
         ) = updates[0]
         self.assertEqual(len(descriptive), len(rank.DESCRIPTIVE_LIST_NAMES) + 1 + len(rank.SCORE_COLUMNS))
-        self.assertEqual((races, educations), ([None], [None]))
+        self.assertEqual((races, educations, lifestyles), ([None], [None], [None]))
         self.assertEqual(incomes, [300000])
         self.assertEqual(individual_incomes, [80000])
         self.assertEqual((len(updates), report_year, name), (1, 2024, "rhinoplasty"))
@@ -1765,6 +1986,7 @@ class ProcedureFeeExportTests(unittest.TestCase):
             "sex",
             "race_and_ethnicity",
             "education_level",
+            "lifestyle_segment",
             *rank.DESCRIPTIVE_LIST_NAMES,
             "composite_score",
             *rank.SCORE_COLUMNS,
@@ -1787,6 +2009,7 @@ class ProcedureFeeExportTests(unittest.TestCase):
             ["woman", None],
             ["Hispanic or Latino", None],
             ["Bachelor's degree", None],
+            ["Young professional renters", None],
         ) + tuple([None, None] for _name in (*rank.DESCRIPTIVE_LIST_NAMES, "composite_score", *rank.SCORE_COLUMNS))
         blank = (None,) * (len(rank.BULLET_CSV_COLUMNS) - 1)
         table_rows = [
@@ -1820,6 +2043,7 @@ class ProcedureFeeExportTests(unittest.TestCase):
                         "sex",
                         "race_and_ethnicity",
                         "education_level",
+                        "lifestyle_segment",
                         *rank.DESCRIPTIVE_LIST_NAMES,
                         "composite_score",
                         *rank.SCORE_COLUMNS,
@@ -1853,14 +2077,15 @@ class ProcedureFeeExportTests(unittest.TestCase):
                     row["sex"],
                     row["race_and_ethnicity"],
                     row["education_level"],
+                    row["lifestyle_segment"],
                 )
                 for row in written
             ],
             [
-                ("", "", "", "", "", "", ""),
-                ("146167", "64075", "858", "25–44", "woman", "Hispanic or Latino", "Bachelor's degree"),
-                ("98000", "52010", "612.5", "25–44", "", "", ""),
-                ("", "", "", "", "", "", ""),
+                ("", "", "", "", "", "", "", ""),
+                ("146167", "64075", "858", "25–44", "woman", "Hispanic or Latino", "Bachelor's degree", "Young professional renters"),
+                ("98000", "52010", "612.5", "25–44", "", "", "", ""),
+                ("", "", "", "", "", "", "", ""),
             ],
         )
         self.assertEqual(written[1]["surgeon_fee_low"], "1100")
