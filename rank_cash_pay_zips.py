@@ -157,6 +157,8 @@ PROCEDURE_PERSONAS = {
     "forehead lift": ("45 to 54", "55 and older"),
 }
 
+LOWERCASE_CITY_WORDS = frozenset({"del", "de", "of", "the"})
+
 RANK_COLUMNS = (
     "persona",
     "rank",
@@ -307,10 +309,8 @@ def middle(values: list[Decimal]) -> Decimal:
 
 
 def format_money(value: Decimal) -> str:
-    integral = value.to_integral_value()
-    if value == integral:
-        return f"${int(integral):,}"
-    return f"${value:,.2f}"
+    """Whole dollars with commas. Half a dollar rounds up."""
+    return f"${int(Decimal(value).quantize(Decimal(1), rounding=ROUND_HALF_UP)):,}"
 
 
 def percent_points(share: Decimal | None) -> Decimal | None:
@@ -537,86 +537,104 @@ def split_place(row: dict) -> tuple[str, str]:
     return city.strip(), state.strip()
 
 
-def screen_header(screen: PersonaRank, price: Decimal | None = None) -> str:
-    persona = screen.persona
-    if screen.household_income_middle is None:
-        return (
-            f"{persona.label}. No ZIP had a published age count, adult population, "
-            "household income, per-person income, median listing price per square foot, and at least "
-            f"{MIN_ACTIVE_LISTINGS} active listings."
-        )
-    if persona.cash == "working":
-        middles = (
-            f"household income middle {format_money(screen.household_income_middle)}, "
-            f"median listing price per square foot middle {format_money(screen.listing_price_middle)}"
-        )
-        rule = "Household income and the median listing price per square foot are both at or above"
-        failed = (
-            "No ZIP has both household income and median listing price per square foot at or above "
-            "the middle of Los Angeles County ZIPs in this screen"
-        )
+def display_city(city: str) -> str:
+    """Title case for the text, such as "Marina del Rey". The city field keeps its own case."""
+    words = city.split()
+    return " ".join(
+        word if index and word in LOWERCASE_CITY_WORDS else "-".join(part.capitalize() for part in word.split("-"))
+        for index, word in enumerate(words)
+    )
+
+
+def ordinal(position: int) -> str:
+    if 10 <= position % 100 <= 20:
+        suffix = "th"
     else:
-        middles = (
-            f"median listing price per square foot middle {format_money(screen.listing_price_middle)}, "
-            f"per-person income middle {format_money(screen.per_capita_income_middle)}"
-        )
-        rule = "Median listing price per square foot and per-person income are both at or above"
-        failed = (
-            "No ZIP has both median listing price per square foot and per-person income at or above "
-            "the middle of Los Angeles County ZIPs in this screen"
-        )
-    if not screen.rows:
-        return f"{persona.label}. {failed} ({middles})."
-    return (
-        f"{persona.label}. {rule} the middle of Los Angeles County ZIPs in this "
-        f"screen ({middles}). {affordability_header(persona, price)} "
-        f"Ranked by the share of adults {persona.age_phrase}."
-    )
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(position % 10, "th")
+    return f"{position}{suffix}"
 
 
-def affordability_header(persona: Persona, price: Decimal | None) -> str:
-    if price is None:
-        return "This procedure has no published surgeon fee, so no affordability screen is applied."
-    return (
-        f"Estimated yearly discretionary spending ({format_percent(DISCRETIONARY_SHARE[persona.label])} "
-        f"of median household income, BLS Consumer Expenditure Surveys {DISCRETIONARY_SOURCE_YEAR}) "
-        f"covers the {format_money(price)} surgeon fee midpoint."
-    )
-
-
-def zip_insight(screen: PersonaRank, row: dict, price: Decimal | None = None) -> str:
-    share = format_percent(row["age_share"])
+def screen_reasons(screen: PersonaRank) -> str:
+    listing = format_money(screen.listing_price_middle)
     if screen.persona.cash == "working":
-        insight = (
-            f"{share} of adults are {screen.persona.age_phrase}. "
-            f"Household income {format_money(Decimal(row['median_household_income']))} "
-            f"and median listing price per square foot {format_money(row['median_listing_price_per_square_foot'])} "
-            "are at or above those middles."
+        return (
+            "median household income and median listing price per square foot in these ZIP codes "
+            "are at or above the Los Angeles County medians of "
+            f"{format_money(screen.household_income_middle)} and {listing}"
+        )
+    return (
+        "median listing price per square foot and per-person income in these ZIP codes "
+        f"are at or above the Los Angeles County medians of {listing} and "
+        f"{format_money(screen.per_capita_income_middle)}"
+    )
+
+
+def screen_header(procedure: str, screen: PersonaRank, price: Decimal | None = None) -> str:
+    persona = screen.persona
+    group = f"adults {persona.age_phrase}"
+    if screen.household_income_middle is None or not screen.rows:
+        return (
+            f"No Los Angeles County ZIP code qualified for marketing {procedure} to {group}. "
+            "Each ZIP code needs income and median listing price per square foot at or above "
+            f"the county median, plus at least {MIN_ACTIVE_LISTINGS} active listings."
+        )
+    if price is None:
+        why = (
+            f"Why: {screen_reasons(screen)}. "
+            "Affordability wasn't checked because this procedure has no published surgeon fee."
         )
     else:
-        insight = (
-            f"{share} of adults are {screen.persona.age_phrase}. "
-            f"Median listing price per square foot {format_money(row['median_listing_price_per_square_foot'])} and "
-            f"per-person income {format_money(Decimal(row['per_capita_income']))} "
-            "are at or above those middles."
+        why = (
+            f"Why: {screen_reasons(screen)}, and a typical household's discretionary spending "
+            f"of about {format_percent(DISCRETIONARY_SHARE[persona.label])} of household income "
+            f"covers the {format_money(price)} midpoint surgeon fee."
+        )
+    sentences = [
+        f"Market {procedure} to {group} in the ZIP codes below.",
+        why,
+        f"ZIP codes are ranked by their share of {group}.",
+    ]
+    if price is not None:
+        sentences.append(f"Source: BLS Consumer Expenditure Surveys, {DISCRETIONARY_SOURCE_YEAR}.")
+    return " ".join(sentences)
+
+
+def zip_insight(
+    screen: PersonaRank, row: dict, position: int, price: Decimal | None = None
+) -> str:
+    city, _ = split_place(row)
+    place = f"{display_city(city)} ({row['zip']})" if city else f"ZIP code {row['zip']}"
+    standing = "the highest" if position == 1 else f"the {ordinal(position)}-highest"
+    sentences = [
+        f"Why {place}: {format_percent(row['age_share'])} of adults are "
+        f"{screen.persona.age_phrase}, {standing} share in this list."
+    ]
+    household = format_money(Decimal(row["median_household_income"]))
+    listing = format_money(row["median_listing_price_per_square_foot"])
+    if screen.persona.cash == "working":
+        sentences.append(
+            f"Median household income is {household} and median listing price per square foot "
+            f"is {listing}, both at or above the county median."
+        )
+    else:
+        sentences.append(
+            f"Median listing price per square foot is {listing} and per-person income is "
+            f"{format_money(Decimal(row['per_capita_income']))}, both at or above the county median."
         )
     if price is not None:
-        spending = discretionary_income(row, screen.persona).quantize(
-            Decimal(1), rounding=ROUND_HALF_UP
-        )
-        source = ""
-        if screen.persona.cash != "working":
-            source = (
-                " from median household income of "
-                f"{format_money(Decimal(row['median_household_income']))}"
+        spending = format_money(discretionary_income(row, screen.persona))
+        if screen.persona.cash == "working":
+            sentences.append(
+                f"About {spending} a year in discretionary spending covers the {format_money(price)} fee."
             )
-        insight += (
-            f" About {format_money(spending)} a year in discretionary spending{source} covers "
-            f"the {format_money(price)} fee midpoint."
-        )
+        else:
+            sentences.append(
+                f"With median household income of {household}, about {spending} a year in "
+                f"discretionary spending covers the {format_money(price)} fee."
+            )
     if row.get("female_share") is not None:
-        insight += f" Women are {format_percent(row['female_share'])} of residents."
-    return insight
+        sentences.append(f"Women are {format_percent(row['female_share'])} of residents.")
+    return " ".join(sentences)
 
 
 def affordable_rows(screen: PersonaRank, price: Decimal | None) -> list[dict]:
@@ -629,8 +647,10 @@ def affordable_rows(screen: PersonaRank, price: Decimal | None) -> list[dict]:
     ]
 
 
-def render_screen(screen: PersonaRank, price: Decimal | None = None) -> list[BulletRow]:
-    header = screen_header(screen, price)
+def render_screen(
+    procedure: str, screen: PersonaRank, price: Decimal | None = None
+) -> list[BulletRow]:
+    header = screen_header(procedure, screen, price)
     rows: list[BulletRow] = []
     for position, row in enumerate(affordable_rows(screen, price), start=1):
         city, state = split_place(row)
@@ -641,7 +661,7 @@ def render_screen(screen: PersonaRank, price: Decimal | None = None) -> list[Bul
                 city=city,
                 state=state,
                 zip_code=str(row["zip"]),
-                insight=zip_insight(screen, row, price),
+                insight=zip_insight(screen, row, position, price),
                 household_income=row["median_household_income"],
                 individual_income=row["per_capita_income"],
                 median_listing_price_per_square_foot=row["median_listing_price_per_square_foot"],
@@ -662,7 +682,7 @@ def bullet_rows(
     by_label = {screen.persona.label: screen for screen in screens}
     rows: list[BulletRow] = []
     for label in labels:
-        rows.extend(render_screen(by_label[label], price))
+        rows.extend(render_screen(procedure, by_label[label], price))
     return rows
 
 
@@ -672,18 +692,9 @@ def bullets_by_procedure(
     prices: dict[str, Decimal | None] | None = None,
 ) -> dict[str, list[BulletRow]]:
     prices = prices or {}
-    cache: dict[tuple, list[BulletRow]] = {}
     bullets: dict[str, list[BulletRow]] = {}
     for name in procedures_in_year:
-        labels = PROCEDURE_PERSONAS.get(name)
-        price = prices.get(name)
-        if labels is None:
-            bullets[name] = bullet_rows(name, screens, price)
-            continue
-        key = (labels, price)
-        if key not in cache:
-            cache[key] = bullet_rows(name, screens, price)
-        bullets[name] = cache[key]
+        bullets[name] = bullet_rows(name, screens, prices.get(name))
     return bullets
 
 

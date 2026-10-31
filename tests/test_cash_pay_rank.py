@@ -357,34 +357,50 @@ class BulletTests(unittest.TestCase):
 
         young = rows("breast augmentation")
         older = rows("facelift")
-        self.assertEqual(young, rows("rhinoplasty"))
-        self.assertEqual(young, rows("buttock augmentation with fat grafting"))
-        self.assertEqual(older, rows("eyelid surgery"))
-        self.assertEqual(older, rows("forehead lift"))
-        self.assertEqual(older, rows("neck lift"))
-        self.assertEqual(rows("arm lift"), rows("thigh lift"))
-        self.assertEqual(rows("breast lift"), rows("tummy tuck"))
-        self.assertEqual(rows("liposuction"), rows("breast reduction"))
+        def lists(name):
+            return [(row.age_range, row.zip_code, row.insight) for row in rows(name)]
+
+        self.assertEqual(lists("breast augmentation"), lists("rhinoplasty"))
+        self.assertEqual(lists("breast augmentation"), lists("buttock augmentation with fat grafting"))
+        self.assertEqual(lists("facelift"), lists("eyelid surgery"))
+        self.assertEqual(lists("facelift"), lists("forehead lift"))
+        self.assertEqual(lists("facelift"), lists("neck lift"))
+        self.assertEqual(lists("arm lift"), lists("thigh lift"))
+        self.assertEqual(lists("breast lift"), lists("tummy tuck"))
+        self.assertEqual(lists("liposuction"), lists("breast reduction"))
         self.assertEqual(
             [(row.rank, row.city, row.state, row.zip_code) for row in young],
             [(1, "pasadena", "ca", "90012"), (1, "pasadena", "ca", "90012")],
         )
-        self.assertTrue(young[0].header.startswith("18 to 34. Household income"))
-        self.assertIn("Ranked by the share of adults ages 18 to 34.", young[0].header)
-        self.assertTrue(young[1].header.startswith("35 to 44. "))
+        self.assertEqual(
+            young[0].header,
+            "Market breast augmentation to adults ages 18 to 34 in the ZIP codes below. "
+            "Why: median household income and median listing price per square foot in these "
+            "ZIP codes are at or above the Los Angeles County medians of $200 and $345. "
+            "Affordability wasn't checked because this procedure has no published surgeon fee. "
+            "ZIP codes are ranked by their share of adults ages 18 to 34.",
+        )
+        self.assertTrue(
+            young[1].header.startswith("Market breast augmentation to adults ages 35 to 44 in the ZIP codes below. Why: ")
+        )
         self.assertEqual(
             young[0].insight,
-            "40.0% of adults are ages 18 to 34. Household income $300 and median listing price "
-            "per square foot $640 are at or above those middles. Women are 75.0% of residents.",
+            "Why Pasadena (90012): 40.0% of adults are ages 18 to 34, the highest share in this list. "
+            "Median household income is $300 and median listing price per square foot is $640, "
+            "both at or above the county median. Women are 75.0% of residents.",
         )
+        self.assertEqual([row.city for row in young], ["pasadena", "pasadena"])
         for row in young + older:
-            self.assertNotIn(row.zip_code, row.insight)
-            self.assertNotIn(row.city, row.insight)
+            self.assertTrue(row.insight.startswith(f"Why "), row.insight)
+            self.assertIn(f"({row.zip_code}):", row.insight)
             self.assertNotRegex(row.insight, r"^\s*(- )?\d+\. ")
         self.assertEqual([row.zip_code for row in older], ["90040", "90040"])
-        self.assertTrue(older[0].header.startswith("45 to 54. "))
-        self.assertTrue(older[1].header.startswith("55 and older. Median listing price per square foot"))
-        self.assertIn("per-person income $200", older[1].insight)
+        self.assertTrue(older[0].header.startswith("Market facelift to adults ages 45 to 54 in the ZIP codes below. "))
+        self.assertIn(
+            "Why: median listing price per square foot and per-person income in these ZIP codes",
+            older[1].header,
+        )
+        self.assertIn("per-person income is $200", older[1].insight)
         self.assertIn("$800", older[1].insight)
         self.assertEqual(rows("custom procedure"), [])
 
@@ -402,7 +418,17 @@ class BulletTests(unittest.TestCase):
             ]
         )
         found = rank.bullet_rows("rhinoplasty", screens)
-        self.assertEqual([row.header.split(".")[0] for row in found], ["18 to 34"])
+        self.assertEqual(
+            [row.header.split(".")[0] for row in found],
+            ["Market rhinoplasty to adults ages 18 to 34 in the ZIP codes below"],
+        )
+
+    def test_city_is_title_cased_in_the_text_only(self):
+        self.assertEqual(rank.display_city("marina del rey"), "Marina del Rey")
+        self.assertEqual(rank.display_city("la canada flintridge"), "La Canada Flintridge")
+        self.assertEqual(rank.display_city("view park-windsor hills"), "View Park-Windsor Hills")
+        self.assertEqual([rank.ordinal(n) for n in (1, 2, 3, 4, 11, 12, 13, 21, 22, 23)],
+            ["1st", "2nd", "3rd", "4th", "11th", "12th", "13th", "21st", "22nd", "23rd"])
 
     def test_city_and_state_come_from_the_zip_name(self):
         self.assertEqual(rank.split_place({"zip_name": "marina del rey, ca"}), ("marina del rey", "ca"))
@@ -474,8 +500,12 @@ class BulletTests(unittest.TestCase):
     def test_shared_persona_lists_repeat_the_same_rows(self):
         names = ["breast augmentation", "rhinoplasty", "facelift", "eyelid surgery"]
         bullets = rank.bullets_by_procedure(names, self.screens)
-        self.assertIs(bullets["breast augmentation"], bullets["rhinoplasty"])
-        self.assertEqual(bullets["facelift"], bullets["eyelid surgery"])
+        def body(name):
+            return [(row.age_range, row.rank, row.zip_code, row.insight) for row in bullets[name]]
+
+        self.assertEqual(body("breast augmentation"), body("rhinoplasty"))
+        self.assertEqual(body("facelift"), body("eyelid surgery"))
+        self.assertTrue(bullets["rhinoplasty"][0].header.startswith("Market rhinoplasty to "))
         self.assertNotEqual(bullets["breast augmentation"], bullets["facelift"])
 
 
@@ -538,15 +568,20 @@ class AffordabilityTests(unittest.TestCase):
         screen = self._screen("55 and older", {"90001": 150000, "90002": 100000})
         for row in screen.passed:
             row["per_capita_income"] = 40000
-        kept = rank.render_screen(screen, Decimal(15500))
+        kept = rank.render_screen("tummy tuck", screen, Decimal(15500))
         self.assertEqual([(row.rank, row.zip_code) for row in kept], [(1, "90001")])
-        self.assertIn("per-person income $40,000 are at or above those middles.", kept[0].insight)
+        self.assertIn("per-person income is $40,000, both at or above the county median.", kept[0].insight)
         self.assertIn(
-            "About $16,126 a year in discretionary spending from median household income of "
-            "$150,000 covers the $15,500 fee midpoint.",
+            "With median household income of $150,000, about $16,126 a year in discretionary "
+            "spending covers the $15,500 fee.",
             kept[0].insight,
         )
-        self.assertTrue(kept[0].header.startswith("55 and older. Median listing price per square foot and per-person income"))
+        self.assertTrue(
+            kept[0].header.startswith(
+                "Market tummy tuck to adults ages 55 and older in the ZIP codes below. "
+                "Why: median listing price per square foot and per-person income"
+            )
+        )
 
     def test_fee_midpoint(self):
         self.assertEqual(rank.fee_midpoint(8000, 15000), Decimal(11500))
@@ -561,18 +596,24 @@ class AffordabilityTests(unittest.TestCase):
         screen = self._screen(
             "35 to 44", {"90001": 50000, "90002": just_enough, "90003": 300000}
         )
-        kept = rank.render_screen(screen, price)
+        kept = rank.render_screen("tummy tuck", screen, price)
         self.assertEqual([(row.rank, row.zip_code) for row in kept], [(1, "90002"), (2, "90003")])
-        unscreened = rank.render_screen(screen, None)
+        unscreened = rank.render_screen("tummy tuck", screen, None)
         self.assertEqual([row.rank for row in unscreened], [1, 2, 3])
-        self.assertIn("no affordability screen", unscreened[0].header)
+        self.assertIn(
+            "Affordability wasn't checked because this procedure has no published surgeon fee.",
+            unscreened[0].header,
+        )
+        self.assertNotIn("Source:", unscreened[0].header)
+        self.assertNotIn("fee.", unscreened[0].insight)
+        self.assertIn("the 2nd-highest share in this list.", kept[1].insight)
 
     def test_dropped_zips_are_backfilled_past_the_top_25(self):
         incomes = {f"9{index:04d}": 50000 for index in range(rank.TOP_N)}
         incomes.update({"91111": 300000, "92222": 300000})
         screen = self._screen("35 to 44", incomes)
         self.assertNotIn("91111", {row["zip"] for row in screen.rows})
-        kept = rank.render_screen(screen, Decimal(20000))
+        kept = rank.render_screen("tummy tuck", screen, Decimal(20000))
         self.assertEqual([row.zip_code for row in kept], ["91111", "92222"])
 
     def test_rankings_differ_by_procedure_price(self):
@@ -592,19 +633,22 @@ class AffordabilityTests(unittest.TestCase):
 
     def test_header_and_insight_describe_the_screen(self):
         screen = self._screen("35 to 44", {"90001": 200000})
-        row = rank.render_screen(screen, Decimal(10750))[0]
-        self.assertIn("Estimated yearly discretionary spending (9.5% of median household income", row.header)
-        self.assertIn("BLS Consumer Expenditure Surveys 2025", row.header)
-        self.assertIn("covers the $10,750 surgeon fee midpoint.", row.header)
-        self.assertIn("About $19,094 a year in discretionary spending covers the $10,750 fee midpoint.", row.insight)
+        row = rank.render_screen("tummy tuck", screen, Decimal(10750))[0]
+        self.assertIn(
+            "and a typical household's discretionary spending of about 9.5% of household income "
+            "covers the $10,750 midpoint surgeon fee.",
+            row.header,
+        )
+        self.assertTrue(row.header.endswith(" Source: BLS Consumer Expenditure Surveys, 2025."))
+        self.assertIn("About $19,094 a year in discretionary spending covers the $10,750 fee.", row.insight)
         older = self._screen("55 and older", {"90001": 100000})
-        older_row = rank.render_screen(older, Decimal(5750))[0]
-        self.assertIn("10.8% of median household income", older_row.header)
+        older_row = rank.render_screen("facelift", older, Decimal(5750))[0]
+        self.assertIn("10.8% of household income", older_row.header)
         self.assertNotIn("of per-person income", older_row.header)
 
     def test_a_group_with_no_affordable_zip_adds_no_rows(self):
         screen = self._screen("55 and older", {"90001": 40000})
-        self.assertEqual(rank.render_screen(screen, Decimal(15500)), [])
+        self.assertEqual(rank.render_screen("tummy tuck", screen, Decimal(15500)), [])
 
     def test_apply_writes_null_when_no_zip_can_afford_the_fee(self):
         screens = rank.rank_personas(
@@ -674,9 +718,25 @@ class MeasureColumnTests(unittest.TestCase):
             self.assertEqual(row.median_listing_price_per_square_foot, Decimal("857.5"))
             self.assertEqual(row.sex, "woman")
             self.assertIn("Women are 53.8% of residents.", row.insight)
-            self.assertIn("median listing price per square foot $857.50", row.insight.lower())
-        self.assertIn("Household income $146,167", rows[0].insight)
-        self.assertTrue(rows[1].header.startswith("55 and older. "))
+            self.assertIn("median listing price per square foot is $858", row.insight.lower())
+            self.assertTrue(row.insight.startswith("Why Marina del Rey (90292): "))
+            self.assertEqual(row.city, "marina del rey")
+        self.assertIn("Median household income is $146,167", rows[0].insight)
+        self.assertTrue(rows[1].header.startswith("Market arm lift to adults ages 55 and older in the ZIP codes below. "))
+
+    def test_text_is_plain_whole_dollar_sentences(self):
+        texts = []
+        for price in (None, Decimal("8250.5")):
+            for row in rank.bullet_rows("arm lift", self.screens, price):
+                texts += [row.header, row.insight]
+        for text in texts:
+            lowered = text.lower()
+            self.assertNotIn("middle", lowered)
+            self.assertNotIn("in this screen", lowered)
+            self.assertNotRegex(text, r"^\d")
+            self.assertNotRegex(text, r"\$[\d,]+\.\d")
+            self.assertTrue(text.endswith("."), text)
+        self.assertIn("$8,251", " ".join(texts))
 
     def test_sex_is_woman_at_fifty_percent_or_more(self):
         self.assertEqual(rank.sex_label(Decimal("0.538")), "woman")
@@ -756,7 +816,7 @@ class MeasureColumnTests(unittest.TestCase):
                     for row in rank.bullet_rows(procedure, screens, price):
                         texts += [row.header, row.insight]
             for screen in screens:
-                texts.append(rank.screen_header(screen, Decimal(1000)))
+                texts.append(rank.screen_header("arm lift", screen, Decimal(1000)))
         self.assertTrue(any("median listing price per square foot" in text.lower() for text in texts))
         for text in texts:
             lowered = text.lower()
@@ -896,11 +956,13 @@ class BulletYearTests(unittest.TestCase):
         self.assertEqual(incomes, [300000])
         self.assertEqual(individual_incomes, [80000])
         self.assertEqual((len(updates), report_year, name), (1, 2024, "rhinoplasty"))
-        self.assertTrue(headers.startswith("18 to 34. "))
+        self.assertTrue(headers.startswith("Market rhinoplasty to adults ages 18 to 34 "))
         self.assertNotIn("\n", headers)
         self.assertEqual(ranks, [1])
         self.assertEqual((cities, states, zips), (["Pasadena"], [""], ["90012"]))
-        self.assertTrue(insights[0].startswith("40.0% of adults are ages 18 to 34."))
+        self.assertTrue(
+            insights[0].startswith("Why Pasadena (90012): 40.0% of adults are ages 18 to 34, the highest share")
+        )
         joined = " ".join(sql for sql, _params in cursor.statements)
         for name, sql_type in rank.BULLET_LIST_COLUMNS:
             self.assertIn(f"ADD COLUMN IF NOT EXISTS {name} {sql_type}", joined)
@@ -1050,9 +1112,9 @@ class SaveTests(unittest.TestCase):
         self.assertEqual(set(by_name), {"facelift", "rhinoplasty", "custom procedure"})
         self.assertTrue(all(row[-2] == 2024 for row in updates))
         headers, ranks, cities, _states, zips, insights = by_name["rhinoplasty"][:6]
-        self.assertTrue(headers.startswith("18 to 34. "))
+        self.assertTrue(headers.startswith("Market rhinoplasty to adults ages 18 to 34 "))
         self.assertEqual((ranks, cities, zips), ([1], ["Pasadena"], ["90012"]))
-        self.assertNotIn("90012", insights[0])
+        self.assertTrue(insights[0].startswith("Why Pasadena (90012): "))
         self.assertEqual(by_name["facelift"][:6], (None,) * 6)
         self.assertEqual(by_name["custom procedure"][:6], (None,) * 6)
         insert = next(rows for sql, rows in statements if "INSERT INTO public.cash_pay_zip_rank" in sql)
