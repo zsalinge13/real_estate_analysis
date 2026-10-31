@@ -423,6 +423,7 @@ class BulletTests(unittest.TestCase):
             "zip_code",
             "insight",
             "household_income",
+            "individual_income",
             "median_listing_price_per_square_foot",
             "age_range",
             "sex",
@@ -434,7 +435,7 @@ class BulletTests(unittest.TestCase):
                 [
                     (2024, "facelift", 8000) + stored,
                     (2024, "custom procedure", 100) + rank.bullet_update([]),
-                    (2025, "facelift", None) + (None,) * 10,
+                    (2025, "facelift", None) + (None,) * 11,
                 ],
                 path,
             )
@@ -669,6 +670,7 @@ class MeasureColumnTests(unittest.TestCase):
         self.assertEqual([row.age_range for row in rows], ["35 to 44", "55 and older"])
         for row in rows:
             self.assertEqual(row.household_income, 146167)
+            self.assertEqual(row.individual_income, 120000)
             self.assertEqual(row.median_listing_price_per_square_foot, Decimal("857.5"))
             self.assertEqual(row.sex, "woman")
             self.assertIn("Women are 53.8% of residents.", row.insight)
@@ -725,17 +727,24 @@ class MeasureColumnTests(unittest.TestCase):
         expanded = rank.expand_marketing_bullet_rows(
             columns, [(2024, "arm lift") + rank.bullet_update(found)]
         )
-        tail = [row[-4:] for row in expanded]
+        tail = [row[-5:] for row in expanded]
         self.assertEqual(
             tail,
             [
-                (146167, Decimal("857.5"), "35 to 44", "woman"),
-                (146167, Decimal("857.5"), "55 and older", "woman"),
+                (146167, 120000, Decimal("857.5"), "35 to 44", "woman"),
+                (146167, 120000, Decimal("857.5"), "55 and older", "woman"),
             ],
         )
         self.assertEqual(
-            list(rank.BULLET_CSV_COLUMNS[-5:]),
-            ["insight", "household_income", "median_listing_price_per_square_foot", "age_range", "sex"],
+            list(rank.BULLET_CSV_COLUMNS[-6:]),
+            [
+                "insight",
+                "household_income",
+                "individual_income",
+                "median_listing_price_per_square_foot",
+                "age_range",
+                "sex",
+            ],
         )
 
     def test_text_never_says_plain_listing_price(self):
@@ -869,7 +878,23 @@ class BulletYearTests(unittest.TestCase):
             for _sql, batch in cursor.statements
             if isinstance(batch, list) and batch
         )
-        headers, ranks, cities, states, zips, insights, incomes, prices, ages, sexes, report_year, name = updates[0]
+        (
+            headers,
+            ranks,
+            cities,
+            states,
+            zips,
+            insights,
+            incomes,
+            individual_incomes,
+            prices,
+            ages,
+            sexes,
+            report_year,
+            name,
+        ) = updates[0]
+        self.assertEqual(incomes, [300000])
+        self.assertEqual(individual_incomes, [80000])
         self.assertEqual((len(updates), report_year, name), (1, 2024, "rhinoplasty"))
         self.assertTrue(headers.startswith("18 to 34. "))
         self.assertNotIn("\n", headers)
@@ -1215,6 +1240,7 @@ class ProcedureFeeExportTests(unittest.TestCase):
             "zip_code",
             "insight",
             "household_income",
+            "individual_income",
             "median_listing_price_per_square_foot",
             "age_range",
             "sex",
@@ -1228,11 +1254,12 @@ class ProcedureFeeExportTests(unittest.TestCase):
             ["90292", "90012"],
             ["Young.", "Thirties."],
             [146167, 98000],
+            [64075, 52010],
             [Decimal("858"), Decimal("612.5")],
             ["18 to 34", "35 to 44"],
             ["woman", None],
         )
-        blank = (None,) * 9
+        blank = (None,) * 10
         table_rows = [
             (2024, "facelift", 10, 1000, 2000, "national", "https://example.test/2024", moment, None, "older") + blank,
             (2024, "rhinoplasty", 11, 1100, 2100, "national", "https://example.test/2024", moment, headers, "older") + lists,
@@ -1255,6 +1282,7 @@ class ProcedureFeeExportTests(unittest.TestCase):
                         "zip_code",
                         "insight",
                         "household_income",
+                        "individual_income",
                         "median_listing_price_per_square_foot",
                         "age_range",
                         "sex",
@@ -1280,14 +1308,20 @@ class ProcedureFeeExportTests(unittest.TestCase):
         )
         self.assertEqual(
             [
-                (row["household_income"], row["median_listing_price_per_square_foot"], row["age_range"], row["sex"])
+                (
+                    row["household_income"],
+                    row["individual_income"],
+                    row["median_listing_price_per_square_foot"],
+                    row["age_range"],
+                    row["sex"],
+                )
                 for row in written
             ],
             [
-                ("", "", "", ""),
-                ("146167", "858", "18 to 34", "woman"),
-                ("98000", "612.5", "35 to 44", ""),
-                ("", "", "", ""),
+                ("", "", "", "", ""),
+                ("146167", "64075", "858", "18 to 34", "woman"),
+                ("98000", "52010", "612.5", "35 to 44", ""),
+                ("", "", "", "", ""),
             ],
         )
         self.assertEqual(written[1]["surgeon_fee_low"], "1100")

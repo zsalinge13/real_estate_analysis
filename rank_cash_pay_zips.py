@@ -20,6 +20,7 @@ keeps the persona ranking without this screen.
 The stored form is one entry per ranked ZIP, in persona-list order:
 marketing_bullets has one line per ZIP holding that ZIP's age-group header
 sentence, and rank, city, state, zip_code, insight, household_income,
+individual_income (ACS per-capita income),
 median_listing_price_per_square_foot, age_range, and sex are same-order lists.
 A group with no ranked ZIP adds no entry.
 After that write succeeds, the same run exports every column of
@@ -62,6 +63,7 @@ BULLET_LIST_COLUMNS = (
     ("zip_code", "text[]"),
     ("insight", "text[]"),
     ("household_income", "integer[]"),
+    ("individual_income", "integer[]"),
     ("median_listing_price_per_square_foot", "numeric[]"),
     ("age_range", "text[]"),
     ("sex", "text[]"),
@@ -520,6 +522,7 @@ class BulletRow:
     zip_code: str
     insight: str
     household_income: int | None = None
+    individual_income: int | None = None
     median_listing_price_per_square_foot: Decimal | None = None
     age_range: str | None = None
     sex: str | None = None
@@ -640,6 +643,7 @@ def render_screen(screen: PersonaRank, price: Decimal | None = None) -> list[Bul
                 zip_code=str(row["zip"]),
                 insight=zip_insight(screen, row, price),
                 household_income=row["median_household_income"],
+                individual_income=row["per_capita_income"],
                 median_listing_price_per_square_foot=row["median_listing_price_per_square_foot"],
                 age_range=screen.persona.label,
                 sex=sex_label(row.get("female_share")),
@@ -906,6 +910,7 @@ def bullet_update(rows: list[BulletRow]) -> tuple:
         [row.zip_code for row in rows],
         [row.insight for row in rows],
         [row.household_income for row in rows],
+        [row.individual_income for row in rows],
         [row.median_listing_price_per_square_foot for row in rows],
         [row.age_range for row in rows],
         [row.sex for row in rows],
